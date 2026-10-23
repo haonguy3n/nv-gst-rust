@@ -1,0 +1,26 @@
+# Laptop / CI profile: simulator backend, metadata only.
+platform = "sim"
+zero_copy = "strict"
+
+[source]
+kind = "synthetic" # "file" + path reads raw NV12 frames from disk
+width = 640
+height = 480
+fps = 30
+pool_size = 6
+frames = 30 # bounded run for dev/CI; remove to run until the source ends
+
+[model]
+input_width = 320
+input_height = 320
+num_classes = 80
+score_threshold = 0.25
+
+[encoder]
+enabled = false # sim has no hardware encoder
+
+[stream]
+metadata_only = true
+
+[pipeline]
+queue_depth = 4

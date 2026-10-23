@@ -1,0 +1,31 @@
+# Jetson Orin NX profile (target: M1+). JetPack 6.x / L4T r36 pinned;
+# record exact CUDA/TensorRT/L4T versions here once the board is flashed.
+platform = "jetson"
+zero_copy = "strict"
+
+[source]
+kind = "argus" # direct libargus capture into our own NVMM pool, never nvarguscamerasrc
+width = 1920
+height = 1080
+fps = 30
+pool_size = 6
+
+[model]
+path = "models/yolov8n.onnx" # .engine is built on-device and cached
+input_width = 640
+input_height = 640
+num_classes = 80
+score_threshold = 0.25
+
+[encoder]
+enabled = true
+codec = "H264"
+hardware = true
+bitrate_kbps = 8000
+
+[stream]
+metadata_only = false
+rtsp_port = 8554
+
+[pipeline]
+queue_depth = 4

@@ -1,0 +1,20 @@
+[package]
+name = "edge-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Platform-agnostic traits, frame/tensor handles and config for the edge-vision pipeline"
+
+[features]
+# Enables HwBuffer::map_cpu. Never enable in release product builds:
+# code that needs CPU pixels must not compile there (see design.md).
+cpu-debug = []
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

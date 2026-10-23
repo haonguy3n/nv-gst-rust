@@ -1,0 +1,21 @@
+[package]
+name = "edge-vision"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Edge vision pipeline binary: parse config, pick platform, run"
+
+[features]
+# Jetson backend (platform-jetson) lands in M1; selecting the feature
+# or platform before then fails with a clear error, not a link error.
+jetson = []
+
+[dependencies]
+edge-core = { path = "../../crates/core" }
+edge-pipeline = { path = "../../crates/pipeline" }
+platform-sim = { path = "../../crates/platform-sim" }
+anyhow.workspace = true
+
+[lints]
+workspace = true
