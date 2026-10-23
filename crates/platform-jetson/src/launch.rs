@@ -25,15 +25,31 @@ fn raw_caps(memory: &str, format: &str, width: u32, height: u32) -> String {
 }
 
 /// Capture side: Argus ISP -> NV12 in NVMM -> appsink.
+///
+/// The appsink queue is deliberately tiny and drop-oldest
+/// (`drop=true`): freshness beats completeness, and a full sink
+/// must never back-pressure Argus. Deeper buffering, when wanted,
+/// belongs in the Rust channel where drops are counted.
 pub fn capture_launch(cfg: &SourceConfig) -> String {
+    let mut ae = String::new();
+    if let Some(us) = cfg.exposure_us {
+        let ns = u64::from(us) * 1000;
+        ae += &format!(" exposuretimerange=\"{ns} {ns}\"");
+    }
+    if cfg.gain_min.is_some() || cfg.gain_max.is_some() {
+        ae += &format!(
+            " gainrange=\"{:.1} {:.1}\"",
+            cfg.gain_min.unwrap_or(1.0),
+            cfg.gain_max.unwrap_or(16.0)
+        );
+    }
     format!(
-        "nvarguscamerasrc name=camsrc sensor-id={} \
+        "nvarguscamerasrc name=camsrc sensor-id={}{ae} \
          ! {},framerate={}/1 \
-         ! appsink name=frames max-buffers={} drop=false sync=false",
+         ! appsink name=frames max-buffers=2 drop=true sync=false",
         cfg.camera_id,
         raw_caps("(memory:NVMM)", "NV12", cfg.width, cfg.height),
         cfg.fps.max(1),
-        cfg.pool_size,
     )
 }
 
@@ -43,53 +59,58 @@ pub fn capture_launch(cfg: &SourceConfig) -> String {
 pub fn file_capture_launch(cfg: &SourceConfig, location: &str) -> String {
     format!(
         "filesrc location={location} ! decodebin ! nvvidconv \
-         ! {} ! appsink name=frames max-buffers={} drop=false sync=false",
+         ! {} ! appsink name=frames max-buffers=2 drop=true sync=false",
         raw_caps("(memory:NVMM)", "NV12", cfg.width, cfg.height),
-        cfg.pool_size,
     )
 }
 
 /// Encode side: appsrc (NVMM in) -> encoder -> byte-stream appsink.
 pub fn encode_launch(kind: EncoderKind, cfg: &EncoderConfig, width: u32, height: u32) -> String {
     let bitrate_bps = cfg.bitrate_kbps.saturating_mul(1000);
+    // Bounded and blocking: if NVENC falls behind, the pipeline's
+    // caller feels it here instead of memory growing without bound.
     let src = format!(
-        "appsrc name=framesrc is-live=true format=time \
+        "appsrc name=framesrc is-live=true format=time block=true max-buffers=4 \
          caps={}",
         raw_caps("(memory:NVMM)", "NV12", width, height)
     );
     match (kind, cfg.codec) {
         (EncoderKind::Nvenc, Codec::H264) => format!(
-            "{src} ! nvv4l2h264enc bitrate={bitrate_bps} insert-sps-pps=true \
-             idrinterval=30 maxperf-enable=true \
+            "{src} ! nvv4l2h264enc profile=2 bitrate={bitrate_bps} insert-sps-pps=true \
+             idrinterval={} iframeinterval={} maxperf-enable=true \
              ! h264parse config-interval=-1 \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=enc sync=false"
+             ! appsink name=enc sync=false",
+            cfg.gop_frames, cfg.gop_frames
         ),
         (EncoderKind::Nvenc, Codec::H265) => format!(
             "{src} ! nvv4l2h265enc bitrate={bitrate_bps} insert-sps-pps=true \
-             idrinterval=30 maxperf-enable=true \
+             idrinterval={} iframeinterval={} maxperf-enable=true \
              ! h265parse config-interval=-1 \
              ! video/x-h265,stream-format=byte-stream,alignment=au \
-             ! appsink name=enc sync=false"
+             ! appsink name=enc sync=false",
+            cfg.gop_frames, cfg.gop_frames
         ),
         // Opt-in only (zero_copy = "relaxed"): the one deliberate
         // copy out of NVMM, immediately before the CPU encoder.
         (EncoderKind::Cpu, Codec::H264) => format!(
             "{src} ! nvvidconv ! {} \
-             ! x264enc tune=zerolatency key-int-max=30 bitrate={} speed-preset=ultrafast \
+             ! x264enc tune=zerolatency key-int-max={} bitrate={} speed-preset=ultrafast \
              ! h264parse config-interval=-1 \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! appsink name=enc sync=false",
             raw_caps("", "I420", width, height),
+            cfg.gop_frames,
             cfg.bitrate_kbps,
         ),
         (EncoderKind::Cpu, Codec::H265) => format!(
             "{src} ! nvvidconv ! {} \
-             ! x265enc tune=zerolatency key-int-max=30 bitrate={} speed-preset=ultrafast \
+             ! x265enc tune=zerolatency key-int-max={} bitrate={} speed-preset=ultrafast \
              ! h265parse config-interval=-1 \
              ! video/x-h265,stream-format=byte-stream,alignment=au \
              ! appsink name=enc sync=false",
             raw_caps("", "I420", width, height),
+            cfg.gop_frames,
             cfg.bitrate_kbps,
         ),
     }
@@ -107,6 +128,9 @@ mod tests {
             width: 1440,
             height: 1080,
             fps: 30,
+            exposure_us: None,
+            gain_min: None,
+            gain_max: None,
             paced: true,
             pool_size: 6,
             frames: None,
@@ -119,7 +143,7 @@ mod tests {
             capture_launch(&source_cfg()),
             "nvarguscamerasrc name=camsrc sensor-id=1 \
              ! video/x-raw(memory:NVMM),format=NV12,width=1440,height=1080,framerate=30/1 \
-             ! appsink name=frames max-buffers=6 drop=false sync=false"
+             ! appsink name=frames max-buffers=2 drop=true sync=false"
         );
     }
 
@@ -132,6 +156,10 @@ mod tests {
         };
         let launch = encode_launch(EncoderKind::Nvenc, &cfg, 1440, 1080);
         assert!(launch.contains("nvv4l2h265enc bitrate=8000000"), "{launch}");
+        assert!(
+            launch.contains("block=true max-buffers=4"),
+            "appsrc must be bounded: {launch}"
+        );
         assert!(
             launch.contains("video/x-raw(memory:NVMM),format=NV12"),
             "{launch}"

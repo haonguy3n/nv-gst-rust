@@ -31,6 +31,10 @@ pub struct YoloPostProcessor {
     num_classes: u32,
     score_threshold: f32,
     iou_threshold: f32,
+    /// Cap on candidates entering NMS (its cost is quadratic);
+    /// the highest scores survive the cap.
+    max_nms: usize,
+    scratch: Vec<bool>,
 }
 
 impl YoloPostProcessor {
@@ -46,6 +50,8 @@ impl YoloPostProcessor {
             num_classes,
             score_threshold,
             iou_threshold: 0.45,
+            max_nms: 300,
+            scratch: Vec::new(),
         }
     }
 
@@ -56,7 +62,7 @@ impl YoloPostProcessor {
 }
 
 impl PostProcessor for YoloPostProcessor {
-    fn decode(&self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
+    fn decode(&mut self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
         out.clear(meta.seq);
         let tensor = outputs
             .first()
@@ -66,19 +72,31 @@ impl PostProcessor for YoloPostProcessor {
         })?;
 
         let channels = 4 + self.num_classes as usize;
-        if tensor.spec.shape.len() != 3 || tensor.spec.shape[1] != channels {
-            return Err(Error::Platform(format!(
-                "yolo decoder: expected output shape [1, {channels}, N], got {:?}",
-                tensor.spec.shape
-            )));
-        }
-        let candidates = tensor.spec.shape[2];
+        // Accept both the channel-major [1, 4+C, N] head and
+        // transposed [1, N, 4+C] exports; reject anything else.
+        let (candidates, transposed) = match tensor.spec.shape.as_slice() {
+            [_, c, n] if *c == channels => (*n, false),
+            [_, n, c] if *c == channels => (*n, true),
+            _ => {
+                return Err(Error::Platform(format!(
+                    "yolo decoder: expected output shape [1, {channels}, N] or \
+                     [1, N, {channels}], got {:?}",
+                    tensor.spec.shape
+                )))
+            }
+        };
         if data.len() < channels * candidates {
             return Err(Error::Platform(
                 "yolo decoder: output tensor smaller than its spec".into(),
             ));
         }
-        let at = |channel: usize, i: usize| data[channel * candidates + i];
+        let at = |channel: usize, i: usize| {
+            if transposed {
+                data[i * channels + channel]
+            } else {
+                data[channel * candidates + i]
+            }
+        };
 
         // Undo the letterbox: model = frame * scale + pad.
         let (fw, fh) = (meta.width as f32, meta.height as f32);
@@ -99,10 +117,14 @@ impl PostProcessor for YoloPostProcessor {
                 continue;
             }
             let (cx, cy, w, h) = (at(0, i), at(1, i), at(2, i), at(3, i));
+            // Clip both corners to the frame, then derive size from
+            // the clipped corners (growing width after clamping x
+            // would re-extend past the edge).
             let x = ((cx - w / 2.0 - pad_x) / scale / fw).clamp(0.0, 1.0);
             let y = ((cy - h / 2.0 - pad_y) / scale / fh).clamp(0.0, 1.0);
-            let width = ((w / scale) / fw).clamp(0.0, 1.0 - x);
-            let height = ((h / scale) / fh).clamp(0.0, 1.0 - y);
+            let x2 = ((cx + w / 2.0 - pad_x) / scale / fw).clamp(0.0, 1.0);
+            let y2 = ((cy + h / 2.0 - pad_y) / scale / fh).clamp(0.0, 1.0);
+            let (width, height) = (x2 - x, y2 - y);
             if width <= 0.0 || height <= 0.0 {
                 continue;
             }
@@ -116,7 +138,12 @@ impl PostProcessor for YoloPostProcessor {
             });
         }
 
-        nms(&mut out.items, self.iou_threshold);
+        if out.items.len() > self.max_nms {
+            out.items
+                .sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+            out.items.truncate(self.max_nms);
+        }
+        nms(&mut out.items, self.iou_threshold, &mut self.scratch);
         Ok(())
     }
 }
@@ -126,7 +153,6 @@ mod tests {
     use super::*;
     use edge_core::{DType, Layout, PixelFormat, TensorBuffer, TensorSpec};
     use std::any::Any;
-    use std::sync::Arc;
     use std::time::Duration;
 
     struct TestBuffer(Vec<f32>);
@@ -168,14 +194,14 @@ mod tests {
         }
         Tensor::new(
             TensorSpec::new("output0", vec![1, channels, n], DType::F32),
-            Arc::new(TestBuffer(data)),
+            Box::new(TestBuffer(data)),
         )
     }
 
     #[test]
     fn decodes_box_and_best_class_without_letterbox_padding() {
         // Square frame into square model: no padding, scale 1.
-        let pp = YoloPostProcessor::new(64, 64, 3, 0.25);
+        let mut pp = YoloPostProcessor::new(64, 64, 3, 0.25);
         let t = tensor(
             &[
                 vec![32.0, 32.0, 16.0, 16.0, 0.1, 0.9, 0.2], // centre box, class 1
@@ -201,7 +227,7 @@ mod tests {
         // 128x64 frame into 64x64 model: scale 0.5, pad_y = 16.
         // Centre of frame = model (32, 32); a 32x16 frame-px box is
         // 16x8 model px. Expect normalised (0.375, 0.375, 0.25, 0.25).
-        let pp = YoloPostProcessor::new(64, 64, 1, 0.25);
+        let mut pp = YoloPostProcessor::new(64, 64, 1, 0.25);
         let t = tensor(&[vec![32.0, 32.0, 16.0, 8.0, 0.8]], 1);
         let mut out = Detections::default();
         pp.decode(&[t], &meta(128, 64), &mut out).unwrap();
@@ -215,7 +241,7 @@ mod tests {
 
     #[test]
     fn nms_keeps_only_best_of_overlapping_duplicates() {
-        let pp = YoloPostProcessor::new(64, 64, 1, 0.25);
+        let mut pp = YoloPostProcessor::new(64, 64, 1, 0.25);
         let t = tensor(
             &[
                 vec![32.0, 32.0, 16.0, 16.0, 0.9],
@@ -230,8 +256,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_transposed_candidate_major_head() {
+        // Same centre box as the channel-major test, laid out
+        // [1, N, 4+C] row-major instead.
+        let mut pp = YoloPostProcessor::new(64, 64, 3, 0.25);
+        let t = Tensor::new(
+            TensorSpec::new("output0", vec![1, 1, 7], DType::F32),
+            Box::new(TestBuffer(vec![32.0, 32.0, 16.0, 16.0, 0.1, 0.9, 0.2])),
+        );
+        let mut out = Detections::default();
+        pp.decode(&[t], &meta(64, 64), &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.items[0].class_id, 1);
+        assert!((out.items[0].x - 0.375).abs() < 1e-6);
+    }
+
+    #[test]
     fn rejects_wrong_output_shape() {
-        let pp = YoloPostProcessor::new(64, 64, 80, 0.25);
+        let mut pp = YoloPostProcessor::new(64, 64, 80, 0.25);
         let t = tensor(&[vec![0.0, 0.0, 0.0, 0.0, 0.9]], 1);
         let mut out = Detections::default();
         assert!(pp.decode(&[t], &meta(64, 64), &mut out).is_err());

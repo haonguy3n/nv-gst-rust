@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DType {
@@ -59,13 +58,20 @@ pub trait TensorBuffer: Send + Sync + 'static {
 
 /// Model input/output only (small). Same shape as `HwFrame`: a spec
 /// plus an opaque buffer handle.
+///
+/// The buffer is uniquely owned (`Box`, not `Arc`): the engine's
+/// input binding must stay writable by the preprocessor for as
+/// long as the engine holds it, and shared ownership made that
+/// write silently fail (REVIEW P1-11). A backend that also needs
+/// the raw address (e.g. TensorRT `setTensorAddress`) keeps the
+/// pointer, not a second owner.
 pub struct Tensor {
     pub spec: TensorSpec,
-    pub buf: Arc<dyn TensorBuffer>,
+    pub buf: Box<dyn TensorBuffer>,
 }
 
 impl Tensor {
-    pub fn new(spec: TensorSpec, buf: Arc<dyn TensorBuffer>) -> Self {
+    pub fn new(spec: TensorSpec, buf: Box<dyn TensorBuffer>) -> Self {
         Self { spec, buf }
     }
 
@@ -73,14 +79,14 @@ impl Tensor {
         self.buf.as_f32_slice()
     }
 
-    /// Mutable host view. Returns `None` when the buffer is shared or
-    /// not host-visible; in-place GPU writes go through `as_any_mut`
+    /// Mutable host view. Returns `None` when the buffer is not
+    /// host-visible; in-place GPU writes go through `as_any_mut`
     /// inside the owning backend instead.
     pub fn as_f32_slice_mut(&mut self) -> Option<&mut [f32]> {
-        Arc::get_mut(&mut self.buf)?.as_f32_slice_mut()
+        self.buf.as_f32_slice_mut()
     }
 
-    pub fn buffer_mut(&mut self) -> Option<&mut dyn TensorBuffer> {
-        Arc::get_mut(&mut self.buf)
+    pub fn buffer_mut(&mut self) -> &mut dyn TensorBuffer {
+        &mut *self.buf
     }
 }

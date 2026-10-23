@@ -9,7 +9,7 @@
 //! The line that matters on the device is `copied=0`: any other
 //! value means frames left NVMM on their way in.
 
-use edge_core::{FrameMemory, FramePoll, FrameSource, SourceConfig};
+use edge_core::{FrameMemory, FramePoll, FrameSource, Layout, SourceConfig};
 use platform_jetson::gst_source::GstLaunchSource;
 use platform_jetson::launch::capture_launch;
 use std::time::Duration;
@@ -31,34 +31,39 @@ fn main() {
         width: 1440,
         height: 1080,
         fps: 30,
+        exposure_us: None,
+        gain_min: None,
+        gain_max: None,
         paced: true,
         pool_size: 6,
         frames: None,
     };
-    let (launch, memory) = if test_pattern {
+    let (launch, memory, layout) = if test_pattern {
         (
             "videotestsrc is-live=true ! videoconvert \
              ! video/x-raw,format=NV12,width=1440,height=1080,framerate=30/1 \
-             ! appsink name=frames max-buffers=6 drop=false sync=false"
+             ! appsink name=frames max-buffers=2 drop=true sync=false"
                 .to_string(),
             FrameMemory::DmaBuf,
+            Layout::PitchLinear,
         )
     } else {
-        (capture_launch(&cfg), FrameMemory::Nvmm)
+        (capture_launch(&cfg), FrameMemory::Nvmm, Layout::BlockLinear)
     };
     println!("launch: {launch}");
 
-    let mut source = GstLaunchSource::new(&launch, cfg, memory).expect("build capture source");
+    let mut source =
+        GstLaunchSource::new(&launch, cfg, memory, layout).expect("build capture source");
     source.start().expect("start capture");
     for _ in 0..frames {
         match source.next_frame(Duration::from_secs(2)) {
             Ok(FramePoll::Frame(frame)) => println!(
                 "seq={} pts={:?} fd={} {}x{}",
-                frame.meta.seq,
-                frame.meta.pts,
-                frame.meta.dmabuf_fd,
-                frame.meta.width,
-                frame.meta.height
+                frame.meta().seq,
+                frame.meta().pts,
+                frame.meta().dmabuf_fd,
+                frame.meta().width,
+                frame.meta().height
             ),
             Ok(FramePoll::Timeout) => println!("timeout (no frame due)"),
             Ok(FramePoll::EndOfStream) => {

@@ -40,7 +40,7 @@ Oct 23, 2026 · @Hao
 | Sinks: JSONL metadata, file video, fan-out; Prometheus text metrics | `crates/sinks`, `pipeline::PipelineMetrics` | unit tests; live JSONL run |
 | Conformance suite every backend must pass | `crates/conformance` (sim passes; broken stubs caught) | maintained tests in `platform-sim` and the suite crate |
 | Jetson: NVENC/NVJPG sysfs probe, encoder choice, pinned GStreamer launch strings | `crates/platform-jetson` (`probe.rs`, `launch.rs`) | unit tests incl. fake sysfs tree |
-| Jetson: GStreamer capture runtime (`appsink`, dmabuf wrap, counted PC copy fallback) | `platform-jetson --features gst` (`gst_source.rs`) | PC tests with `videotestsrc` (copied=5 counted); **not on device yet** — `copied=0` on the Orin is an M1 exit gate |
+| Jetson: GStreamer capture runtime (`appsink`; system-memory copy fallback on PC, NVMM dmabuf branch refuses loudly until wired) | `platform-jetson --features gst` (`gst_source.rs`) | PC tests verify only the system-memory fallback (copies counted) and the NVMM refusal; the dmabuf/NVMM path is **exercised nowhere yet** — `copied=0` on the Orin is an M1 exit gate |
 | Jetson: TensorRT engine, CUDA pre-process/overlay, NVENC encode stage, RTSP sink | — | **Not implemented** (M1 device work; launch strings are the contract) |
 | aarch64 cross-build | Docker (`tools/Dockerfile.cross`), CI job with configured linker | real aarch64 ELF produced in Docker |
 | Zero-copy on device (no `memcpy` in steady state) | — | **Not verified** — Nsight/`tegrastats` EMC gate on the flashed board (M1) |
@@ -66,7 +66,7 @@ Build one Rust binary that captures camera frames, runs a neural network on them
 | CPU load (whole process) | < 25% of one core per stream |
 | Steady-state allocations in hot loop | 0 |
 
-Orin Nano targets are the same at one camera; confirm once the model is chosen.
+Orin Nano (strict profile, detections only) targets the same at one camera. The relaxed CPU-encode profile has its own CPU budget (≈1.1 NX cores measured in the reference product for H.264; a Nano's 6 slower cores will use more) and is exempt from the <25%-of-one-core row above; confirm both once the model is chosen.
 
 **Non-goals (v1)**
 
@@ -95,16 +95,16 @@ After the sensor writes a frame, no CPU instruction and no `cudaMemcpy` ever cop
 | Output tensors | pinned mapped host memory (`cudaHostAllocMapped`) | TensorRT | CPU post-process |
 | Bitstream | encoder output buffer (GstBuffer from `nvv4l2h26xenc` in M1; V4L2 capture-plane mmap if/when the direct-Argus path replaces the encoder too) | NVENC | RTSP sink by reference; returned to the encoder pool on drop. RTP payloading copies the (small) bitstream — budget it explicitly, it is not zero |
 
-Only the output tensors (around 1 MB for a YOLO-class head) and the compressed bitstream are touched by the CPU. The kernel's socket send is the one copy no user-space design can avoid.
+Only the output tensors (2.82 MB F32 for a YOLOv8 640×80-class head, halved in FP16) and the compressed bitstream are touched by the CPU. Two bitstream copies remain and are budgeted, not denied: RTP payloading repacketizes the encoded bytes, and the kernel copies on socket send. Neither touches pixels.
 
 **How the code enforces it**
 
 - **No byte access in the type.** `HwBuffer` has no `as_slice()`. `map_cpu()` exists only behind a `cpu-debug` feature that release builds never enable, so code that needs CPU pixels does not compile in release.
-- **Strict domain matching.** The pipeline builder never inserts a converter silently. If two stages disagree on memory domain or layout (block-linear vs pitch-linear), startup fails with the mismatch named. At startup it prints the buffer budget above.
-- **Write into, never return.** Stages write into buffers owned by the next stage: the pre-processor writes into the engine's input binding; the encoder hands packets out through a callback instead of allocating a `Vec`.
-- **Same fd end to end.** `FrameMeta` carries the capture dmabuf fd; the encoder asserts it is encoding that same fd.
+- **Strict domain matching.** The pipeline builder never inserts a converter silently. The source declares its memory domain and layout; both are checked against platform caps at build time, the declared layout (not an assumption) is handed to the preprocessor, and a stage that cannot consume it fails at startup with the mismatch named. At startup the pipeline prints the buffer budget above.
+- **Write into, never return.** Stages write into buffers owned by the next stage: the pre-processor writes into the engine's input binding; the encoder hands packets out through a callback as shared handles (`Arc<[u8]>` today; an encoder-owned buffer kept alive by the packet on hardware), never a freshly allocated `Vec` per sink.
+- **Same fd end to end.** `FrameMeta` (immutable after the source hands it out) carries the capture dmabuf fd; the pipeline checks it against the buffer's fd before encode — a typed error in release builds, not a debug assert.
 - **Frames move by value to the encoder.** The encoder holds the `HwFrame` until NVENC releases it, then dropping it returns the buffer to the Argus pool. Pool size ≥ frames in flight + 2.
-- **Zero allocations in the hot loop.** A counting global allocator in tests fails the build if steady-state allocations are above 0.
+- **Zero allocations in the hot loop.** The decoders already gate on this (counting-allocator test around 100 steady-state decodes); extending the same gate to the capture/encode stages is M1 device work, measured there rather than assumed.
 
 The trait sketch in the HAL section is written to these rules: `HwFrame` has no CPU-memory variant, every stage takes a GPU stream, and the encoder is optional per platform.
 
@@ -117,7 +117,7 @@ The trait sketch in the HAL section is written to these rules: `HwFrame` has no 
 **No frame copies, no exceptions**
 
 - **Capture stays in NVMM from M1.** M1 uses `nvarguscamerasrc` → appsink (the path both shipping reference products use; frames are NVMM NV12 from the ISP, no capture-side copy). Direct libargus buffer-stream capture into our own NVMM pool is a later replacement behind the same `FrameSource` trait, adopted only if device traces show the GStreamer boundary costing us copies or latency.
-- **Orin Nano defaults to never handing frames to the CPU.** It has no NVENC, so the strict Nano profile runs capture → infer → overlay fully in NVMM and streams detections only (MQTT / WebSocket metadata); `zero_copy = "strict"` (the default) refuses any CPU-encode profile. A Nano product that truly needs video opts in explicitly (`zero_copy = "relaxed"`, `encoder.hardware = false`) to the measured VIC-copy + x264 path — one deliberate, budgeted copy, chosen in config, never a silent fallback (revision decision 3).
+- **Orin Nano defaults to never handing frames to the CPU.** It has no NVENC, so the strict Nano profile runs capture → infer → overlay fully in NVMM and streams detections only (metadata sinks: JSONL today; MQTT/WebSocket are later sink work); `zero_copy = "strict"` (the default) refuses any CPU-encode profile. A Nano product that truly needs video opts in explicitly (`zero_copy = "relaxed"`, `encoder.hardware = false`) to the measured VIC-copy + x264 path — one deliberate, budgeted copy, chosen in config, never a silent fallback (revision decision 3).
 - **Layout changes stay on hardware.** If a stage needs a different layout (block-linear → pitch-linear), VIC converts NVMM → NVMM, and the startup budget lists it. The CPU never touches pixels.
 
 ## Platform abstraction (HAL) design
@@ -180,7 +180,7 @@ pub struct Tensor {
 pub trait FrameSource: Send {
     fn start(&mut self) -> Result<()>;
     /// Hands out a frame from the source's NVMM pool; never allocates, never copies.
-    fn next_frame(&mut self, timeout: Duration) -> Result<Option<HwFrame>>;
+    fn next_frame(&mut self, timeout: Duration) -> Result<FramePoll>; // Frame | Timeout | EndOfStream — never conflated
     fn stop(&mut self) -> Result<()>;
 }
 
@@ -279,7 +279,7 @@ The Jetson backend keeps every frame as an NvBufSurface (NVMM) from sensor to en
 
 | Stage | Orin NX | Orin Nano | Rust integration (zero-copy detail) |
 | --- | --- | --- | --- |
-| Capture | libargus buffer output stream writing into our own pitch-linear NV12 NvBufSurfaces (dmabuf), from M1 | same | `argus-sys` C++ shim via `cxx`; never `copyToNvBuffer` (it copies); confirm the buffer-stream API against the pinned JetPack's Argus samples |
+| Capture | M1: `nvarguscamerasrc` → block-linear NV12 in NVMM → appsink (the reference products' path). Later, if traces justify it: libargus buffer output stream into our own pitch-linear NVMM pool | same | M1: gstreamer-rs pipelines from pinned launch strings; NVMM buffers need the NvBufSurface branch (gst-nvmm `nvmmalloc`), never a CPU map/copy. Later: `argus-sys` C++ shim via `cxx`; never `copyToNvBuffer` (it copies) |
 | Pre-process | one fused CUDA kernel: NV12 → letterbox resize → normalise → FP16, written straight into the TensorRT input binding | same | surface → EGLImage → `cuGraphicsEGLRegisterImage` gives a device pointer to the same memory; kernels built by `nvcc` in `build.rs`, launched with `cudarc`. VIC path (`NvBufSurfTransform`, NVMM → NVMM) kept as an option to offload the GPU |
 | Inference | TensorRT 10 on GPU or DLA (1–2 DLA cores) | TensorRT on GPU only (no DLA) | `tensorrt-sys` C shim; `setTensorAddress` points at our pooled tensors, `enqueueV3` on the camera's CUDA stream; outputs in `cudaHostAllocMapped` memory |
 | Post-process | CPU reads only the small output tensors, in place | same | shared `postproc` crate, borrows `&[Tensor]` |
@@ -292,9 +292,9 @@ The Jetson backend keeps every frame as an NvBufSurface (NVMM) from sensor to en
 - **Engines are device-specific.** A TensorRT `.engine` only runs on the same TensorRT version and GPU it was built for. Ship the ONNX model; build the engine on the device at first boot (`tools/build-engine.sh` wrapping `trtexec`) and cache it keyed by TRT version + model hash.
 - **One CUDA stream per camera**, with pre-process, inference and overlay queued on it; the CPU thread only waits on an event. This keeps the CPU near idle.
 - **Synchronisation across engines** (VIC, CUDA, encoder) uses `NvBufSurfaceSyncForDevice` / CUDA events; wrap them so a stage cannot forget to sync.
-- **Pool sizing:** capture pool ≥ pipeline depth + 2 (e.g. 6 buffers); exhausting the pool drops the oldest frame rather than blocking the sensor.
+- **Pool sizing:** capture pool ≥ channel queue depth + 3 (validated in config; default pool 8 with queue 4); exhausting the pool reports a counted timeout and drops the frame rather than blocking the sensor.
 - **Version pinning:** pin JetPack 7 (L4T r39.2.1, TensorRT 10.16, CUDA 13) for v1 and record the exact flashed versions in `config/`; when the direct-Argus shim lands, its headers are generated from that release's `/usr/src/jetson_multimedia_api`.
-- **Build:** cross-compile from x86 with a Docker image holding the L4T sysroot, or build natively on the Orin; both covered in CI.
+- **Build:** cross-compile from x86 (Docker image today; the L4T sysroot joins it when the NVMM stage work lands) or build natively on the Orin. CI covers the cross build; there is no Orin CI runner yet.
 - **Avoid a DeepStream dependency** in v1: it is heavy and its licensing/versions tie you to NVIDIA's release cadence. The backend uses only the Multimedia API, CUDA and TensorRT.
 
 ## Porting guide: NXP and Ambarella
@@ -319,23 +319,25 @@ Adding a platform means writing one new `platform-<vendor>` crate that implement
 - [ ] Add a feature flag, a `config/<board>.toml` and a cross-compile Docker target.
 - [ ] Pass the shared conformance suite (below) on the board.
 
-**Conformance suite** — a crate of trait-level tests every backend must pass: frame order and timestamps monotonic, pool exhaustion drops instead of deadlocking, golden-image pre-processing within tolerance, detection mAP within 1–2 points of the ONNX reference on a fixed clip, clean shutdown with no leaked buffers.
+**Conformance suite** — a crate of trait-level tests every backend must pass: frame order and timestamps monotonic, pool exhaustion reports `Timeout` instead of deadlocking (and recovers), preprocessor writes finite non-trivial values into the engine binding, encoder option matches caps, clean shutdown with no leaked buffers. Golden-image pre-processing values and detection mAP vs the ONNX reference are device/model gates (M1+), explicitly not in the trait suite today.
 
 ## Milestones and roadmap
 
-Ship a working Jetson demo early on direct Argus capture (M1), then move every stage onto the zero-copy GPU path; the NXP port in M5 is the real test of the abstraction.
+Ship a working Jetson demo early on the GStreamer hybrid path (M1: Argus capture in NVMM, NVENC encode, dmabuf import proven by Nsight/EMC traces), then move every remaining stage onto the zero-copy GPU path; the NXP port in M5 is the real test of the abstraction.
 
 &#91;embedded content: roadmap · 6 phases, each with an exit gate\]
 
-Each phase ends only when its gate is measured on hardware, not when its code is merged.
+Each phase ends only when its gate is measured on hardware, not when its code is merged. Measurements are only comparable with SoC clocks pinned (devfreq floors via a `camera-clocks`-style unit); unpinned DVFS numbers measure the governor, not the code.
+
+**M1 device constraints (round-3 review, from the shipping product's device history).** These change the process model, not just the implementation, and are design inputs until each is closed on the board: (a) Argus failure is process-level — a lost `nvargus-daemon` session never recovers in-process, arrives as bare EOS, and teardown after daemon loss can segfault in the Argus client; recovery is once-per-boot via exit code 75 + daemon restart, owned by the app with the daemon-restart timestamp checked before teardown. One process per camera is our default for fault isolation (they share the daemon regardless). (b) The capture pool belongs to `nvarguscamerasrc`; what we control is the total in-flight surface count (appsink 2 + channel + 1 processing + appsrc 4 + encoder ≥1), which must stay under the Argus pool size — hence small live queues. An encoder must hold each `HwFrame` until NVENC releases the surface. (c) Prefer clean video plus metadata-track boxes over drawing into the capture surface, and never gate video on inference (engine builds take minutes; stream first, detect when ready) — the split video/inference runner is an M1 design decision to make before the NVENC stage. (d) IMX296 facts: AE needs the gain cap (config), white balance is inert until the vendor NITO lands (expect a green cast; pin golden mAP to the tuned image), first ~1 s of frames are dark, and cam1 currently stops after 13–15 s under Argus in the reference product — the 2-camera target is blocked on that hardware cause. (e) On the camera Yocto image: write the boot-ok marker only after a real first-frame health check, keep disk writes off the frame thread (bounded writer thread), and respect the systemd sandbox / camera-guard grants; `edge-vision` uses RTSP port 8555 (8554 is camera-streamer's).
 
 **First week, concretely**
 
-- [ ] `cargo new --lib` the workspace; add `core`, `pipeline`, `platform-sim`, `apps/edge-vision`
-- [ ] Write `HwFrame`, `HwBuffer`, `Tensor` and the five stage traits from the HAL section
-- [ ] TOML config schema + loader with validation errors
-- [ ] `platform-sim` file source and ONNX Runtime engine; run one YOLO ONNX model on a recorded clip
-- [ ] CI: fmt, clippy, tests, `cargo deny`; aarch64 cross-build job
+- [x] `cargo new --lib` the workspace; add `core`, `pipeline`, `platform-sim`, `apps/edge-vision`
+- [x] Write `HwFrame`, `HwBuffer`, `Tensor` and the five stage traits from the HAL section
+- [x] TOML config schema + loader with validation errors
+- [x] `platform-sim` file source and ONNX Runtime engine; run one YOLO ONNX model on a recorded clip (YOLOX-tiny, manually verified; committed-test conversion pending)
+- [x] CI: fmt, clippy, tests, `cargo deny`; aarch64 cross-build job
 - [ ] Flash the Orin NX with the pinned JetPack; record versions of CUDA, TensorRT, L4T
 
 ## Risks, testing and performance
@@ -346,7 +348,7 @@ The biggest risks are FFI glue to C++-only SDKs and hidden copies; both are caug
 | --- | --- | --- |
 | libargus and TensorRT are C++-only | slow start, unsafe surface grows | thin C shims via `cxx`, kept under \~500 lines each; direct Argus capture from M1 |
 | Hidden CPU copies (map/unmap, wrong memory type) | CPU load and latency balloon | `HwBuffer::map_cpu` counted in metrics; CI fails if it is called in the hot loop |
-| Orin Nano has no NVENC | no video stream on Nano | Nano profile streams detections only; no CPU encode, no frame copy; use Orin NX where video is required |
+| Orin Nano has no NVENC | no video stream on Nano in strict mode | strict Nano profile streams detections only; CPU encode only as the explicit relaxed-mode opt-in (one budgeted VIC copy); prefer Orin NX where video is required |
 | JetPack / TensorRT upgrades break ABI | rebuilds, engine rebuilds | pin JetPack, rebuild engines at boot, headers regenerated per release |
 | Abstraction leaks Jetson assumptions | NXP port forces core changes | build `platform-sim` from day one as a second backend; review traits before M4 |
 | Ambarella SDK under NDA | cannot publish backend | keep that crate in a private repo, depending on the public core by version |

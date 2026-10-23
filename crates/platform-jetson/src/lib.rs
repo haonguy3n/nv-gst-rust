@@ -27,9 +27,12 @@ pub mod probe;
 
 pub use probe::{choose_encoder, probe_media_engines, EncoderChoice, EncoderKind, MediaEngines};
 
+#[cfg(feature = "gst")]
+use edge_core::Layout;
 use edge_core::{
     Codec, Encoder, EncoderConfig, Error, FrameMemory, FrameSource, InferenceEngine, ModelConfig,
-    Overlay, PixelFormat, Platform, PlatformCaps, PreConfig, Preprocessor, Result, SourceConfig,
+    Overlay, PixelFormat, Platform, PlatformCaps, PreConfig, Precision, Preprocessor, Result,
+    SourceConfig,
 };
 use std::path::Path;
 
@@ -76,10 +79,14 @@ impl Platform for JetsonPlatform {
             } else {
                 Vec::new()
             },
+            precisions: vec![Precision::Fp32, Precision::Fp16, Precision::Int8],
+            devices: vec!["gpu".into()],
             has_hw_encoder: self.engines.nvenc,
-            // launch::encode_launch has the VIC + x264/x265 strings;
-            // the runtime lands with the M1 encoder stage.
-            cpu_encode: true,
+            // The launch strings for the VIC + x264/x265 path exist,
+            // but no encoder stage does yet; do not advertise a
+            // capability the platform cannot supply. Flip this when
+            // the M1 encoder stage lands.
+            cpu_encode: false,
             accelerators: vec!["gpu".into()],
         }
     }
@@ -106,6 +113,8 @@ impl Platform for JetsonPlatform {
                 &launch,
                 cfg.clone(),
                 FrameMemory::Nvmm,
+                // nvarguscamerasrc NVMM surfaces are block-linear.
+                Layout::BlockLinear,
             )?))
         }
         #[cfg(not(feature = "gst"))]

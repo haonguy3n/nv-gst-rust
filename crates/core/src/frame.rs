@@ -14,6 +14,10 @@ pub enum FrameMemory {
     Nvmm,
     /// NXP / Ambarella / generic V4L2 DMA-BUF.
     DmaBuf,
+    /// A backend-defined domain (e.g. Ambarella IAV/DSP shared
+    /// memory). Naming it here must never require a core release:
+    /// a new platform brings its own tag, and equality is exact.
+    Other(&'static str),
 }
 
 impl std::fmt::Display for FrameMemory {
@@ -21,6 +25,7 @@ impl std::fmt::Display for FrameMemory {
         match self {
             Self::Nvmm => f.write_str("NVMM"),
             Self::DmaBuf => f.write_str("DMA-BUF"),
+            Self::Other(name) => f.write_str(name),
         }
     }
 }
@@ -91,7 +96,11 @@ impl<'a> CpuMapping<'a> {
 pub trait HwBuffer: Send + Sync + 'static {
     fn memory(&self) -> FrameMemory;
     /// Every backend must provide a dmabuf fd: it is the lingua franca
-    /// for cross-API import (CUDA, V4L2 encoder, ...).
+    /// for cross-API import (CUDA, V4L2 encoder, ...). Contract: the
+    /// fd names ONE contiguous allocation; planes are offsets within
+    /// it, with pitch/plane geometry backend-internal for now (a
+    /// plane descriptor lands with the NVMM stage work in M1, when
+    /// stride comes from real NvBufSurface params instead of guesses).
     fn dmabuf_fd(&self) -> RawFd;
     /// Downcast inside its own backend only.
     fn as_any(&self) -> &dyn Any;
@@ -108,13 +117,19 @@ pub trait HwBuffer: Send + Sync + 'static {
 /// a stage boundary; pixel bytes never do.
 #[derive(Clone)]
 pub struct HwFrame {
-    pub meta: FrameMeta,
+    // Private: the fd in here is part of the same-fd contract, so
+    // no stage may rewrite it after the source hands the frame out.
+    meta: FrameMeta,
     pub buf: Arc<dyn HwBuffer>,
 }
 
 impl HwFrame {
     pub fn new(meta: FrameMeta, buf: Arc<dyn HwBuffer>) -> Self {
         Self { meta, buf }
+    }
+
+    pub fn meta(&self) -> &FrameMeta {
+        &self.meta
     }
     pub fn memory(&self) -> FrameMemory {
         self.buf.memory()

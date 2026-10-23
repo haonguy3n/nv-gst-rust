@@ -21,6 +21,8 @@ pub struct YoloxPostProcessor {
     score_threshold: f32,
     iou_threshold: f32,
     top_k: usize,
+    max_nms: usize,
+    scratch: Vec<bool>,
 }
 
 impl YoloxPostProcessor {
@@ -37,6 +39,8 @@ impl YoloxPostProcessor {
             score_threshold,
             iou_threshold: 0.45,
             top_k: 100,
+            max_nms: 300,
+            scratch: Vec::new(),
         }
     }
 }
@@ -49,7 +53,7 @@ fn pick<'a>(outputs: &'a [Tensor], name: &str, index: usize) -> Option<&'a Tenso
 }
 
 impl PostProcessor for YoloxPostProcessor {
-    fn decode(&self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
+    fn decode(&mut self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
         out.clear(meta.seq);
         let missing = |what: &str| Error::Platform(format!("yolox decoder: missing {what}"));
         let boxes_t = pick(outputs, "boxes", 0).ok_or_else(|| missing("boxes output"))?;
@@ -127,8 +131,13 @@ impl PostProcessor for YoloxPostProcessor {
             });
         }
 
-        nms_agnostic(&mut out.items, self.iou_threshold);
-        nms(&mut out.items, self.iou_threshold);
+        if out.items.len() > self.max_nms {
+            out.items
+                .sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+            out.items.truncate(self.max_nms);
+        }
+        nms_agnostic(&mut out.items, self.iou_threshold, &mut self.scratch);
+        nms(&mut out.items, self.iou_threshold, &mut self.scratch);
         out.items.truncate(self.top_k);
         Ok(())
     }
@@ -139,7 +148,6 @@ mod tests {
     use super::*;
     use edge_core::{DType, Layout, PixelFormat, TensorBuffer, TensorSpec};
     use std::any::Any;
-    use std::sync::Arc;
     use std::time::Duration;
 
     struct TestBuffer(Vec<f32>);
@@ -158,7 +166,7 @@ mod tests {
     fn tensor(name: &str, shape: Vec<usize>, data: Vec<f32>) -> Tensor {
         Tensor::new(
             TensorSpec::new(name, shape, DType::F32),
-            Arc::new(TestBuffer(data)),
+            Box::new(TestBuffer(data)),
         )
     }
 
@@ -178,7 +186,7 @@ mod tests {
     #[test]
     fn decodes_xyxy_with_objectness_product() {
         // Model and frame both 416x416: scale 1, no padding.
-        let pp = YoloxPostProcessor::new(416, 416, 3, 0.3);
+        let mut pp = YoloxPostProcessor::new(416, 416, 3, 0.3);
         let outputs = vec![
             tensor(
                 "boxes",
@@ -207,7 +215,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_class_count() {
-        let pp = YoloxPostProcessor::new(416, 416, 80, 0.3);
+        let mut pp = YoloxPostProcessor::new(416, 416, 80, 0.3);
         let outputs = vec![
             tensor("boxes", vec![1, 1, 4], vec![0.0; 4]),
             tensor("objectness", vec![1, 1, 1], vec![0.9]),

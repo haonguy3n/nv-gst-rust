@@ -16,14 +16,15 @@ pub use metrics::PipelineMetrics;
 
 use edge_core::{
     Config, Detections, Encoder, Error, FramePoll, FrameSource, GpuStream, HwFrame,
-    InferenceEngine, Layout, Overlay, PixelFormat, Platform, PostProcessor, PreConfig,
-    Preprocessor, Result, Sink,
+    InferenceEngine, Overlay, PixelFormat, Platform, PostProcessor, PreConfig, Preprocessor,
+    Result, Sink,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct Pipeline {
+    input_spec: Option<edge_core::TensorSpec>,
     source: Box<dyn FrameSource>,
     preprocessor: Box<dyn Preprocessor>,
     engine: Box<dyn InferenceEngine>,
@@ -56,6 +57,27 @@ impl Pipeline {
                 ),
             ));
         }
+        if !caps.precisions.is_empty() && !caps.precisions.contains(&config.model.precision) {
+            return Err(Error::invalid(
+                "model.precision",
+                format!(
+                    "{} not supported by platform `{}`",
+                    config.model.precision,
+                    platform.name()
+                ),
+            ));
+        }
+        if !caps.devices.is_empty() && !caps.devices.contains(&config.model.device) {
+            return Err(Error::invalid(
+                "model.device",
+                format!(
+                    "`{}` not available on platform `{}` (has: {})",
+                    config.model.device,
+                    platform.name(),
+                    caps.devices.join(", ")
+                ),
+            ));
+        }
         if !caps.formats.contains(&PixelFormat::Nv12) {
             return Err(Error::DomainMismatch {
                 stage: "source",
@@ -78,13 +100,15 @@ impl Pipeline {
             src_height: config.source.height,
             dst_width: config.model.input_width,
             dst_height: config.model.input_height,
-            layout: Layout::PitchLinear,
+            layout: source.layout(),
             color: config.model.input_color,
+            colorspace: config.model.input_colorspace,
             normalize: config.model.input_normalize,
             pad_value: config.model.pad_value,
         };
         let preprocessor = platform.preprocessor(&pre_cfg)?;
-        let engine = platform.engine(&config.model)?;
+        let mut engine = platform.engine(&config.model)?;
+        let input_spec = engine.input_bindings().first().map(|t| t.spec.clone());
         let overlay = platform.overlay()?;
 
         let encoder = if config.encoder.enabled {
@@ -149,6 +173,7 @@ impl Pipeline {
         let metadata_only = encoder.is_none();
 
         Ok(Self {
+            input_spec,
             source,
             preprocessor,
             engine,
@@ -171,16 +196,24 @@ impl Pipeline {
         let s = &self.config.source;
         let m = &self.config.model;
         let capture = PixelFormat::Nv12.frame_bytes(s.width, s.height);
-        let input = (m.input_width as usize) * (m.input_height as usize) * 3 * 2; // FP16
+        let (dtype, input) = match &self.input_spec {
+            Some(spec) => (format!("{:?}", spec.dtype), spec.byte_len()),
+            None => (
+                "FP16 (assumed)".to_string(),
+                (m.input_width as usize) * (m.input_height as usize) * 3 * 2,
+            ),
+        };
         format!(
-            "buffer budget:\n  capture NV12 {}x{} pitch-linear: {} bytes x pool {}\n  \
-             input tensor FP16 3x{}x{}: {} bytes (engine binding, written once)\n  \
+            "buffer budget:\n  capture NV12 {}x{} {}: {} bytes x pool {}\n  \
+             input tensor {} 3x{}x{}: {} bytes (engine binding, written once)\n  \
              output tensors: host-visible, read in place\n  \
              mode: {}",
             s.width,
             s.height,
+            self.source.layout(),
             capture,
             s.pool_size,
+            dtype,
             m.input_width,
             m.input_height,
             input,
@@ -293,7 +326,7 @@ impl Pipeline {
 
         let t = Instant::now();
         self.postprocessor
-            .decode(self.engine.output_bindings(), &frame.meta, detections)?;
+            .decode(self.engine.output_bindings(), frame.meta(), detections)?;
         metrics.post_total += t.elapsed();
         metrics.detections += detections.len() as u64;
 
@@ -307,8 +340,15 @@ impl Pipeline {
                 let sink = &mut *self.sink;
                 let mut sink_err: Option<Error> = None;
                 // The encoder holds the HwFrame until the hardware
-                // releases it; assert the fd contract here.
-                debug_assert_eq!(frame.meta.dmabuf_fd, frame.buf.dmabuf_fd());
+                // releases it; enforce the same-fd contract in
+                // release builds too, not just debug ones.
+                if frame.meta().dmabuf_fd != frame.buf.dmabuf_fd() {
+                    return Err(Error::Platform(format!(
+                        "encoder fd contract violated: meta says fd {}, buffer is fd {}",
+                        frame.meta().dmabuf_fd,
+                        frame.buf.dmabuf_fd()
+                    )));
+                }
                 encoder.encode(frame, &mut |pkt| {
                     if let Err(e) = sink.push_video(pkt) {
                         sink_err = Some(e);

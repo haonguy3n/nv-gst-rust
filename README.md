@@ -47,11 +47,11 @@ cargo run -p edge-vision -- config/x86-dev.toml --frames 30
 cargo test --workspace
 ```
 
-The sim backend has no hardware encoder, so — like the Orin Nano
-profile — it streams detections only and never hands frames to a CPU
-encoder. `zero_copy = "strict"` in the config refuses CPU-encode
-profiles at load time, and the pipeline builder refuses an encoder
-request on any platform without hardware encode.
+The sim backend has no encoder at all, so it streams detections only.
+`zero_copy = "strict"` (the default) refuses CPU-encode profiles at
+load time; on a platform that offers a CPU path, video without NVENC
+is the explicit opt-in `zero_copy = "relaxed"` + `encoder.hardware =
+false`, and the builder enforces exactly that matrix.
 
 ## Layout
 

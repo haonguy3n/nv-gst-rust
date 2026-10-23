@@ -18,9 +18,10 @@ mod onnx;
 
 use edge_core::{
     DType, Detection, Detections, Encoder, EncoderConfig, Error, FrameMemory, FrameMeta, FramePoll,
-    FrameSource, GpuStream, HwBuffer, HwFrame, InferenceEngine, InputColor, InputNormalize, Layout,
-    ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps, PostProcessor, PreConfig,
-    Preprocessor, Result, SourceConfig, Tensor, TensorBuffer, TensorSpec,
+    FrameSource, GpuStream, HwBuffer, HwFrame, InferenceEngine, InputColor, InputColorspace,
+    InputNormalize, Layout, ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps,
+    PostProcessor, PreConfig, Precision, Preprocessor, Result, SourceConfig, Tensor, TensorBuffer,
+    TensorSpec,
 };
 use std::any::Any;
 use std::fs::File;
@@ -34,11 +35,14 @@ use std::time::Duration;
 
 type FilePool = Arc<Mutex<Vec<File>>>;
 
+static POOL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn make_pool(pool_size: usize, frame_bytes: usize) -> Result<FilePool> {
+    let pool_id = POOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut files = Vec::with_capacity(pool_size);
     for i in 0..pool_size {
         let path = PathBuf::from(format!(
-            "/dev/shm/edge-vision-sim-{}-{i}",
+            "/dev/shm/edge-vision-sim-{}-{pool_id}-{i}",
             std::process::id()
         ));
         let file = std::fs::OpenOptions::new()
@@ -229,15 +233,15 @@ pub struct HostTensor {
 }
 
 impl HostTensor {
-    fn zeros(elements: usize) -> Arc<dyn TensorBuffer> {
-        Arc::new(Self {
+    fn zeros(elements: usize) -> Box<dyn TensorBuffer> {
+        Box::new(Self {
             data: vec![0.0; elements],
         })
     }
 
     #[cfg(feature = "onnx")]
-    pub(crate) fn from_vec(data: Vec<f32>) -> Arc<dyn TensorBuffer> {
-        Arc::new(Self { data })
+    pub(crate) fn from_vec(data: Vec<f32>) -> Box<dyn TensorBuffer> {
+        Box::new(Self { data })
     }
 }
 
@@ -268,19 +272,38 @@ pub struct SimPreprocessor {
     scratch: Vec<u8>,
 }
 
-/// BT.601 limited-range NV12 sample to RGB bytes.
-fn nv12_rgb(y: f32, u: f32, v: f32) -> (f32, f32, f32) {
-    let y = 1.164 * (y - 16.0);
+/// NV12 sample to RGB bytes under the configured matrix/range.
+/// Coefficients are the standard BT.601/BT.709 limited- and
+/// full-range (JFIF-style) conversions.
+fn nv12_rgb(cs: InputColorspace, y: f32, u: f32, v: f32) -> (f32, f32, f32) {
     let (u, v) = (u - 128.0, v - 128.0);
+    let (r, g, b) = match cs {
+        InputColorspace::Bt601Limited => {
+            let y = 1.164 * (y - 16.0);
+            (y + 1.596 * v, y - 0.813 * v - 0.391 * u, y + 2.018 * u)
+        }
+        InputColorspace::Bt709Limited => {
+            let y = 1.164 * (y - 16.0);
+            (y + 1.793 * v, y - 0.533 * v - 0.213 * u, y + 2.115 * u)
+        }
+        InputColorspace::Bt601Full => (y + 1.402 * v, y - 0.714 * v - 0.344 * u, y + 1.772 * u),
+        InputColorspace::Bt709Full => (y + 1.5748 * v, y - 0.4681 * v - 0.1873 * u, y + 1.8556 * u),
+    };
     (
-        (y + 1.596 * v).clamp(0.0, 255.0),
-        (y - 0.813 * v - 0.391 * u).clamp(0.0, 255.0),
-        (y + 2.018 * u).clamp(0.0, 255.0),
+        r.clamp(0.0, 255.0),
+        g.clamp(0.0, 255.0),
+        b.clamp(0.0, 255.0),
     )
 }
 
 impl Preprocessor for SimPreprocessor {
     fn run(&mut self, frame: &HwFrame, dst: &mut Tensor, _stream: &GpuStream) -> Result<()> {
+        if self.cfg.layout != Layout::PitchLinear {
+            return Err(Error::Unsupported(format!(
+                "sim preprocessor reads pitch-linear NV12 only, got {}",
+                self.cfg.layout
+            )));
+        }
         let sim = frame
             .buf
             .as_any()
@@ -288,9 +311,11 @@ impl Preprocessor for SimPreprocessor {
             .ok_or_else(|| Error::Platform("sim preprocessor got a foreign HwBuffer".into()))?;
         sim.read_bytes(&mut self.scratch)?;
 
-        let (sw, sh) = (frame.meta.width as usize, frame.meta.height as usize);
+        let (sw, sh) = (frame.meta().width as usize, frame.meta().height as usize);
         let (dw, dh) = (self.cfg.dst_width as usize, self.cfg.dst_height as usize);
-        if self.scratch.len() < PixelFormat::Nv12.frame_bytes(frame.meta.width, frame.meta.height) {
+        if self.scratch.len()
+            < PixelFormat::Nv12.frame_bytes(frame.meta().width, frame.meta().height)
+        {
             return Err(Error::Platform(
                 "sim preprocessor: frame buffer smaller than NV12 frame".into(),
             ));
@@ -342,7 +367,7 @@ impl Preprocessor for SimPreprocessor {
                     + sample_y(x0, y0 + 1) * (1.0 - fx) * fy
                     + sample_y(x0 + 1, y0 + 1) * fx * fy;
                 let (u, v) = sample_uv(x0, y0);
-                let (r, g, b) = nv12_rgb(yv, u, v);
+                let (r, g, b) = nv12_rgb(self.cfg.colorspace, yv, u, v);
                 let (c0, c1, c2) = match self.cfg.color {
                     InputColor::Rgb => (r, g, b),
                     InputColor::Bgr => (b, g, r),
@@ -436,7 +461,7 @@ impl SimPostProcessor {
 }
 
 impl PostProcessor for SimPostProcessor {
-    fn decode(&self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
+    fn decode(&mut self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
         out.clear(meta.seq);
         let Some(tensor) = outputs.first() else {
             return Ok(());
@@ -446,7 +471,7 @@ impl PostProcessor for SimPostProcessor {
                 "sim postprocessor needs a host-visible F32 output tensor".into(),
             ));
         };
-        for row in data.chunks_exact(SIM_ROW) {
+        for row in data.as_chunks::<SIM_ROW>().0 {
             let score = row[4];
             if score >= self.score_threshold {
                 out.push(Detection {
@@ -492,6 +517,9 @@ impl Platform for SimPlatform {
             max_width: 3840,
             max_height: 2160,
             codecs: Vec::new(),
+            precisions: vec![Precision::Fp32],
+            // The sim stands in for a GPU target while running on CPU.
+            devices: vec!["cpu".into(), "gpu".into()],
             has_hw_encoder: false,
             cpu_encode: false,
             accelerators: vec!["cpu-sim".into()],
@@ -581,6 +609,9 @@ mod tests {
             width: 64,
             height: 48,
             fps: 30,
+            exposure_us: None,
+            gain_min: None,
+            gain_max: None,
             paced: true,
             pool_size,
             frames: Some(frames),
@@ -597,10 +628,10 @@ mod tests {
             let FramePoll::Frame(frame) = src.next_frame(Duration::from_millis(10)).unwrap() else {
                 panic!("expected a frame");
             };
-            assert_eq!(frame.meta.seq, expected_seq);
-            assert!(frame.meta.pts >= last_pts);
-            assert_eq!(frame.meta.dmabuf_fd, frame.buf.dmabuf_fd());
-            last_pts = frame.meta.pts;
+            assert_eq!(frame.meta().seq, expected_seq);
+            assert!(frame.meta().pts >= last_pts);
+            assert_eq!(frame.meta().dmabuf_fd, frame.buf.dmabuf_fd());
+            last_pts = frame.meta().pts;
         }
         assert!(matches!(
             src.next_frame(Duration::from_millis(10)).unwrap(),

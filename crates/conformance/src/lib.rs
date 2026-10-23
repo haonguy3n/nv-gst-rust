@@ -24,8 +24,7 @@
 #![forbid(unsafe_code)]
 
 use edge_core::{
-    EncoderConfig, FramePoll, GpuStream, HwFrame, Layout, ModelConfig, Platform, PreConfig,
-    SourceConfig,
+    EncoderConfig, FramePoll, GpuStream, HwFrame, ModelConfig, Platform, PreConfig, SourceConfig,
 };
 
 /// Unwrap a poll that must yield a frame.
@@ -116,20 +115,20 @@ pub fn check_frame_order_and_timestamps(platform: &dyn Platform, cfg: &SourceCon
             "next_frame",
         );
         assert_eq!(
-            frame.meta.width,
+            frame.meta().width,
             cfg.width,
             "{}: frame width",
             platform.name()
         );
         assert_eq!(
-            frame.meta.height,
+            frame.meta().height,
             cfg.height,
             "{}: frame height",
             platform.name()
         );
-        assert_eq!(frame.meta.camera_id, cfg.camera_id);
+        assert_eq!(frame.meta().camera_id, cfg.camera_id);
         assert_eq!(
-            frame.meta.dmabuf_fd,
+            frame.meta().dmabuf_fd,
             frame.buf.dmabuf_fd(),
             "{}: FrameMeta fd must be the buffer's fd (same-fd contract)",
             platform.name()
@@ -139,22 +138,28 @@ pub fn check_frame_order_and_timestamps(platform: &dyn Platform, cfg: &SourceCon
             "{}: dmabuf fd must be valid",
             platform.name()
         );
+        assert_eq!(
+            frame.buf.memory(),
+            caps.frame_memory,
+            "{}: produced frame's memory domain must match the declared source domain",
+            platform.name()
+        );
         if let Some(prev) = last_seq {
             assert!(
-                frame.meta.seq > prev,
+                frame.meta().seq > prev,
                 "{}: frame seq must strictly increase ({} after {})",
                 platform.name(),
-                frame.meta.seq,
+                frame.meta().seq,
                 prev
             );
             assert!(
-                frame.meta.pts >= last_pts,
+                frame.meta().pts >= last_pts,
                 "{}: frame pts must be monotonic",
                 platform.name()
             );
         }
-        last_seq = Some(frame.meta.seq);
-        last_pts = frame.meta.pts;
+        last_seq = Some(frame.meta().seq);
+        last_pts = frame.meta().pts;
     }
     source
         .stop()
@@ -242,8 +247,9 @@ pub fn check_preprocess_and_inference(
             src_height: source_cfg.height,
             dst_width: model_cfg.input_width,
             dst_height: model_cfg.input_height,
-            layout: Layout::PitchLinear,
+            layout: source.layout(),
             color: model_cfg.input_color,
+            colorspace: model_cfg.input_colorspace,
             normalize: model_cfg.input_normalize,
             pad_value: model_cfg.pad_value,
         })

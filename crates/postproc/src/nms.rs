@@ -16,19 +16,29 @@ pub fn iou(a: &Detection, b: &Detection) -> f32 {
 }
 
 /// Per-class greedy NMS, in place. Keeps the highest-score boxes.
-pub fn nms(detections: &mut Vec<Detection>, iou_threshold: f32) {
-    nms_inner(detections, iou_threshold, false);
+/// `scratch` is caller-owned working space, reused across frames
+/// so steady-state NMS allocates nothing.
+pub fn nms(detections: &mut Vec<Detection>, iou_threshold: f32, scratch: &mut Vec<bool>) {
+    nms_inner(detections, iou_threshold, false, scratch);
 }
 
 /// Class-agnostic greedy NMS: overlapping boxes suppress each
 /// other regardless of class (YOLOX exports run this first).
-pub fn nms_agnostic(detections: &mut Vec<Detection>, iou_threshold: f32) {
-    nms_inner(detections, iou_threshold, true);
+pub fn nms_agnostic(detections: &mut Vec<Detection>, iou_threshold: f32, scratch: &mut Vec<bool>) {
+    nms_inner(detections, iou_threshold, true, scratch);
 }
 
-fn nms_inner(detections: &mut Vec<Detection>, iou_threshold: f32, agnostic: bool) {
-    detections.sort_by(|a, b| b.score.total_cmp(&a.score));
-    let mut keep = vec![true; detections.len()];
+fn nms_inner(
+    detections: &mut Vec<Detection>,
+    iou_threshold: f32,
+    agnostic: bool,
+    keep: &mut Vec<bool>,
+) {
+    // Unstable sort: in place, no allocation; equal scores may
+    // swap order, which NMS does not care about.
+    detections.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    keep.clear();
+    keep.resize(detections.len(), true);
     for i in 0..detections.len() {
         if !keep[i] {
             continue;
@@ -86,7 +96,7 @@ mod tests {
             det(0.10, 0.10, 0.30, 0.30, 0.70, 2), // same box, other class: kept
             det(0.60, 0.60, 0.20, 0.20, 0.60, 1), // disjoint: kept
         ];
-        nms(&mut dets, 0.45);
+        nms(&mut dets, 0.45, &mut Vec::new());
         assert_eq!(dets.len(), 3);
         assert_eq!(dets[0].score, 0.90);
         assert!(dets.iter().all(|d| d.score != 0.80));

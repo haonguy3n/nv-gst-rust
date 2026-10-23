@@ -28,9 +28,6 @@ pub enum Error {
     #[error("platform error: {0}")]
     Platform(String),
 
-    #[error("timed out")]
-    Timeout,
-
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

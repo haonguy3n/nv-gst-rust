@@ -1,4 +1,4 @@
-use crate::config::{Codec, EncoderConfig, ModelConfig, SourceConfig};
+use crate::config::{Codec, EncoderConfig, ModelConfig, Precision, SourceConfig};
 use crate::detection::Detections;
 use crate::error::Result;
 use crate::frame::{FrameMemory, FrameMeta, HwFrame, Layout, PixelFormat};
@@ -14,6 +14,7 @@ pub struct PreConfig {
     pub dst_height: u32,
     pub layout: Layout,
     pub color: crate::config::InputColor,
+    pub colorspace: crate::config::InputColorspace,
     pub normalize: crate::config::InputNormalize,
     /// Letterbox padding value in byte domain.
     pub pad_value: u8,
@@ -35,14 +36,26 @@ impl GpuStream {
     }
 }
 
-/// A compressed packet handed out by the encoder through a callback,
-/// so the encoder never allocates a `Vec` per packet in product
-/// backends (the bytes wrap the V4L2 capture-plane mmap there).
+/// A compressed packet handed out by the encoder through a
+/// callback. The payload is a shared handle, so fan-out to N
+/// sinks clones a refcount, never the bytes; hardware backends
+/// will back it with the encoder's output buffer (kept alive by
+/// the packet and returned on drop) instead of a heap copy.
 #[derive(Debug, Clone)]
 pub struct EncodedPacket {
     pub pts: Duration,
     pub keyframe: bool,
-    pub data: Vec<u8>,
+    pub data: std::sync::Arc<[u8]>,
+}
+
+impl EncodedPacket {
+    pub fn new(pts: Duration, keyframe: bool, data: impl Into<std::sync::Arc<[u8]>>) -> Self {
+        Self {
+            pts,
+            keyframe,
+            data: data.into(),
+        }
+    }
 }
 
 /// Result of polling a source for a frame. Timeout and end of
@@ -52,8 +65,9 @@ pub struct EncodedPacket {
 pub enum FramePoll {
     Frame(HwFrame),
     /// No frame was available within the timeout (e.g. the buffer
-    /// pool is momentarily exhausted). The frame, if any was due,
-    /// is counted as dropped by the pipeline.
+    /// pool is momentarily exhausted). Counted separately as a
+    /// capture timeout; `frames_dropped` is reserved for frames
+    /// that were captured and then evicted by backpressure.
     Timeout,
     /// The source will never produce another frame.
     EndOfStream,
@@ -67,6 +81,13 @@ pub trait FrameSource: Send {
     fn stop(&mut self) -> Result<()>;
     /// Memory domain this source produces. Checked at build time.
     fn memory(&self) -> FrameMemory;
+    /// Layout of the frames this source produces (nvarguscamerasrc
+    /// NVMM is block-linear; most file/sim sources pitch-linear).
+    /// The builder feeds this to the preprocessor instead of
+    /// assuming a layout, and equals `FrameMeta::layout`.
+    fn layout(&self) -> Layout {
+        Layout::PitchLinear
+    }
 }
 
 pub trait Preprocessor: Send {
@@ -83,8 +104,10 @@ pub trait InferenceEngine: Send {
 }
 
 /// Platform-neutral; reads only the small output tensors.
+/// `&mut self` so decoders can reuse scratch buffers across
+/// frames instead of allocating per frame.
 pub trait PostProcessor: Send {
-    fn decode(&self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()>;
+    fn decode(&mut self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()>;
 }
 
 pub trait Overlay: Send {
@@ -117,6 +140,10 @@ pub struct PlatformCaps {
     pub max_width: u32,
     pub max_height: u32,
     pub codecs: Vec<Codec>,
+    pub precisions: Vec<Precision>,
+    /// Accelerator names `model.device` may select ("gpu", "dla0",
+    /// "cpu", ...). Empty means the backend does not distinguish.
+    pub devices: Vec<String>,
     pub has_hw_encoder: bool,
     /// A CPU-encode path exists (VIC copy out + x264/x265 on
     /// Jetson). Only reachable under `zero_copy = "relaxed"` with

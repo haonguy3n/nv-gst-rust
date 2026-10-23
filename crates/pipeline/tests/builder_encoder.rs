@@ -57,7 +57,7 @@ impl InferenceEngine for NoopEngine {
 
 struct NoopPost;
 impl PostProcessor for NoopPost {
-    fn decode(&self, _o: &[Tensor], m: &FrameMeta, out: &mut Detections) -> Result<()> {
+    fn decode(&mut self, _o: &[Tensor], m: &FrameMeta, out: &mut Detections) -> Result<()> {
         out.clear(m.seq);
         Ok(())
     }
@@ -99,6 +99,8 @@ impl Platform for FakePlatform {
             } else {
                 Vec::new()
             },
+            precisions: Vec::new(),
+            devices: Vec::new(),
             has_hw_encoder: self.hw,
             cpu_encode: self.cpu,
             accelerators: Vec::new(),
@@ -142,6 +144,8 @@ input_height = 416
 [encoder]
 enabled = true
 hardware = {hardware}
+[stream]
+metadata_only = false
 "#
     ))
     .expect("config")

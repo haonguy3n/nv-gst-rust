@@ -25,7 +25,7 @@ impl PipelineMetrics {
         if self.frames_processed == 0 {
             Duration::ZERO
         } else {
-            total / u32::try_from(self.frames_processed).unwrap_or(u32::MAX)
+            Duration::from_nanos((total.as_nanos() / u128::from(self.frames_processed)) as u64)
         }
     }
 
@@ -47,7 +47,7 @@ impl PipelineMetrics {
         counter(
             &mut out,
             "edge_frames_dropped_total",
-            "Frames dropped by backpressure or pool exhaustion",
+            "Frames captured then evicted by drop-oldest backpressure",
             self.frames_dropped,
         );
         counter(

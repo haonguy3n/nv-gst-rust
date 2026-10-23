@@ -50,6 +50,18 @@ pub struct SourceConfig {
     /// Preallocated buffer pool; must be >= frames in flight + 2.
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+    /// Pinned exposure time in microseconds (Argus
+    /// `exposuretimerange`). `None` lets auto-exposure run; AE
+    /// brightness swings were a real device problem, so the caps
+    /// are config, not launch-string folklore.
+    #[serde(default)]
+    pub exposure_us: Option<u32>,
+    /// Analog gain bounds (Argus `gainrange`). The reference
+    /// product caps gain at 16 to stop AE brightness swings.
+    #[serde(default)]
+    pub gain_min: Option<f32>,
+    #[serde(default)]
+    pub gain_max: Option<f32>,
     /// Stop after this many frames (sim/CI). `None` runs forever.
     #[serde(default)]
     pub frames: Option<u64>,
@@ -78,6 +90,18 @@ pub struct ModelConfig {
     /// Letterbox padding value in byte domain (114 in both families).
     #[serde(default = "default_pad_value")]
     pub pad_value: u8,
+    /// YUV->RGB matrix/range the frames arrive in; must match the
+    /// training pipeline or accuracy drifts silently.
+    #[serde(default)]
+    pub input_colorspace: InputColorspace,
+    /// Inference precision to build/select (TensorRT FP16/INT8 on
+    /// device; FP32 in sim). Validated against platform caps.
+    #[serde(default)]
+    pub precision: Precision,
+    /// Accelerator to run on: backend-defined name ("gpu", "dla0",
+    /// "cpu", ...), validated against platform caps.
+    #[serde(default = "default_device")]
+    pub device: String,
     pub input_width: u32,
     pub input_height: u32,
     #[serde(default = "default_num_classes")]
@@ -110,6 +134,40 @@ pub enum InputNormalize {
     /// Pixels left in 0.0..=255.0.
     None,
 }
+fn default_device() -> String {
+    "gpu".into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    #[default]
+    Fp32,
+    Fp16,
+    Int8,
+}
+
+impl std::fmt::Display for Precision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fp32 => f.write_str("fp32"),
+            Self::Fp16 => f.write_str("fp16"),
+            Self::Int8 => f.write_str("int8"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputColorspace {
+    /// BT.601 limited range (most cameras/ISP defaults).
+    #[default]
+    Bt601Limited,
+    Bt709Limited,
+    Bt601Full,
+    Bt709Full,
+}
+
 fn default_num_classes() -> u32 {
     80
 }
@@ -134,6 +192,9 @@ pub struct EncoderConfig {
     pub hardware: bool,
     #[serde(default = "default_bitrate")]
     pub bitrate_kbps: u32,
+    /// Keyframe interval in frames (GOP length).
+    #[serde(default = "default_gop_frames")]
+    pub gop_frames: u32,
 }
 
 impl Default for EncoderConfig {
@@ -143,6 +204,7 @@ impl Default for EncoderConfig {
             codec: Codec::H264,
             hardware: true,
             bitrate_kbps: default_bitrate(),
+            gop_frames: default_gop_frames(),
         }
     }
 }
@@ -156,12 +218,17 @@ fn default_true() -> bool {
 fn default_bitrate() -> u32 {
     8_000
 }
+fn default_gop_frames() -> u32 {
+    30
+}
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
-    /// Required on SoCs without a HW encoder (Orin Nano): detections
-    /// go out over MQTT/WebSocket, frames never touch the CPU.
-    #[serde(default)]
+    /// Detections only, no video. Defaults to true: video is what
+    /// a config asks for explicitly (with an enabled encoder), so
+    /// an omitted field can never silently promise video that
+    /// will not arrive.
+    #[serde(default = "default_true")]
     pub metadata_only: bool,
     /// Also write detections to this file as JSON lines (one line
     /// per frame). Useful for metadata-only profiles and debugging.
@@ -169,6 +236,16 @@ pub struct StreamConfig {
     pub meta_file: Option<PathBuf>,
     #[serde(default = "default_rtsp_port")]
     pub rtsp_port: u16,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            metadata_only: true,
+            meta_file: None,
+            rtsp_port: default_rtsp_port(),
+        }
+    }
 }
 
 fn default_rtsp_port() -> u16 {
@@ -214,7 +291,7 @@ impl Config {
         if s.width == 0 || s.height == 0 {
             return Err(Error::invalid("source.width/height", "must be > 0"));
         }
-        if s.width % 2 != 0 || s.height % 2 != 0 {
+        if !s.width.is_multiple_of(2) || !s.height.is_multiple_of(2) {
             return Err(Error::invalid(
                 "source.width/height",
                 "must be even for NV12",
@@ -264,6 +341,12 @@ impl Config {
                 "encoder.hardware",
                 "zero_copy = \"strict\" refuses a CPU encoder; \
                  use a SoC with a hardware encoder or stream metadata only",
+            ));
+        }
+        if !self.encoder.enabled && !self.stream.metadata_only {
+            return Err(Error::invalid(
+                "stream.metadata_only",
+                "false promises video but the encoder is disabled;                  enable the encoder or set metadata_only = true",
             ));
         }
         if self.encoder.enabled && self.stream.metadata_only {

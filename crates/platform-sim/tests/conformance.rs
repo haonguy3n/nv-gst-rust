@@ -15,6 +15,9 @@ fn source_cfg() -> SourceConfig {
         // Unpaced: conformance pulls several pools' worth of
         // frames and must not wait on simulated sensor timing.
         fps: 30,
+        exposure_us: None,
+        gain_min: None,
+        gain_max: None,
         paced: false,
         pool_size: 4,
         frames: None,
@@ -28,6 +31,9 @@ fn model_cfg() -> ModelConfig {
         input_color: Default::default(),
         input_normalize: Default::default(),
         pad_value: 114,
+        input_colorspace: Default::default(),
+        precision: Default::default(),
+        device: "gpu".into(),
         input_width: 32,
         input_height: 32,
         num_classes: 80,

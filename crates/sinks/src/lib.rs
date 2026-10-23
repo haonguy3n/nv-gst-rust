@@ -39,9 +39,10 @@ impl<W: Write + Send> JsonlMetaSink<W> {
 
 impl<W: Write + Send> Sink for JsonlMetaSink<W> {
     fn push_video(&mut self, _pkt: EncodedPacket) -> Result<()> {
-        Err(Error::Unsupported(
-            "JsonlMetaSink is metadata-only; pair an encoder with a video sink".into(),
-        ))
+        // A metadata sink in a fan-out next to a video sink is a
+        // legitimate topology; ignoring video here (documented)
+        // beats killing an otherwise healthy run on packet one.
+        Ok(())
     }
 
     fn push_meta(&mut self, det: &Detections) -> Result<()> {
@@ -198,14 +199,16 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_sink_rejects_video() {
+    fn jsonl_sink_ignores_video_so_fanout_topologies_work() {
         let mut sink = JsonlMetaSink::new(Vec::new());
         let pkt = EncodedPacket {
             pts: Duration::ZERO,
             keyframe: true,
-            data: vec![0u8; 4],
+            data: vec![0u8; 4].into(),
         };
-        assert!(sink.push_video(pkt).is_err());
+        sink.push_video(pkt)
+            .expect("video is ignored, not an error");
+        assert!(sink.into_inner().is_empty(), "nothing was written");
     }
 
     #[test]
@@ -221,7 +224,7 @@ mod tests {
             .push_video(EncodedPacket {
                 pts: Duration::ZERO,
                 keyframe: false,
-                data: vec![1u8; 10],
+                data: vec![1u8; 10].into(),
             })
             .unwrap();
         for counts in [&counts_a, &counts_b] {
@@ -243,7 +246,7 @@ mod tests {
             sink.push_video(EncodedPacket {
                 pts: Duration::ZERO,
                 keyframe: true,
-                data: payload.to_vec(),
+                data: payload.to_vec().into(),
             })
             .unwrap();
         }

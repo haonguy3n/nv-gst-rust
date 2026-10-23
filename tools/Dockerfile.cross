@@ -7,7 +7,9 @@
 # This covers the platform-independent workspace and platform-sim.
 # platform-jetson (M1+) additionally needs the L4T sysroot from the
 # pinned JetPack mounted in; extend this image then.
-FROM rust:1.85-bookworm
+# Aligned with the camera Yocto image's OE-core Rust (1.98.1), so
+# cross builds and image builds see the same compiler generation.
+FROM rust:1.98-bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \

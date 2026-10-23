@@ -66,6 +66,8 @@ impl Platform for BrokenPlatform {
             max_width: 1920,
             max_height: 1080,
             codecs: vec![Codec::H264],
+            precisions: Vec::new(),
+            devices: Vec::new(),
             has_hw_encoder: true, // the lie under test
             cpu_encode: false,
             accelerators: Vec::new(),
@@ -96,6 +98,9 @@ fn source_cfg() -> SourceConfig {
         width: 64,
         height: 64,
         fps: 30,
+        exposure_us: None,
+        gain_min: None,
+        gain_max: None,
         paced: true,
         pool_size: 4,
         frames: None,

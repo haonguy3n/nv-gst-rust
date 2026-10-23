@@ -31,7 +31,12 @@ trt_version=$(trtexec --help 2>&1 | grep -oE 'TensorRT v[0-9.]+' | head -n1 | gr
 [ -n "$trt_version" ] || die "could not determine TensorRT version from trtexec --help"
 
 name=$(basename "$model" .onnx)
-engine="$cache_dir/${name}-${model_hash}-trt${trt_version}.engine"
+# The cache key covers everything that changes the engine bytes:
+# model, TensorRT version, GPU architecture, and every extra
+# trtexec argument (precision flags included).
+arch=$(uname -m)
+args_hash=$(printf '%s' "$*" | sha256sum | cut -c1-8)
+engine="$cache_dir/${name}-${model_hash}-trt${trt_version}-${arch}-${args_hash}.engine"
 
 if [ -f "$engine" ]; then
     echo "build-engine: cache hit: $engine" >&2
