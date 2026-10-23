@@ -264,6 +264,12 @@ impl Pipeline {
         Arc::clone(&self.stop)
     }
 
+    /// Clear a stop request so the pipeline can run again. The
+    /// only way the external flag is reset; `run` never does it.
+    pub fn clear_stop(&self) {
+        self.stop.store(false, Ordering::Relaxed);
+    }
+
     /// The per-frame buffer budget, printed at startup so a hidden
     /// extra buffer is visible in the log, not just in a trace.
     pub fn buffer_budget(&self) -> String {
@@ -300,7 +306,9 @@ impl Pipeline {
     }
 
     /// Run until the source ends, `max_frames` frames are
-    /// captured, the stop handle is set, or a stage fails.
+    /// captured, the stop handle is set, or a stage fails. A stop
+    /// requested before the run starts is honoured (the run ends
+    /// immediately); call `clear_stop` to run again afterwards.
     ///
     /// Always returns the metrics gathered so far — including on
     /// the error path, where the first (processing) error wins —
@@ -308,16 +316,20 @@ impl Pipeline {
     /// again. The one exception is a capture-thread panic, where
     /// the source is lost with the thread.
     pub fn run(&mut self, max_frames: Option<u64>) -> (PipelineMetrics, Result<()>) {
-        // Each run starts un-stopped; the shutdown path below sets
-        // the flag, and it must not poison a later run.
-        self.stop.store(false, Ordering::Relaxed);
+        // The external stop flag is never reset here: a stop that
+        // arrives before or between runs must be honoured, not
+        // silently overwritten. Teardown uses its own per-run
+        // flag instead.
+        let shutdown = Arc::new(AtomicBool::new(false));
         self.live_metrics.reset();
         let mut metrics = PipelineMetrics::default();
         let limit = max_frames.or(self.config.source.frames);
         let max_idle = Duration::from_millis(self.config.pipeline.max_idle_ms);
 
         let (tx, rx, dropped) = channel::channel::<HwFrame>(self.config.pipeline.queue_depth);
+        self.live_metrics.attach_dropped(Arc::clone(&dropped));
         let capture_stop = Arc::clone(&self.stop);
+        let capture_shutdown = Arc::clone(&shutdown);
         let capture_live = Arc::clone(&self.live_metrics);
 
         // Temporarily move the source into the capture thread.
@@ -338,6 +350,7 @@ impl Pipeline {
                     &mut *source,
                     &tx,
                     &capture_stop,
+                    &capture_shutdown,
                     &capture_live,
                     limit,
                     max_idle,
@@ -367,7 +380,11 @@ impl Pipeline {
                 break;
             }
             let Some(frame) = rx.recv_timeout(Duration::from_millis(200)) else {
-                if rx.is_closed_and_empty() || capture.is_finished() {
+                // Closed-and-empty is the only safe exit: the
+                // sender drops with the capture thread (even on
+                // panic), while is_finished() could race a frame
+                // sent just before the thread exited.
+                if rx.is_closed_and_empty() {
                     break;
                 }
                 continue;
@@ -382,7 +399,7 @@ impl Pipeline {
 
         // Tell capture to stop and drop the receiver *before*
         // joining, so an unbounded source cannot block shutdown.
-        self.stop.store(true, Ordering::Relaxed);
+        shutdown.store(true, Ordering::Relaxed);
         drop(rx);
         let capture_result = match capture.join() {
             Ok((source, (captured, timeouts), result)) => {
@@ -536,6 +553,7 @@ fn capture_loop(
     source: &mut dyn FrameSource,
     tx: &channel::Sender<HwFrame>,
     stop: &AtomicBool,
+    shutdown: &AtomicBool,
     live: &LiveMetrics,
     limit: Option<u64>,
     max_idle: Duration,
@@ -546,8 +564,13 @@ fn capture_loop(
         return ((captured, timeouts), Err(e));
     }
     let mut last_frame = Instant::now();
+    // Set when polls starve on the buffer pool: then the consumer
+    // (not the camera) is what stopped, and the stall report
+    // must say so.
+    let mut pool_starved = false;
     loop {
-        if stop.load(Ordering::Relaxed) {
+        // External stop (supervisor/signal) or runner teardown.
+        if stop.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
             break;
         }
         if let Some(limit) = limit {
@@ -562,6 +585,7 @@ fn capture_loop(
         match poll {
             FramePoll::Frame(frame) => {
                 captured += 1;
+                pool_starved = false;
                 live.set_capture(captured, timeouts);
                 last_frame = Instant::now();
                 // Drop-oldest: an evicted frame returns its
@@ -569,25 +593,104 @@ fn capture_loop(
                 drop(tx.send(frame));
             }
             // A momentary shortage is not the end of anything:
-            // count it and keep capturing — unless the source has
-            // been silent past the idle limit, which is a dead
-            // camera a supervisor must hear about.
-            FramePoll::Timeout => {
-                timeouts += 1;
-                live.set_capture(captured, timeouts);
+            // keep capturing — unless no frame has been handed
+            // out past the idle limit, which a supervisor must
+            // hear about, attributed to the side that stopped.
+            // Normal pacing (NoFrame) is not counted as a timeout;
+            // pool starvation is.
+            FramePoll::Timeout(reason) => {
+                if reason == edge_core::TimeoutReason::PoolExhausted {
+                    timeouts += 1;
+                    pool_starved = true;
+                    live.set_capture(captured, timeouts);
+                }
                 if !max_idle.is_zero() && last_frame.elapsed() > max_idle {
-                    return (
-                        (captured, timeouts),
-                        Err(Error::Platform(format!(
+                    let what = if pool_starved {
+                        format!(
+                            "processing stalled: capture pool exhausted, no frame \
+                             handed out for {:?} (max_idle {:?})",
+                            last_frame.elapsed(),
+                            max_idle
+                        )
+                    } else {
+                        format!(
                             "source stalled: no frame for {:?} (max_idle {:?})",
                             last_frame.elapsed(),
                             max_idle
-                        ))),
-                    );
+                        )
+                    };
+                    return ((captured, timeouts), Err(Error::Platform(what)));
                 }
             }
             FramePoll::EndOfStream => break,
         }
     }
     ((captured, timeouts), Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edge_core::TimeoutReason;
+    use std::sync::atomic::AtomicBool;
+
+    /// A source that never produces a frame, timing out for one
+    /// fixed reason.
+    struct SilentSource(TimeoutReason);
+    impl FrameSource for SilentSource {
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn next_frame(&mut self, _t: Duration) -> Result<FramePoll> {
+            Ok(FramePoll::Timeout(self.0))
+        }
+        fn stop(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn memory(&self) -> edge_core::FrameMemory {
+            edge_core::FrameMemory::DmaBuf
+        }
+        fn layout(&self) -> edge_core::Layout {
+            edge_core::Layout::PitchLinear
+        }
+    }
+
+    fn stall_error(reason: TimeoutReason) -> ((u64, u64), String) {
+        let (tx, _rx, _dropped) = channel::channel::<HwFrame>(2);
+        let stop = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        let live = LiveMetrics::default();
+        let mut source = SilentSource(reason);
+        let (counts, result) = capture_loop(
+            &mut source,
+            &tx,
+            &stop,
+            &shutdown,
+            &live,
+            None,
+            Duration::from_millis(50),
+        );
+        (
+            counts,
+            result.expect_err("idle limit must trip").to_string(),
+        )
+    }
+
+    /// R2-2: a quiet sensor is blamed on the source, and its
+    /// pacing timeouts are not counted (R2-5).
+    #[test]
+    fn silent_sensor_reports_source_stalled() {
+        let ((captured, timeouts), err) = stall_error(TimeoutReason::NoFrame);
+        assert_eq!((captured, timeouts), (0, 0));
+        assert!(err.contains("source stalled"), "{err}");
+    }
+
+    /// R2-2: a starved pool is blamed on processing, and counted.
+    #[test]
+    fn starved_pool_reports_processing_stalled() {
+        let ((captured, timeouts), err) = stall_error(TimeoutReason::PoolExhausted);
+        assert_eq!(captured, 0);
+        assert!(timeouts > 0);
+        assert!(err.contains("processing stalled"), "{err}");
+    }
 }

@@ -31,9 +31,9 @@ pub use probe::{choose_encoder, probe_media_engines, EncoderChoice, EncoderKind,
 #[cfg(feature = "gst")]
 use edge_core::Layout;
 use edge_core::{
-    Codec, Encoder, EncoderConfig, EngineState, Error, FrameMemory, FrameSource, ModelConfig,
-    Overlay, PixelFormat, Platform, PlatformCaps, PreConfig, Precision, Preprocessor, Result,
-    SourceConfig,
+    Codec, Encoder, EncoderConfig, EngineState, Error, FrameMemory, FrameSource, GpuStream,
+    ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps, PreConfig, Precision, Preprocessor,
+    Result, SourceConfig,
 };
 use std::path::Path;
 
@@ -136,6 +136,12 @@ impl Platform for JetsonPlatform {
 
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
         Err(Error::Unsupported(M1_PENDING.into()))
+    }
+
+    fn stream(&self, _camera_id: u8) -> Result<GpuStream> {
+        // Until T4 lands the real CudaStream, Jetson stages do not
+        // run at all (M1_PENDING), so a no-op stream is honest.
+        Ok(GpuStream::noop())
     }
 
     fn encoder(&self, _cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {

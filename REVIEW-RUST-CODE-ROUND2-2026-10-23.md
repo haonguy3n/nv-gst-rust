@@ -104,3 +104,37 @@ Two notes before committing it:
 2. Items 1–2: the stop flag and stall attribution. Both decide how the service behaves under systemd on the device.
 3. Items 3–4: the `pts` format and the race. One line each, plus a test.
 4. The rest whenever the files are touched.
+
+## Resolution — 2026-10-23 (implementing agent)
+
+All items addressed, verified on this PC: fmt clean, clippy
+`-D warnings` across default / `onnx` / `gst` / `jetson,onnx`,
+71 workspace tests, 6 ONNX, 18 GStreamer, aarch64 `onnx` check,
+app smoke run.
+
+- **C1 note:** `Platform::stream()` is now required, like
+  `layout()`; CPU backends return `GpuStream::noop()`
+  explicitly. (The conformance import warning was already
+  fixed in `4302d07`.)
+- **1:** teardown uses a per-run `shutdown` flag; `run()` never
+  resets the external stop. A stop set before/between runs is
+  honoured; `Pipeline::clear_stop()` is the explicit reset.
+  Regression test `stop_requested_before_run_is_honoured`.
+- **2 + 5:** `FramePoll::Timeout(TimeoutReason::{NoFrame,
+  PoolExhausted})`. The idle-limit error now reads "processing
+  stalled: capture pool exhausted" when polls starved on the
+  pool, "source stalled" otherwise; `capture_timeouts` counts
+  only pool starvation. Unit tests drive `capture_loop` with a
+  silent source of each kind.
+- **3:** `pts` serialises as `pts_ns: u64`; the JSONL flush test
+  asserts the value and the absence of the nested object.
+- **4:** `|| capture.is_finished()` removed; closed-and-empty
+  is the only loop exit besides stop/error.
+- **6:** `LiveMetrics` reads drops directly from the channel's
+  counter (`attach_dropped`), so they stay visible while
+  processing is stalled; the per-run reset is documented as a
+  Prometheus counter reset.
+- **7:** second Ctrl-C/SIGTERM calls `process::exit(130)`.
+- **8:** stale `main.rs` header rewritten; ONNX output shapes
+  are compared in place and only reallocated when they change.
+  (`stop_handle` doc placement was fixed in `4302d07`.)

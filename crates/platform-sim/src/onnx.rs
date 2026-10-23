@@ -153,13 +153,6 @@ impl InferenceEngine for OnnxEngine {
             let (shape, data) = value
                 .try_extract_tensor::<f32>()
                 .map_err(|e| Error::Platform(format!("onnx output {i}: {e}")))?;
-            let shape: Vec<usize> = shape
-                .iter()
-                .map(|&d| {
-                    usize::try_from(d)
-                        .map_err(|_| Error::Platform(format!("onnx output {i}: negative dim {d}")))
-                })
-                .collect::<Result<_>>()?;
             if i >= self.outputs.len() {
                 let name = self
                     .output_names
@@ -172,7 +165,26 @@ impl InferenceEngine for OnnxEngine {
                 ));
             }
             let tensor = &mut self.outputs[i];
-            tensor.spec.shape = shape;
+            // Compare in place; only allocate a new shape Vec
+            // when the output shape actually changed (steady
+            // state allocates nothing here).
+            let unchanged = tensor.spec.shape.len() == shape.len()
+                && tensor
+                    .spec
+                    .shape
+                    .iter()
+                    .zip(shape.iter())
+                    .all(|(&have, &got)| got >= 0 && have == got as usize);
+            if !unchanged {
+                tensor.spec.shape = shape
+                    .iter()
+                    .map(|&d| {
+                        usize::try_from(d).map_err(|_| {
+                            Error::Platform(format!("onnx output {i}: negative dim {d}"))
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+            }
             match tensor.buf.as_any_mut().downcast_mut::<HostTensor>() {
                 Some(host) => host.replace(data),
                 None => tensor.buf = HostTensor::from_vec(data.to_vec()),

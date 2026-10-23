@@ -216,17 +216,50 @@ fn stalled_source_fails_at_idle_limit() {
         elapsed < std::time::Duration::from_secs(5),
         "idle limit must trip long before the watchdog (took {elapsed:?})"
     );
-    assert!(result.is_err(), "stalled source must fail the run");
-    // Partial capture counts survive the capture error.
+    let err = result.expect_err("stalled source must fail the run");
     assert!(
-        metrics.capture_timeouts > 0,
-        "timeouts counted before the stall must be reported: {}",
-        metrics.summary()
+        err.to_string().contains("source stalled"),
+        "a silent sensor must be blamed on the source: {err}"
     );
+    // Partial capture counts survive the capture error; normal
+    // pacing is not counted as a capture timeout (R2-5).
+    assert!(metrics.frames_captured >= 1, "{}", metrics.summary());
+    assert_eq!(metrics.capture_timeouts, 0, "{}", metrics.summary());
 }
 
 /// Item 4/5: the shutdown path sets the internal stop flag; that
 /// must not poison a second run on the same pipeline.
+/// R2-1: a stop requested before (or between) runs must be
+/// honoured, never reset by `run` itself; `clear_stop` is the
+/// explicit way back.
+#[test]
+fn stop_requested_before_run_is_honoured() {
+    let cfg = test_config(10);
+    let mut pipeline = Pipeline::build(
+        &SimPlatform,
+        cfg,
+        Box::new(SimPostProcessor::new(0.25)),
+        Box::new(CountingSink::default()),
+    )
+    .expect("build pipeline");
+    pipeline
+        .stop_handle()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
+    let (metrics, result) = pipeline.run(None);
+    result.expect("stopped run still returns Ok");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "pre-set stop must end the run at once"
+    );
+    assert_eq!(metrics.frames_processed, 0, "{}", metrics.summary());
+
+    pipeline.clear_stop();
+    let (metrics, result) = pipeline.run(None);
+    result.expect("run after clear_stop");
+    assert_eq!(metrics.frames_captured, 10, "{}", metrics.summary());
+}
+
 #[test]
 fn pipeline_can_run_twice() {
     let mut cfg = test_config(0);

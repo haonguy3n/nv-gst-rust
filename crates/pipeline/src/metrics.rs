@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Counters and per-stage timings, measured from day one.
@@ -8,8 +9,9 @@ pub struct PipelineMetrics {
     pub frames_captured: u64,
     /// Frames evicted by drop-oldest backpressure.
     pub frames_dropped: u64,
-    /// Capture polls that timed out (e.g. pool temporarily
-    /// exhausted). The run continues; this is the counter that
+    /// Capture polls starved by pool exhaustion (all buffers
+    /// held downstream). Normal sensor pacing between frames is
+    /// not counted. The run continues; this is the counter that
     /// makes a starving pool visible instead of silent.
     pub capture_timeouts: u64,
     pub frames_processed: u64,
@@ -54,7 +56,7 @@ impl PipelineMetrics {
         counter(
             &mut out,
             "edge_capture_timeouts_total",
-            "Capture polls that timed out",
+            "Capture polls starved by pool exhaustion",
             self.capture_timeouts,
         );
         counter(
@@ -111,10 +113,18 @@ impl PipelineMetrics {
 /// `Pipeline::live_metrics` so a supervisor (or a `/metrics`
 /// endpoint) can observe a long-running pipeline instead of
 /// waiting for `run()` to return.
+///
+/// Counters reset at the start of every `run()`; a Prometheus
+/// scraper sees that as a counter reset (the usual process-
+/// restart semantics), which rate functions handle.
 #[derive(Debug, Default)]
 pub struct LiveMetrics {
     frames_captured: AtomicU64,
     frames_dropped: AtomicU64,
+    /// The channel's own drop counter for the current run, read
+    /// directly so drops stay visible even while processing is
+    /// stalled (when nothing calls `sync_processing`).
+    dropped_source: Mutex<Option<Arc<AtomicU64>>>,
     capture_timeouts: AtomicU64,
     frames_processed: AtomicU64,
     detections: AtomicU64,
@@ -130,7 +140,15 @@ impl LiveMetrics {
     pub fn snapshot(&self) -> PipelineMetrics {
         PipelineMetrics {
             frames_captured: self.frames_captured.load(Ordering::Relaxed),
-            frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
+            frames_dropped: self
+                .dropped_source
+                .lock()
+                .expect("live metrics mutex poisoned")
+                .as_ref()
+                .map_or_else(
+                    || self.frames_dropped.load(Ordering::Relaxed),
+                    |source| source.load(Ordering::Relaxed),
+                ),
             capture_timeouts: self.capture_timeouts.load(Ordering::Relaxed),
             frames_processed: self.frames_processed.load(Ordering::Relaxed),
             detections: self.detections.load(Ordering::Relaxed),
@@ -157,6 +175,14 @@ impl LiveMetrics {
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Read drops straight from the current run's channel counter.
+    pub(crate) fn attach_dropped(&self, source: Arc<AtomicU64>) {
+        *self
+            .dropped_source
+            .lock()
+            .expect("live metrics mutex poisoned") = Some(source);
     }
 
     pub(crate) fn set_capture(&self, captured: u64, timeouts: u64) {
@@ -187,6 +213,17 @@ impl LiveMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R2-6: drops read from the channel counter are visible in
+    /// snapshots without any processing-side sync.
+    #[test]
+    fn live_drops_are_visible_without_processing_sync() {
+        let live = LiveMetrics::default();
+        let dropped = Arc::new(AtomicU64::new(0));
+        live.attach_dropped(Arc::clone(&dropped));
+        dropped.store(5, Ordering::Relaxed);
+        assert_eq!(live.snapshot().frames_dropped, 5);
+    }
 
     #[test]
     fn prometheus_output_has_each_counter_once() {

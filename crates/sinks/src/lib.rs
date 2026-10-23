@@ -247,6 +247,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(v["frame_seq"], 7);
         assert_eq!(v["camera_id"], 2);
+        // pts is one nanosecond count for joining, not an object.
+        assert_eq!(v["pts_ns"], 33 * 7 * 1_000_000);
+        assert!(v.get("pts").is_none(), "no nested pts object: {text}");
         sink.finish().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

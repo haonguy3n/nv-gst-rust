@@ -3,7 +3,7 @@
 
 use edge_core::{
     Codec, Encoder, EncoderConfig, EngineState, Error, FrameMemory, FrameMeta, FramePoll,
-    FrameSource, HwBuffer, HwFrame, Layout, ModelConfig, Overlay, PixelFormat, Platform,
+    FrameSource, GpuStream, HwBuffer, HwFrame, Layout, ModelConfig, Overlay, PixelFormat, Platform,
     PlatformCaps, PreConfig, Preprocessor, Result, SourceConfig,
 };
 use std::any::Any;
@@ -87,6 +87,10 @@ impl Platform for BrokenPlatform {
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
         Err(Error::Unsupported("stub".into()))
     }
+    fn stream(&self, _camera_id: u8) -> Result<GpuStream> {
+        Ok(GpuStream::noop())
+    }
+
     fn encoder(&self, _cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
         Ok(None)
     }

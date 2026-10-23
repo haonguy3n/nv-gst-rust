@@ -93,13 +93,24 @@ impl EncodedPacket {
 /// on `EndOfStream`.
 pub enum FramePoll {
     Frame(HwFrame),
-    /// No frame was available within the timeout (e.g. the buffer
-    /// pool is momentarily exhausted). Counted separately as a
-    /// capture timeout; `frames_dropped` is reserved for frames
-    /// that were captured and then evicted by backpressure.
-    Timeout,
+    /// No frame was handed out within the timeout. The reason
+    /// distinguishes a quiet sensor from a starved consumer:
+    /// only `PoolExhausted` is counted as a capture timeout;
+    /// `frames_dropped` is reserved for frames that were
+    /// captured and then evicted by backpressure.
+    Timeout(TimeoutReason),
     /// The source will never produce another frame.
     EndOfStream,
+}
+
+/// Why a poll timed out — who to blame when frames stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutReason {
+    /// The sensor simply had no frame due yet (normal pacing).
+    NoFrame,
+    /// Frames may exist, but every pooled buffer is held
+    /// downstream: the consumer, not the camera, has stalled.
+    PoolExhausted,
 }
 
 pub trait FrameSource: Send {
@@ -243,12 +254,11 @@ pub trait Platform {
     /// `None` when the SoC has no HW encoder (Orin Nano): the pipeline
     /// then streams metadata only.
     fn encoder(&self, cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>>;
-    /// The ordered GPU work queue for one camera. Backends with a
-    /// real device (Jetson CUDA) override this; the default is a
-    /// no-op stream for CPU-only backends.
-    fn stream(&self, _camera_id: u8) -> Result<GpuStream> {
-        Ok(GpuStream::noop())
-    }
+    /// The ordered GPU work queue for one camera. Required (no
+    /// default): a GPU backend that forgets it must fail to
+    /// compile, not silently run on a no-op stream. CPU-only
+    /// backends return `GpuStream::noop()` explicitly.
+    fn stream(&self, camera_id: u8) -> Result<GpuStream>;
 }
 
 #[cfg(test)]

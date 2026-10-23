@@ -65,7 +65,7 @@ fn main() {
                 frame.meta().width,
                 frame.meta().height
             ),
-            Ok(FramePoll::Timeout) => println!("timeout (no frame due)"),
+            Ok(FramePoll::Timeout(reason)) => println!("timeout ({reason:?})"),
             Ok(FramePoll::EndOfStream) => {
                 println!("end of stream");
                 break;

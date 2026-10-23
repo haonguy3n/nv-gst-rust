@@ -1,6 +1,6 @@
 //! Edge-vision binary: parse config, pick the platform, run the
-//! pipeline, report metrics. Signal handling lands with the Jetson
-//! daemon work; the sim profile is bounded by `source.frames`.
+//! pipeline, report metrics. SIGINT/SIGTERM ask the pipeline to
+//! stop; a second signal exits immediately.
 
 #![forbid(unsafe_code)]
 
@@ -134,8 +134,16 @@ fn main() -> Result<()> {
     println!("platform: {}", platform.name());
     println!("{}", pipeline.buffer_budget());
     let stop = pipeline.stop_handle();
-    ctrlc::set_handler(move || stop.store(true, std::sync::atomic::Ordering::Relaxed))
-        .context("installing signal handler")?;
+    ctrlc::set_handler(move || {
+        use std::sync::atomic::Ordering;
+        // First signal: stop cleanly. Second: teardown is stuck
+        // (a hung stop(), a blocked sink) — exit now instead of
+        // leaving SIGKILL as the only way out. 130 = 128 + SIGINT.
+        if stop.swap(true, Ordering::Relaxed) {
+            std::process::exit(130);
+        }
+    })
+    .context("installing signal handler")?;
     // With --prometheus, also serve the counters while the run is
     // in progress (stderr, so stdout keeps the final exposition).
     let reporter = if prometheus {

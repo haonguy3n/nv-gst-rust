@@ -1,6 +1,12 @@
 use crate::frame::FrameMeta;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::time::Duration;
+
+/// Serialise a `Duration` as one nanosecond count: metadata
+/// consumers join on a number, not serde's `{secs, nanos}` object.
+fn serialize_pts_ns<S: Serializer>(pts: &Duration, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u64(pts.as_nanos() as u64)
+}
 
 /// One decoded detection, coordinates normalised to `0.0..=1.0`
 /// of the frame width/height.
@@ -23,7 +29,9 @@ pub struct Detections {
     /// must be attributable without out-of-band knowledge).
     pub camera_id: u8,
     /// Sensor timestamp of the frame, for joining detections to
-    /// encoded packets (which carry the same pts).
+    /// encoded packets (which carry the same pts). Serialised as
+    /// `pts_ns`, a single nanosecond count.
+    #[serde(rename = "pts_ns", serialize_with = "serialize_pts_ns")]
     pub pts: Duration,
     pub items: Vec<Detection>,
 }

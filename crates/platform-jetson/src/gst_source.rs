@@ -14,7 +14,7 @@
 
 use edge_core::{
     Error, FrameMemory, FrameMeta, FramePoll, FrameSource, HwBuffer, HwFrame, Layout, PixelFormat,
-    Result, SourceConfig,
+    Result, SourceConfig, TimeoutReason,
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -271,7 +271,7 @@ impl FrameSource for GstLaunchSource {
                 if self.appsink.is_eos() {
                     return Ok(FramePoll::EndOfStream);
                 }
-                return Ok(FramePoll::Timeout);
+                return Ok(FramePoll::Timeout(TimeoutReason::NoFrame));
             }
         };
         let buffer = sample
@@ -283,7 +283,7 @@ impl FrameSource for GstLaunchSource {
         );
         let Some(buf) = self.wrap_buffer(buffer)? else {
             // Fallback pool exhausted: this frame is dropped.
-            return Ok(FramePoll::Timeout);
+            return Ok(FramePoll::Timeout(TimeoutReason::PoolExhausted));
         };
         let meta = FrameMeta {
             seq: self.seq,

@@ -26,5 +26,6 @@ pub use letterbox::{normalize_factor, order_channels, Letterbox};
 pub use stage::{
     EncodedPacket, Encoder, EngineState, EngineWarmup, FramePoll, FrameSource, GpuStream,
     InferenceEngine, Overlay, Platform, PlatformCaps, PostProcessor, PreConfig, Preprocessor, Sink,
+    TimeoutReason,
 };
 pub use tensor::{DType, Tensor, TensorBuffer, TensorSpec};

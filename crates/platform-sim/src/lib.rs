@@ -21,7 +21,7 @@ use edge_core::{
     FrameMeta, FramePoll, FrameSource, GpuStream, HwBuffer, HwFrame, InferenceEngine,
     InputColorspace, Layout, ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps,
     PostProcessor, PreConfig, Precision, Preprocessor, Result, SourceConfig, Tensor, TensorBuffer,
-    TensorSpec,
+    TensorSpec, TimeoutReason,
 };
 use std::any::Any;
 use std::fs::File;
@@ -150,7 +150,7 @@ impl FrameSource for SimSource {
                 let wait = due - now;
                 if wait > timeout {
                     std::thread::sleep(timeout);
-                    return Ok(FramePoll::Timeout);
+                    return Ok(FramePoll::Timeout(TimeoutReason::NoFrame));
                 }
                 std::thread::sleep(wait);
             }
@@ -164,7 +164,7 @@ impl FrameSource for SimSource {
                 break f;
             }
             if std::time::Instant::now() >= deadline {
-                return Ok(FramePoll::Timeout);
+                return Ok(FramePoll::Timeout(TimeoutReason::PoolExhausted));
             }
             std::thread::sleep(Duration::from_millis(1));
         };
@@ -609,6 +609,10 @@ impl Platform for SimPlatform {
         // Like Orin Nano: no hardware encoder, metadata only.
         Ok(None)
     }
+
+    fn stream(&self, _camera_id: u8) -> Result<GpuStream> {
+        Ok(GpuStream::noop())
+    }
 }
 
 /// Sim platform whose engine takes `ready_after` to become
@@ -661,6 +665,10 @@ impl Platform for DelayedSimPlatform {
     }
     fn encoder(&self, cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
         SimPlatform.encoder(cfg)
+    }
+
+    fn stream(&self, camera_id: u8) -> Result<GpuStream> {
+        SimPlatform.stream(camera_id)
     }
 }
 
@@ -719,9 +727,11 @@ mod tests {
                 _ => panic!("expected a frame"),
             })
             .collect();
+        // 500 ms reaches past the pacing wait (next frame due in
+        // ~34 ms) so the poll reaches the empty pool.
         assert!(matches!(
-            src.next_frame(Duration::from_millis(1)).unwrap(),
-            FramePoll::Timeout
+            src.next_frame(Duration::from_millis(500)).unwrap(),
+            FramePoll::Timeout(TimeoutReason::PoolExhausted)
         ));
         drop(held);
         // Buffers returned on drop, so capture resumes.

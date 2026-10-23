@@ -31,7 +31,9 @@ use edge_core::{
 fn expect_frame(poll: FramePoll, platform: &dyn Platform, context: &str) -> HwFrame {
     match poll {
         FramePoll::Frame(frame) => frame,
-        FramePoll::Timeout => panic!("{}: {context}: timed out", platform.name()),
+        FramePoll::Timeout(reason) => {
+            panic!("{}: {context}: timed out ({reason:?})", platform.name())
+        }
         FramePoll::EndOfStream => panic!("{}: {context}: source ended early", platform.name()),
     }
 }
@@ -194,7 +196,7 @@ pub fn check_pool_exhaustion_drops_and_recovers(platform: &dyn Platform, cfg: &S
         .next_frame(Duration::from_millis(100))
         .unwrap_or_else(|e| panic!("{}: exhausted next_frame: {e}", platform.name()));
     assert!(
-        matches!(extra, FramePoll::Timeout),
+        matches!(extra, FramePoll::Timeout(_)),
         "{}: exhausted pool must report Timeout (never EndOfStream, never buffer {})",
         platform.name(),
         cfg.pool_size + 1

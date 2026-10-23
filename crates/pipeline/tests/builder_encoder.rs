@@ -143,6 +143,10 @@ impl Platform for FakePlatform {
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
         Ok(Box::new(NoopOverlay))
     }
+    fn stream(&self, _camera_id: u8) -> Result<GpuStream> {
+        Ok(GpuStream::noop())
+    }
+
     fn encoder(&self, cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
         let available = if cfg.hardware { self.hw } else { self.cpu };
         Ok(available.then(|| Box::new(NoopEncoder) as Box<dyn Encoder>))
