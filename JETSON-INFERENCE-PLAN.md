@@ -1,7 +1,8 @@
 # Jetson inference path in Rust: implementation plan
 
 **Date:** 2026-10-23
-**Status:** plan, not started
+**Status:** PC-side core changes landed (C1–C4, plus T6's plan cache);
+the device tasks (T0–T5, T7–T12) start at the first board session
 **Base:** `8760268`
 
 **Scope:** the Jetson stages behind the existing traits: NVMM frame access, VIC/CUDA pre-processing, TensorRT inference and the plan cache. Encode and the runner split are touched only where inference needs them.
@@ -182,3 +183,30 @@ Each task names its files and dependencies, and how it is checked:
 2. **DLA** (Orin NX has two). Out of scope for M1. The builder flag and `model.device = "dla0"` hook are reserved in `BuildOptions` and `PlatformCaps`.
 3. **INT8 needs a calibration set** (the design's targets say INT8). M1 ships FP16; INT8 is a T6 follow-up with its own accuracy gate.
 4. **Async inference.** M1 synchronises inside `infer`. Overlapping pre-processing of frame N+1 with inference of N needs events and a two-slot input; only do it if T10's numbers say so.
+
+## Implementation status — 2026-10-23 (implementing agent, PC)
+
+- **C1 done.** `GpuStream` is an opaque `Arc<dyn Any>` handle created
+  by `Platform::stream(camera_id)`; the runner no longer constructs
+  one. Sim/conformance use the no-op default. Downcast unit test in
+  `core/stage.rs`.
+- **C2 done.** `Platform::engine` returns `EngineState::{Ready,
+  Warming}`; the runner polls per frame and flows empty detections
+  while warming. PC test: `DelayedSimPlatform` (engine ready after
+  600 ms) in `warming_engine_flows_empty_then_detects` — metadata
+  flows from frame one, detections join mid-run.
+- **C3 done** (landed with the Rust review batch, item 13).
+- **C4 done.** `core/src/letterbox.rs` is the one definition of
+  scale/pad (integer pads, matching what scalers apply) plus
+  `normalize_factor`/`order_channels`; the sim preprocessor and
+  both decoders now use it. Note this *changed* the decoders from
+  float pads to the preprocessor's integer pads — the two had
+  differed by rounding.
+- **T6 (cache half) done.** `platform-jetson/src/plan_cache.rs`:
+  key = SHA-256(ONNX + TRT version + precision + SM + builder
+  flags); integrity-checked entries (truncated/corrupt loads as
+  missing); atomic store (temp + fsync + rename + dir fsync);
+  prune. The shim's `build_plan` half waits for T3/T5.
+- Everything else (T0–T5, T7–T12) is unchanged and still gated on
+  the Yocto SDK sysroot / the board, exactly as §6 says. Nothing
+  here is claimed verified on a Jetson.

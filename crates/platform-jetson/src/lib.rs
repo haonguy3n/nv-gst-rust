@@ -23,6 +23,7 @@
 #[cfg(feature = "gst")]
 pub mod gst_source;
 pub mod launch;
+pub mod plan_cache;
 pub mod probe;
 
 pub use probe::{choose_encoder, probe_media_engines, EncoderChoice, EncoderKind, MediaEngines};

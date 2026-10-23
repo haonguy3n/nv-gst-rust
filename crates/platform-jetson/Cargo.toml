@@ -19,6 +19,7 @@ required-features = ["gst"]
 
 [dependencies]
 edge-core = { path = "../core" }
+sha2.workspace = true
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }
 gstreamer-allocators = { version = "0.25", optional = true }
