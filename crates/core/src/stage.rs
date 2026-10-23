@@ -13,6 +13,10 @@ pub struct PreConfig {
     pub dst_width: u32,
     pub dst_height: u32,
     pub layout: Layout,
+    pub color: crate::config::InputColor,
+    pub normalize: crate::config::InputNormalize,
+    /// Letterbox padding value in byte domain.
+    pub pad_value: u8,
 }
 
 /// Opaque handle to one ordered GPU work queue. One stream per camera:
@@ -34,19 +38,32 @@ impl GpuStream {
 /// A compressed packet handed out by the encoder through a callback,
 /// so the encoder never allocates a `Vec` per packet in product
 /// backends (the bytes wrap the V4L2 capture-plane mmap there).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EncodedPacket {
     pub pts: Duration,
     pub keyframe: bool,
     pub data: Vec<u8>,
 }
 
+/// Result of polling a source for a frame. Timeout and end of
+/// stream are different events and must never be conflated: a
+/// pipeline continues on `Timeout` (and counts it) and stops only
+/// on `EndOfStream`.
+pub enum FramePoll {
+    Frame(HwFrame),
+    /// No frame was available within the timeout (e.g. the buffer
+    /// pool is momentarily exhausted). The frame, if any was due,
+    /// is counted as dropped by the pipeline.
+    Timeout,
+    /// The source will never produce another frame.
+    EndOfStream,
+}
+
 pub trait FrameSource: Send {
     fn start(&mut self) -> Result<()>;
     /// Hands out a frame from the source's hardware buffer pool;
     /// never allocates in steady state, never copies pixels.
-    /// `Ok(None)` means timeout or end of stream.
-    fn next_frame(&mut self, timeout: Duration) -> Result<Option<HwFrame>>;
+    fn next_frame(&mut self, timeout: Duration) -> Result<FramePoll>;
     fn stop(&mut self) -> Result<()>;
     /// Memory domain this source produces. Checked at build time.
     fn memory(&self) -> FrameMemory;
@@ -101,6 +118,10 @@ pub struct PlatformCaps {
     pub max_height: u32,
     pub codecs: Vec<Codec>,
     pub has_hw_encoder: bool,
+    /// A CPU-encode path exists (VIC copy out + x264/x265 on
+    /// Jetson). Only reachable under `zero_copy = "relaxed"` with
+    /// `encoder.hardware = false`; strict mode never uses it.
+    pub cpu_encode: bool,
     /// e.g. `["gpu", "dla0", "dla1"]` on Orin NX, `["cpu-sim"]` in sim.
     pub accelerators: Vec<String>,
 }

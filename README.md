@@ -15,10 +15,30 @@ M0 scaffold (the "first week" checklist from design.md):
 - [x] TOML config schema + loader with typed validation errors
 - [x] `platform-sim` synthetic/file source and deterministic CPU engine
 - [x] CI: fmt, clippy (`-D warnings`), tests, `cargo deny`, aarch64 cross-build
-- [ ] ONNX Runtime engine in `platform-sim` + a YOLO model on a recorded
-      clip (needs the model/clip committed or fetched in CI)
-- [ ] Flash the Orin NX with pinned JetPack 6.x; record CUDA/TensorRT/L4T
-      versions in `config/orin-nx-yolo.toml` (M1: direct Argus capture)
+- [x] ONNX Runtime engine in `platform-sim` (`--features onnx`), verified
+      against generated fixtures and a real model (below)
+- [x] `edge-postproc`: YOLOv8/v11 and YOLOX decoders with letterbox
+      inversion + NMS; real NV12 letterbox preprocessor in the sim
+- [x] Real-model end-to-end (manual run, not yet a committed test): the
+      reference products' YOLOX-tiny package (external path, not copied)
+      on a photo clip — bus 0.92 and three persons 0.86–0.90,
+      corroborated against Python onnxruntime to within 0.005/box
+- [x] External review (REVIEW-2026-10-23) worked through: runner
+      deadlock and pool-truncation fixes with regression tests, CI
+      aarch64 linker + gst-feature jobs, relaxed CPU-encode opt-in
+      reachable in the builder
+- [x] `edge-sinks`: JSONL metadata (`stream.meta_file`), file video,
+      fan-out sinks; Prometheus rendering for pipeline metrics
+- [x] `edge-conformance`: trait-level suite every backend must pass
+      (sim passes; deliberately broken stubs are caught by the suite)
+- [x] Tools: `build-engine.sh` (on-device TensorRT engine build, cached by
+      model hash + TRT version), cross-compile Docker image (verified to
+      produce an aarch64 binary), pipeline throughput bench
+- [x] Reference review (camera-viber, LPR app, gst-nvmm-cpp) folded into
+      design.md revision 2026-10-23: GStreamer-first hybrid M1, JetPack 7
+      pin, Nano CPU-encode as explicit opt-in, sysfs media-engine probe
+- [ ] Flash the Orin NX (JetPack 7 / L4T r39.2.1); record exact versions in
+      `config/orin-nx-yolo.toml` (M1: GStreamer capture/encode on device)
 
 ## Run it (no hardware needed)
 
@@ -37,8 +57,12 @@ request on any platform without hardware encode.
 
 ```text
 crates/core/          traits, HwFrame, Tensor, config, errors — #![forbid(unsafe_code)]
+crates/conformance/   trait-level checks every platform backend must pass
 crates/pipeline/      builder, capture/processing threads, drop-oldest backpressure, metrics
-crates/platform-sim/  synthetic/file source, deterministic engine — runs anywhere
+crates/postproc/      YOLO decoder + NMS (platform-neutral)
+crates/sinks/         JSONL metadata, file video, fan-out/counting sinks
+crates/platform-sim/  synthetic/file source, deterministic or ONNX engine — runs anywhere
+crates/platform-jetson/ media-engine probe + pinned GStreamer launch strings (M1 runtime on device)
 apps/edge-vision/     main: parse config, pick platform, run
 config/               x86-dev.toml (sim), orin-nx-yolo.toml (jetson target)
 ```

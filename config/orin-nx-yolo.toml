@@ -1,17 +1,20 @@
-# Jetson Orin NX profile (target: M1+). JetPack 6.x / L4T r36 pinned;
-# record exact CUDA/TensorRT/L4T versions here once the board is flashed.
+# Jetson Orin NX profile (target: M1+). Pinned (revision 2026-10-23):
+# JetPack 7 / L4T r39.2.1, TensorRT 10.16, CUDA 13, Yocto image from
+# orin-nx-camera-viber (yocto/kas), dual VC MIPI IMX296 sensors.
+# Record the exact flashed versions here once the board is up.
 platform = "jetson"
 zero_copy = "strict"
 
 [source]
-kind = "argus" # direct libargus capture into our own NVMM pool, never nvarguscamerasrc
-width = 1920
+kind = "argus" # M1: nvarguscamerasrc into NVMM (see crates/platform-jetson launch.rs); direct libargus replaces it later
+width = 1440 # IMX296 native
 height = 1080
 fps = 30
-pool_size = 6
+pool_size = 8
 
 [model]
 path = "models/yolov8n.onnx" # .engine is built on-device and cached
+decoder = "yolo"
 input_width = 640
 input_height = 640
 num_classes = 80

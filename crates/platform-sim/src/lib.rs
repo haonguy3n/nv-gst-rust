@@ -6,20 +6,21 @@
 //! anonymous files in `/dev/shm` (unlinked immediately), which give a
 //! real fd to honour the `HwBuffer::dmabuf_fd` contract and a pooled,
 //! drop-returns-to-pool lifecycle like the NVMM pool on Jetson.
-//! The engine is deterministic: it derives detections from the input
-//! tensor the preprocessor filled, so golden tests are stable.
-//!
-//! Not yet done (needs a model + clip in the repo, tracked in
-//! README): a real ONNX Runtime engine behind the same
-//! `InferenceEngine` trait.
+//! The default engine is deterministic: it derives detections from
+//! the input tensor the preprocessor filled, so golden tests are
+//! stable. With `--features onnx` and `model.path` set, the same
+//! `InferenceEngine` trait is backed by ONNX Runtime instead.
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "onnx")]
+mod onnx;
+
 use edge_core::{
-    DType, Detection, Detections, Encoder, EncoderConfig, Error, FrameMemory, FrameMeta,
-    FrameSource, GpuStream, HwBuffer, HwFrame, InferenceEngine, Layout, ModelConfig, Overlay,
-    PixelFormat, Platform, PlatformCaps, PostProcessor, PreConfig, Preprocessor, Result,
-    SourceConfig, Tensor, TensorBuffer, TensorSpec,
+    DType, Detection, Detections, Encoder, EncoderConfig, Error, FrameMemory, FrameMeta, FramePoll,
+    FrameSource, GpuStream, HwBuffer, HwFrame, InferenceEngine, InputColor, InputNormalize, Layout,
+    ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps, PostProcessor, PreConfig,
+    Preprocessor, Result, SourceConfig, Tensor, TensorBuffer, TensorSpec,
 };
 use std::any::Any;
 use std::fs::File;
@@ -60,6 +61,23 @@ pub struct SimBuffer {
     pool: FilePool,
 }
 
+impl SimBuffer {
+    /// Backend-internal read of the pooled bytes. Only sim code
+    /// downcasts to this type; the core API still gives the rest of
+    /// the pipeline no pixel access.
+    fn read_bytes(&self, out: &mut Vec<u8>) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| Error::Platform("sim buffer already returned to pool".into()))?;
+        let len = file.metadata()?.len() as usize;
+        out.resize(len, 0);
+        file.read_exact_at(out, 0)?;
+        Ok(())
+    }
+}
+
 impl HwBuffer for SimBuffer {
     fn memory(&self) -> FrameMemory {
         FrameMemory::DmaBuf
@@ -96,6 +114,7 @@ pub struct SimSource {
     seq: u64,
     running: bool,
     started: Option<std::time::Instant>,
+    scratch: Vec<u8>,
 }
 
 impl FrameSource for SimSource {
@@ -105,19 +124,19 @@ impl FrameSource for SimSource {
         Ok(())
     }
 
-    fn next_frame(&mut self, _timeout: Duration) -> Result<Option<HwFrame>> {
+    fn next_frame(&mut self, timeout: Duration) -> Result<FramePoll> {
         if !self.running {
-            return Ok(None);
+            return Ok(FramePoll::EndOfStream);
         }
         if let SourceKind::Synthetic { frames } = &self.kind {
             if frames.is_some_and(|limit| self.seq >= limit) {
-                return Ok(None);
+                return Ok(FramePoll::EndOfStream);
             }
         }
         // Pace like a real sensor at the configured fps, so the
         // pipeline's backpressure sees realistic arrival times
         // instead of an instant burst.
-        if let Some(started) = self.started {
+        if let Some(started) = self.started.filter(|_| self.cfg.paced) {
             let due =
                 started + Duration::from_secs_f64(self.seq as f64 / f64::from(self.cfg.fps.max(1)));
             let now = std::time::Instant::now();
@@ -125,17 +144,35 @@ impl FrameSource for SimSource {
                 std::thread::sleep(due - now);
             }
         }
-        // Pool exhaustion drops instead of deadlocking: the caller
-        // sees a timeout and the frame is counted by the pipeline.
-        let mut file = {
-            let mut pool = self.pool.lock().expect("sim pool mutex poisoned");
-            match pool.pop() {
-                Some(f) => f,
-                None => return Ok(None),
+        // Pool exhaustion waits up to `timeout` for a buffer to be
+        // returned, then reports Timeout instead of deadlocking:
+        // the caller sees a timeout and the frame is counted.
+        let deadline = std::time::Instant::now() + timeout;
+        let mut file = loop {
+            if let Some(f) = self.pool.lock().expect("sim pool mutex poisoned").pop() {
+                break f;
             }
+            if std::time::Instant::now() >= deadline {
+                return Ok(FramePoll::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(1));
         };
 
         let frame_bytes = PixelFormat::Nv12.frame_bytes(self.cfg.width, self.cfg.height);
+        if matches!(self.kind, SourceKind::Synthetic { .. }) {
+            // A moving gradient, so the real preprocessor has
+            // non-trivial pixels to work on (and golden tests stay
+            // deterministic per sequence number).
+            let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
+            self.scratch.resize(frame_bytes, 128);
+            for y in 0..h {
+                for x in 0..w {
+                    self.scratch[y * w + x] = (x + 2 * y + 37 * self.seq as usize) as u8;
+                }
+            }
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&self.scratch)?;
+        }
         if let SourceKind::File { reader } = &mut self.kind {
             // Dev backend only: pixels arrive from a file, so one read
             // into the pooled buffer is unavoidable and intended.
@@ -149,7 +186,7 @@ impl FrameSource for SimSource {
                     if let Ok(mut pool) = self.pool.lock() {
                         pool.push(file);
                     }
-                    return Ok(None);
+                    return Ok(FramePoll::EndOfStream);
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -171,7 +208,7 @@ impl FrameSource for SimSource {
             file: Some(file),
             pool: Arc::clone(&self.pool),
         });
-        Ok(Some(HwFrame::new(meta, buf)))
+        Ok(FramePoll::Frame(HwFrame::new(meta, buf)))
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -197,6 +234,11 @@ impl HostTensor {
             data: vec![0.0; elements],
         })
     }
+
+    #[cfg(feature = "onnx")]
+    pub(crate) fn from_vec(data: Vec<f32>) -> Arc<dyn TensorBuffer> {
+        Arc::new(Self { data })
+    }
 }
 
 impl TensorBuffer for HostTensor {
@@ -216,28 +258,101 @@ impl TensorBuffer for HostTensor {
 
 // ---------------------------------------------------------------- pre / engine
 
+/// Real pre-processing on the CPU: NV12 -> letterbox resize ->
+/// channel order -> normalise, written straight into the engine's
+/// input binding. This is what lets the sim run real models on
+/// recorded frames; hardware backends do the same math in one
+/// fused GPU/VIC pass without touching the pixels on the CPU.
 pub struct SimPreprocessor {
-    dst: (u32, u32),
+    cfg: PreConfig,
+    scratch: Vec<u8>,
+}
+
+/// BT.601 limited-range NV12 sample to RGB bytes.
+fn nv12_rgb(y: f32, u: f32, v: f32) -> (f32, f32, f32) {
+    let y = 1.164 * (y - 16.0);
+    let (u, v) = (u - 128.0, v - 128.0);
+    (
+        (y + 1.596 * v).clamp(0.0, 255.0),
+        (y - 0.813 * v - 0.391 * u).clamp(0.0, 255.0),
+        (y + 2.018 * u).clamp(0.0, 255.0),
+    )
 }
 
 impl Preprocessor for SimPreprocessor {
     fn run(&mut self, frame: &HwFrame, dst: &mut Tensor, _stream: &GpuStream) -> Result<()> {
-        // No pixel access through the core API (by design), so the sim
-        // fills the input binding with a deterministic pattern keyed
-        // by the frame sequence. A hardware backend replaces this
-        // with a fused GPU kernel reading the surface in place.
-        let expected = (self.dst.0 as usize) * (self.dst.1 as usize) * 3;
-        let slice = dst.as_f32_slice_mut().ok_or_else(|| {
+        let sim = frame
+            .buf
+            .as_any()
+            .downcast_ref::<SimBuffer>()
+            .ok_or_else(|| Error::Platform("sim preprocessor got a foreign HwBuffer".into()))?;
+        sim.read_bytes(&mut self.scratch)?;
+
+        let (sw, sh) = (frame.meta.width as usize, frame.meta.height as usize);
+        let (dw, dh) = (self.cfg.dst_width as usize, self.cfg.dst_height as usize);
+        if self.scratch.len() < PixelFormat::Nv12.frame_bytes(frame.meta.width, frame.meta.height) {
+            return Err(Error::Platform(
+                "sim preprocessor: frame buffer smaller than NV12 frame".into(),
+            ));
+        }
+        let out = dst.as_f32_slice_mut().ok_or_else(|| {
             Error::Platform("sim preprocessor needs a host-visible F32 input tensor".into())
         })?;
-        if slice.len() < expected {
+        if out.len() < 3 * dw * dh {
             return Err(Error::Platform(format!(
-                "input tensor too small: {} < {expected}",
-                slice.len()
+                "input tensor too small: {} < {}",
+                out.len(),
+                3 * dw * dh
             )));
         }
-        let v = 0.5 + (frame.meta.seq % 10) as f32 / 20.0; // 0.50..=0.95
-        slice[..expected].fill(v);
+
+        let norm = match self.cfg.normalize {
+            InputNormalize::Unit => 1.0 / 255.0,
+            InputNormalize::None => 1.0,
+        };
+        out[..3 * dw * dh].fill(self.cfg.pad_value as f32 * norm);
+
+        let scale = (dw as f32 / sw as f32).min(dh as f32 / sh as f32);
+        let (rw, rh) = (
+            ((sw as f32 * scale).round() as usize).max(1),
+            ((sh as f32 * scale).round() as usize).max(1),
+        );
+        let (ox, oy) = ((dw - rw) / 2, (dh - rh) / 2);
+        let (y_plane, uv_plane) = self.scratch.split_at(sw * sh);
+
+        let sample_y = |x: usize, y: usize| y_plane[(y.min(sh - 1)) * sw + x.min(sw - 1)] as f32;
+        let sample_uv = |x: usize, y: usize| {
+            let cx = (x / 2).min(sw / 2 - 1);
+            let cy = (y / 2).min(sh / 2 - 1);
+            let i = cy * sw + cx * 2;
+            (uv_plane[i] as f32, uv_plane[i + 1] as f32)
+        };
+
+        for ry in 0..rh {
+            // Bilinear source position for this resized row.
+            let sy = (ry as f32 + 0.5) / scale - 0.5;
+            let y0 = sy.floor().max(0.0) as usize;
+            let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+            for rx in 0..rw {
+                let sx = (rx as f32 + 0.5) / scale - 0.5;
+                let x0 = sx.floor().max(0.0) as usize;
+                let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+                let yv = sample_y(x0, y0) * (1.0 - fx) * (1.0 - fy)
+                    + sample_y(x0 + 1, y0) * fx * (1.0 - fy)
+                    + sample_y(x0, y0 + 1) * (1.0 - fx) * fy
+                    + sample_y(x0 + 1, y0 + 1) * fx * fy;
+                let (u, v) = sample_uv(x0, y0);
+                let (r, g, b) = nv12_rgb(yv, u, v);
+                let (c0, c1, c2) = match self.cfg.color {
+                    InputColor::Rgb => (r, g, b),
+                    InputColor::Bgr => (b, g, r),
+                };
+                let (dx, dy) = (ox + rx, oy + ry);
+                out[dy * dw + dx] = c0 * norm;
+                out[dw * dh + dy * dw + dx] = c1 * norm;
+                out[2 * dw * dh + dy * dw + dx] = c2 * norm;
+            }
+        }
         Ok(())
     }
 }
@@ -378,6 +493,7 @@ impl Platform for SimPlatform {
             max_height: 2160,
             codecs: Vec::new(),
             has_hw_encoder: false,
+            cpu_encode: false,
             accelerators: vec!["cpu-sim".into()],
         }
     }
@@ -411,17 +527,36 @@ impl Platform for SimPlatform {
             seq: 0,
             running: false,
             started: None,
+            scratch: Vec::new(),
         }))
     }
 
     fn preprocessor(&self, cfg: &PreConfig) -> Result<Box<dyn Preprocessor>> {
         Ok(Box::new(SimPreprocessor {
-            dst: (cfg.dst_width, cfg.dst_height),
+            cfg: cfg.clone(),
+            scratch: Vec::new(),
         }))
     }
 
     fn engine(&self, cfg: &ModelConfig) -> Result<Box<dyn InferenceEngine>> {
-        Ok(Box::new(SimEngine::new(cfg)))
+        match &cfg.path {
+            None => Ok(Box::new(SimEngine::new(cfg))),
+            Some(path) => {
+                #[cfg(feature = "onnx")]
+                {
+                    Ok(Box::new(onnx::OnnxEngine::load(path, cfg)?))
+                }
+                #[cfg(not(feature = "onnx"))]
+                {
+                    Err(Error::Unsupported(format!(
+                        "model.path = {} requires building platform-sim \
+                         with --features onnx (or clear model.path to use \
+                         the deterministic sim engine)",
+                        path.display()
+                    )))
+                }
+            }
+        }
     }
 
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
@@ -446,6 +581,7 @@ mod tests {
             width: 64,
             height: 48,
             fps: 30,
+            paced: true,
             pool_size,
             frames: Some(frames),
         }
@@ -458,32 +594,45 @@ mod tests {
         src.start().unwrap();
         let mut last_pts = Duration::ZERO;
         for expected_seq in 0..5 {
-            let frame = src
-                .next_frame(Duration::from_millis(10))
-                .unwrap()
-                .expect("frame");
+            let FramePoll::Frame(frame) = src.next_frame(Duration::from_millis(10)).unwrap() else {
+                panic!("expected a frame");
+            };
             assert_eq!(frame.meta.seq, expected_seq);
             assert!(frame.meta.pts >= last_pts);
             assert_eq!(frame.meta.dmabuf_fd, frame.buf.dmabuf_fd());
             last_pts = frame.meta.pts;
         }
-        assert!(src.next_frame(Duration::from_millis(10)).unwrap().is_none());
+        assert!(matches!(
+            src.next_frame(Duration::from_millis(10)).unwrap(),
+            FramePoll::EndOfStream
+        ));
         src.stop().unwrap();
     }
 
     #[test]
-    fn pool_exhaustion_returns_none_instead_of_deadlocking() {
+    fn pool_exhaustion_times_out_instead_of_deadlocking() {
         let platform = SimPlatform;
         let mut src = platform.source(&synthetic_cfg(3, 100)).unwrap();
         src.start().unwrap();
         // Hold every pooled buffer: the next call must not block.
         let held: Vec<_> = (0..3)
-            .map(|_| src.next_frame(Duration::from_millis(1)).unwrap().unwrap())
+            .map(
+                |_| match src.next_frame(Duration::from_millis(1)).unwrap() {
+                    FramePoll::Frame(f) => f,
+                    _ => panic!("expected a frame"),
+                },
+            )
             .collect();
-        assert!(src.next_frame(Duration::from_millis(1)).unwrap().is_none());
+        assert!(matches!(
+            src.next_frame(Duration::from_millis(1)).unwrap(),
+            FramePoll::Timeout
+        ));
         drop(held);
         // Buffers returned on drop, so capture resumes.
-        assert!(src.next_frame(Duration::from_millis(1)).unwrap().is_some());
+        assert!(matches!(
+            src.next_frame(Duration::from_millis(1)).unwrap(),
+            FramePoll::Frame(_)
+        ));
         src.stop().unwrap();
     }
 }

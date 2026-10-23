@@ -15,10 +15,12 @@ pub mod metrics;
 pub use metrics::PipelineMetrics;
 
 use edge_core::{
-    Config, Detections, Encoder, Error, FrameSource, GpuStream, HwFrame, InferenceEngine, Layout,
-    Overlay, PixelFormat, Platform, PostProcessor, PreConfig, Preprocessor, Result, Sink,
+    Config, Detections, Encoder, Error, FramePoll, FrameSource, GpuStream, HwFrame,
+    InferenceEngine, Layout, Overlay, PixelFormat, Platform, PostProcessor, PreConfig,
+    Preprocessor, Result, Sink,
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct Pipeline {
@@ -77,27 +79,56 @@ impl Pipeline {
             dst_width: config.model.input_width,
             dst_height: config.model.input_height,
             layout: Layout::PitchLinear,
+            color: config.model.input_color,
+            normalize: config.model.input_normalize,
+            pad_value: config.model.pad_value,
         };
         let preprocessor = platform.preprocessor(&pre_cfg)?;
         let engine = platform.engine(&config.model)?;
         let overlay = platform.overlay()?;
 
         let encoder = if config.encoder.enabled {
-            if !caps.has_hw_encoder {
-                return Err(Error::invalid(
-                    "encoder.enabled",
-                    format!(
-                        "platform `{}` has no hardware encoder; \
-                         set stream.metadata_only = true (frames never go to a CPU encoder)",
-                        platform.name()
-                    ),
-                ));
-            }
-            if !caps.codecs.contains(&config.encoder.codec) {
-                return Err(Error::invalid(
-                    "encoder.codec",
-                    format!("not supported by platform `{}`", platform.name()),
-                ));
+            if config.encoder.hardware {
+                if !caps.has_hw_encoder {
+                    return Err(Error::invalid(
+                        "encoder.enabled",
+                        format!(
+                            "platform `{}` has no hardware encoder; \
+                             set stream.metadata_only = true, or opt in to CPU encode \
+                             with zero_copy = \"relaxed\" and encoder.hardware = false",
+                            platform.name()
+                        ),
+                    ));
+                }
+                if !caps.codecs.contains(&config.encoder.codec) {
+                    return Err(Error::invalid(
+                        "encoder.codec",
+                        format!("not supported by platform `{}`", platform.name()),
+                    ));
+                }
+            } else {
+                // The explicit opt-in (design revision decision 3):
+                // relaxed mode only, and the platform must actually
+                // offer a CPU path. Config validation already
+                // rejects strict + hardware=false; re-check here for
+                // programmatically built configs.
+                if config.zero_copy == edge_core::ZeroCopyMode::Strict {
+                    return Err(Error::invalid(
+                        "encoder.hardware",
+                        "zero_copy = \"strict\" refuses a CPU encoder; \
+                         set zero_copy = \"relaxed\" to opt in",
+                    ));
+                }
+                if !caps.cpu_encode {
+                    return Err(Error::invalid(
+                        "encoder.enabled",
+                        format!(
+                            "platform `{}` offers no CPU encoder either; \
+                             set stream.metadata_only = true",
+                            platform.name()
+                        ),
+                    ));
+                }
             }
             match platform.encoder(&config.encoder)? {
                 Some(enc) => Some(enc),
@@ -168,30 +199,42 @@ impl Pipeline {
         let limit = max_frames.or(self.config.source.frames);
 
         let (tx, rx, dropped) = channel::channel::<HwFrame>(self.config.pipeline.queue_depth);
+        // Shared stop flag: the only way the capture thread learns
+        // the consumer is gone (a stage error must never deadlock
+        // against an unbounded source — REVIEW P0-1).
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture_stop = Arc::clone(&stop);
 
         // Temporarily move the source into the capture thread.
         let mut source = std::mem::replace(&mut self.source, NoopSource::boxed());
-        let capture = std::thread::spawn(move || -> Result<(Box<dyn FrameSource>, u64)> {
+        let capture = std::thread::spawn(move || -> Result<(Box<dyn FrameSource>, u64, u64)> {
             let mut captured = 0u64;
+            let mut timeouts = 0u64;
             source.start()?;
             loop {
+                if capture_stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Some(limit) = limit {
                     if captured >= limit {
                         break;
                     }
                 }
                 match source.next_frame(Duration::from_millis(100))? {
-                    Some(frame) => {
+                    FramePoll::Frame(frame) => {
                         captured += 1;
                         // Drop-oldest: an evicted frame returns its
                         // buffer to the capture pool here.
                         drop(tx.send(frame));
                     }
-                    None => break, // end of stream / exhausted source
+                    // A momentary shortage is not the end of
+                    // anything: count it and keep capturing.
+                    FramePoll::Timeout => timeouts += 1,
+                    FramePoll::EndOfStream => break,
                 }
             }
             source.stop()?;
-            Ok((source, captured))
+            Ok((source, captured, timeouts))
         });
 
         let mut detections = Detections::with_capacity(64);
@@ -210,11 +253,16 @@ impl Pipeline {
             }
         }
 
-        let (source, captured) = capture
+        // Tell capture to stop and drop the receiver *before*
+        // joining, so an unbounded source cannot block shutdown.
+        stop.store(true, Ordering::Relaxed);
+        drop(rx);
+        let (source, captured, timeouts) = capture
             .join()
             .map_err(|_| Error::Platform("capture thread panicked".into()))??;
         self.source = source;
         metrics.frames_captured = captured;
+        metrics.capture_timeouts = timeouts;
         metrics.frames_dropped += dropped.load(Ordering::Relaxed);
 
         match last_err {
@@ -293,8 +341,8 @@ impl FrameSource for NoopSource {
     fn start(&mut self) -> Result<()> {
         Ok(())
     }
-    fn next_frame(&mut self, _timeout: Duration) -> Result<Option<HwFrame>> {
-        Ok(None)
+    fn next_frame(&mut self, _timeout: Duration) -> Result<FramePoll> {
+        Ok(FramePoll::EndOfStream)
     }
     fn stop(&mut self) -> Result<()> {
         Ok(())

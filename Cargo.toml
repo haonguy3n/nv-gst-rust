@@ -1,8 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/conformance",
     "crates/core",
     "crates/pipeline",
+    "crates/postproc",
+    "crates/sinks",
+    "crates/platform-jetson",
     "crates/platform-sim",
     "apps/edge-vision",
 ]
@@ -14,6 +18,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "1.1"
 thiserror = "2.0"
 anyhow = "1.0"

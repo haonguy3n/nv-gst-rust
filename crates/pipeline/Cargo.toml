@@ -11,6 +11,7 @@ edge-core = { path = "../core" }
 
 [dev-dependencies]
 platform-sim = { path = "../platform-sim" }
+edge-sinks = { path = "../sinks" }
 
 [lints]
 workspace = true

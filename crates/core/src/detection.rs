@@ -1,6 +1,8 @@
+use serde::Serialize;
+
 /// One decoded detection, coordinates normalised to `0.0..=1.0`
 /// of the frame width/height.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Detection {
     pub x: f32,
     pub y: f32,
@@ -12,7 +14,7 @@ pub struct Detection {
 
 /// Reused across frames: `PostProcessor::decode` clears and refills it
 /// so the hot loop does not allocate.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct Detections {
     pub frame_seq: u64,
     pub items: Vec<Detection>,

@@ -42,6 +42,11 @@ pub struct SourceConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Simulator only: pace frame production at `fps` like a real
+    /// sensor. Set `false` for throughput benches and burst tests.
+    /// Hardware sources ignore this (the sensor sets the pace).
+    #[serde(default = "default_true")]
+    pub paced: bool,
     /// Preallocated buffer pool; must be >= frames in flight + 2.
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
@@ -51,7 +56,7 @@ pub struct SourceConfig {
 }
 
 fn default_pool_size() -> usize {
-    6
+    8
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +64,20 @@ pub struct ModelConfig {
     /// ONNX model on sim; `.engine` built on-device on Jetson.
     #[serde(default)]
     pub path: Option<PathBuf>,
+    /// Output decoder: `"sim"` (deterministic sim engine rows),
+    /// `"yolo"` (YOLOv8/v11 raw head, `[1, 4 + classes, N]`), or
+    /// `"yolox"` (three outputs: boxes xyxy, objectness, scores).
+    #[serde(default = "default_decoder")]
+    pub decoder: String,
+    /// Channel order the model expects (YOLOv8: RGB, YOLOX: BGR).
+    #[serde(default)]
+    pub input_color: InputColor,
+    /// Pixel scaling the model expects (YOLOv8: 0..1, YOLOX: 0..255).
+    #[serde(default)]
+    pub input_normalize: InputNormalize,
+    /// Letterbox padding value in byte domain (114 in both families).
+    #[serde(default = "default_pad_value")]
+    pub pad_value: u8,
     pub input_width: u32,
     pub input_height: u32,
     #[serde(default = "default_num_classes")]
@@ -67,6 +86,30 @@ pub struct ModelConfig {
     pub score_threshold: f32,
 }
 
+fn default_decoder() -> String {
+    "sim".into()
+}
+fn default_pad_value() -> u8 {
+    114
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InputColor {
+    #[default]
+    Rgb,
+    Bgr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InputNormalize {
+    /// Pixels scaled to 0.0..=1.0.
+    #[default]
+    Unit,
+    /// Pixels left in 0.0..=255.0.
+    None,
+}
 fn default_num_classes() -> u32 {
     80
 }
@@ -120,6 +163,10 @@ pub struct StreamConfig {
     /// go out over MQTT/WebSocket, frames never touch the CPU.
     #[serde(default)]
     pub metadata_only: bool,
+    /// Also write detections to this file as JSON lines (one line
+    /// per frame). Useful for metadata-only profiles and debugging.
+    #[serde(default)]
+    pub meta_file: Option<PathBuf>,
     #[serde(default = "default_rtsp_port")]
     pub rtsp_port: u16,
 }
@@ -176,10 +223,17 @@ impl Config {
         if !(1..=240).contains(&s.fps) {
             return Err(Error::invalid("source.fps", "must be within 1..=240"));
         }
-        if s.pool_size < 3 {
+        // The pool must cover the channel queue plus capture and
+        // in-flight processing, or pool exhaustion masquerades as
+        // a starved (and formerly truncated) run.
+        let min_pool = self.pipeline.queue_depth + 3;
+        if s.pool_size < min_pool {
             return Err(Error::invalid(
                 "source.pool_size",
-                "must be >= frames in flight + 2 (>= 3)",
+                format!(
+                    "must be >= pipeline.queue_depth + 3 (>= {min_pool} here), got {}",
+                    s.pool_size
+                ),
             ));
         }
         if s.kind == "file" && s.path.is_none() {
@@ -191,6 +245,12 @@ impl Config {
         let m = &self.model;
         if m.input_width == 0 || m.input_height == 0 {
             return Err(Error::invalid("model.input_width/height", "must be > 0"));
+        }
+        if !matches!(m.decoder.as_str(), "sim" | "yolo" | "yolox") {
+            return Err(Error::invalid(
+                "model.decoder",
+                "must be \"sim\", \"yolo\" or \"yolox\"",
+            ));
         }
         if !(0.0..=1.0).contains(&m.score_threshold) {
             return Err(Error::invalid(
@@ -238,7 +298,7 @@ input_height = 320
     #[test]
     fn parses_minimal_config_with_defaults() {
         let cfg = Config::from_toml_str(VALID).expect("valid config");
-        assert_eq!(cfg.source.pool_size, 6);
+        assert_eq!(cfg.source.pool_size, 8);
         assert_eq!(cfg.zero_copy, ZeroCopyMode::Strict);
         assert_eq!(cfg.pipeline.queue_depth, 4);
     }

@@ -2,6 +2,49 @@
 
 Oct 23, 2026 · @Hao
 
+> **Revision 2026-10-23 (after reviewing the owner's shipping references —
+> `orin-nx-camera-viber`, `orin-nano/lpr_app`, and `gst-nvmm-cpp`).** Three
+> decisions supersede the text below where they differ:
+>
+> 1. **Hybrid Jetson path.** M1 uses GStreamer pipelines proven in the
+>    reference products (`nvarguscamerasrc` → NV12 in NVMM → appsink;
+>    appsrc → `nvv4l2h26xenc`), still zero-copy from sensor to encoder.
+>    Direct libargus capture into our own NVMM pool becomes a later
+>    replacement behind the same `FrameSource` trait, not an M1 gate.
+>    Feeding NVENC the very same dmabuf from `appsrc` needs an NVMM
+>    `GstAllocator` (gst-nvmm-cpp's `nvmmalloc`, LGPL; validated on
+>    JetPack 5.1/6 — JetPack 7 validation is ours). Hard lesson carried
+>    over: in-place analytics must sit *before* any tee/branch — after a
+>    tee they shallow-copy frames branches still hold, and NVENC ended up
+>    encoding a surface the capture pool had already reused (crash/hang).
+> 2. **JetPack 7 pin.** L4T r39.2.1, TensorRT 10.16, CUDA 13, Yocto image
+>    (camera-viber `yocto/kas`), sensors: dual VC MIPI IMX296, 1440×1080.
+>    This replaces the JetPack 6.x / r36 pin below.
+> 3. **Orin Nano CPU encode is an explicit opt-in.** `zero_copy = "strict"`
+>    (default) still refuses it. `zero_copy = "relaxed"` plus
+>    `encoder.hardware = false` selects the reference product's measured
+>    path (VIC copy NVMM → I420, then x264/x265; 30 fps at ≈1.1 Orin NX
+>    cores) — recorded as one deliberate copy in the buffer budget.
+>    NVENC/NVJPG presence is probed from sysfs (driver-bound `.nvenc` /
+>    `.nvjpg` platform devices), never assumed from the board name.
+
+## Implementation status (2026-10-23)
+
+| Claim | Code path | Verified by |
+| --- | --- | --- |
+| Core traits + `HwFrame`/`Tensor` handles, no CPU pixel access in release | `crates/core` (`#![forbid(unsafe_code)]`, `map_cpu` behind `cpu-debug`) | unit tests; `cargo clippy --features cpu-debug` |
+| TOML config with validation (incl. pool ≥ queue + 3, strict-mode encoder refusal) | `crates/core/src/config.rs` | config unit tests |
+| Pipeline: bounded drop-oldest channel, capture timeouts counted, stage errors cannot deadlock | `crates/pipeline` | integration + regression tests (`sim_pipeline.rs`: P0-1/P0-2 cases) |
+| Sim backend: synthetic/file sources, real NV12 letterbox preprocessor | `crates/platform-sim` | unit tests; conformance suite; live runs |
+| ONNX inference on CPU (sim), real YOLOX-tiny end to end | `platform-sim --features onnx`, `crates/postproc` (YOLOv8 + YOLOX decoders, NMS) | fixture tests; real-model run corroborated vs Python onnxruntime (manual, not yet a committed test) |
+| Sinks: JSONL metadata, file video, fan-out; Prometheus text metrics | `crates/sinks`, `pipeline::PipelineMetrics` | unit tests; live JSONL run |
+| Conformance suite every backend must pass | `crates/conformance` (sim passes; broken stubs caught) | maintained tests in `platform-sim` and the suite crate |
+| Jetson: NVENC/NVJPG sysfs probe, encoder choice, pinned GStreamer launch strings | `crates/platform-jetson` (`probe.rs`, `launch.rs`) | unit tests incl. fake sysfs tree |
+| Jetson: GStreamer capture runtime (`appsink`, dmabuf wrap, counted PC copy fallback) | `platform-jetson --features gst` (`gst_source.rs`) | PC tests with `videotestsrc` (copied=5 counted); **not on device yet** — `copied=0` on the Orin is an M1 exit gate |
+| Jetson: TensorRT engine, CUDA pre-process/overlay, NVENC encode stage, RTSP sink | — | **Not implemented** (M1 device work; launch strings are the contract) |
+| aarch64 cross-build | Docker (`tools/Dockerfile.cross`), CI job with configured linker | real aarch64 ELF produced in Docker |
+| Zero-copy on device (no `memcpy` in steady state) | — | **Not verified** — Nsight/`tegrastats` EMC gate on the flashed board (M1) |
+
 ## Goals and non-goals
 
 Build one Rust binary that captures camera frames, runs a neural network on them and streams the encoded video, with every frame staying in hardware memory end to end. Jetson Orin Nano / Orin NX is the first target; NXP i.MX and Ambarella must be addable as new backend crates without touching the pipeline core.
@@ -33,7 +76,7 @@ Orin Nano targets are the same at one camera; confirm once the model is chosen.
 
 ## Architecture overview
 
-Six stages run as one thread each, joined by bounded channels; only handles to hardware buffers move between them, never pixel bytes.
+Stages are joined by bounded channels and only handles to hardware buffers move between them, never pixel bytes. The current runner uses two threads (capture + one processing thread running the remaining stages in order); splitting processing into per-stage threads is a latency/parallelism decision to make with device measurements, not an assumption baked into the traits.
 
 &#91;embedded content: pipeline architecture · 6 stages, 3 platform columns\]
 
@@ -47,10 +90,10 @@ After the sensor writes a frame, no CPU instruction and no `cudaMemcpy` ever cop
 
 | Buffer | Memory | Written by | Read in place by |
 | --- | --- | --- | --- |
-| Capture surface, NV12 pitch-linear 1920×1080 | NVMM dmabuf, pool of 6 | ISP via Argus | CUDA pre-process, CUDA overlay (draws boxes in place), NVENC (dmabuf import) |
+| Capture surface, NV12 1440×1080 (IMX296), block-linear from `nvarguscamerasrc` in M1 (pitch-linear only if a VIC/direct-Argus step makes it so — the layout in `FrameMeta` is authoritative, never assumed) | NVMM dmabuf, pool ≥ queue + 3 | ISP via Argus | CUDA/VIC pre-process, CUDA overlay (draws boxes in place), NVENC (dmabuf import) |
 | Input tensor, FP16 3×640×640 | CUDA device memory = the TensorRT input binding | fused CUDA pre-process kernel | TensorRT |
 | Output tensors | pinned mapped host memory (`cudaHostAllocMapped`) | TensorRT | CPU post-process |
-| Bitstream | V4L2 capture-plane mmap | NVENC | RTSP sink, wrapped as a GstBuffer; returned to the encoder on drop |
+| Bitstream | encoder output buffer (GstBuffer from `nvv4l2h26xenc` in M1; V4L2 capture-plane mmap if/when the direct-Argus path replaces the encoder too) | NVENC | RTSP sink by reference; returned to the encoder pool on drop. RTP payloading copies the (small) bitstream — budget it explicitly, it is not zero |
 
 Only the output tensors (around 1 MB for a YOLO-class head) and the compressed bitstream are touched by the CPU. The kernel's socket send is the one copy no user-space design can avoid.
 
@@ -73,8 +116,8 @@ The trait sketch in the HAL section is written to these rules: `HwFrame` has no 
 
 **No frame copies, no exceptions**
 
-- **Direct Argus capture from M1.** Frames go straight into our own NVMM pool. `nvarguscamerasrc` is never in the product path, so there is no capture-side copy at any milestone.
-- **Orin Nano never hands frames to the CPU.** It has no NVENC, so the Nano profile runs capture → infer → overlay fully in NVMM and streams detections only (MQTT / WebSocket metadata). If you need video from a Nano-class product, the answer is a module with NVENC (Orin NX), not a CPU encoder. `zero_copy = "strict"` (the default) refuses any CPU-encode profile.
+- **Capture stays in NVMM from M1.** M1 uses `nvarguscamerasrc` → appsink (the path both shipping reference products use; frames are NVMM NV12 from the ISP, no capture-side copy). Direct libargus buffer-stream capture into our own NVMM pool is a later replacement behind the same `FrameSource` trait, adopted only if device traces show the GStreamer boundary costing us copies or latency.
+- **Orin Nano defaults to never handing frames to the CPU.** It has no NVENC, so the strict Nano profile runs capture → infer → overlay fully in NVMM and streams detections only (MQTT / WebSocket metadata); `zero_copy = "strict"` (the default) refuses any CPU-encode profile. A Nano product that truly needs video opts in explicitly (`zero_copy = "relaxed"`, `encoder.hardware = false`) to the measured VIC-copy + x264 path — one deliberate, budgeted copy, chosen in config, never a silent fallback (revision decision 3).
 - **Layout changes stay on hardware.** If a stage needs a different layout (block-linear → pitch-linear), VIC converts NVMM → NVMM, and the startup budget lists it. The CPU never touches pixels.
 
 ## Platform abstraction (HAL) design
@@ -232,7 +275,7 @@ edge-vision/
 
 ## Jetson Orin backend details
 
-The Jetson backend keeps every frame as an NvBufSurface (NVMM) from sensor to encoder, using VIC for scaling, CUDA for tensor prep, TensorRT (GPU or DLA) for inference and the V4L2 hardware encoder. One hardware difference shapes the design: **Orin Nano has no hardware video encoder (NVENC)**, so the Nano build streams detections only and never hands frames to a CPU encoder — an optional `Encoder` trait makes that a config switch, not a fork.
+The Jetson backend keeps every frame as an NvBufSurface (NVMM) from sensor to encoder, using VIC for scaling, CUDA for tensor prep, TensorRT (GPU or DLA) for inference and the V4L2 hardware encoder. One hardware difference shapes the design: **Orin Nano has no hardware video encoder (NVENC)**, so the strict Nano build streams detections only, with CPU encode available as the explicit relaxed-mode opt-in — an optional `Encoder` trait plus `PlatformCaps::cpu_encode` make that a config switch, not a fork.
 
 | Stage | Orin NX | Orin Nano | Rust integration (zero-copy detail) |
 | --- | --- | --- | --- |
@@ -250,7 +293,7 @@ The Jetson backend keeps every frame as an NvBufSurface (NVMM) from sensor to en
 - **One CUDA stream per camera**, with pre-process, inference and overlay queued on it; the CPU thread only waits on an event. This keeps the CPU near idle.
 - **Synchronisation across engines** (VIC, CUDA, encoder) uses `NvBufSurfaceSyncForDevice` / CUDA events; wrap them so a stage cannot forget to sync.
 - **Pool sizing:** capture pool ≥ pipeline depth + 2 (e.g. 6 buffers); exhausting the pool drops the oldest frame rather than blocking the sensor.
-- **Version pinning:** pin one JetPack release (6.x line, L4T r36) for v1 and record it in `config/`; bindgen headers are generated from that release's `/usr/src/jetson_multimedia_api`.
+- **Version pinning:** pin JetPack 7 (L4T r39.2.1, TensorRT 10.16, CUDA 13) for v1 and record the exact flashed versions in `config/`; when the direct-Argus shim lands, its headers are generated from that release's `/usr/src/jetson_multimedia_api`.
 - **Build:** cross-compile from x86 with a Docker image holding the L4T sysroot, or build natively on the Orin; both covered in CI.
 - **Avoid a DeepStream dependency** in v1: it is heavy and its licensing/versions tie you to NVIDIA's release cadence. The backend uses only the Multimedia API, CUDA and TensorRT.
 

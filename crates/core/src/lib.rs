@@ -15,14 +15,14 @@ pub mod stage;
 pub mod tensor;
 
 pub use config::{
-    Codec, Config, EncoderConfig, ModelConfig, PipelineConfig, SourceConfig, StreamConfig,
-    ZeroCopyMode,
+    Codec, Config, EncoderConfig, InputColor, InputNormalize, ModelConfig, PipelineConfig,
+    SourceConfig, StreamConfig, ZeroCopyMode,
 };
 pub use detection::{Detection, Detections};
 pub use error::{Error, Result};
 pub use frame::{FrameMemory, FrameMeta, HwBuffer, HwFrame, Layout, PixelFormat};
 pub use stage::{
-    EncodedPacket, Encoder, FrameSource, GpuStream, InferenceEngine, Overlay, Platform,
+    EncodedPacket, Encoder, FramePoll, FrameSource, GpuStream, InferenceEngine, Overlay, Platform,
     PlatformCaps, PostProcessor, PreConfig, Preprocessor, Sink,
 };
 pub use tensor::{DType, Tensor, TensorBuffer, TensorSpec};

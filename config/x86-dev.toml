@@ -7,7 +7,7 @@ kind = "synthetic" # "file" + path reads raw NV12 frames from disk
 width = 640
 height = 480
 fps = 30
-pool_size = 6
+pool_size = 8
 frames = 30 # bounded run for dev/CI; remove to run until the source ends
 
 [model]

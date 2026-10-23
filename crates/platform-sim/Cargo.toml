@@ -6,8 +6,22 @@ license.workspace = true
 rust-version.workspace = true
 description = "Simulator backend: synthetic/file source and deterministic CPU engine for laptops and CI"
 
+[features]
+# Real ONNX models via ONNX Runtime. Off by default so plain CI
+# builds stay hermetic and fast; the deterministic engine is used
+# whenever the config sets no model.path.
+onnx = ["dep:ort"]
+
 [dependencies]
 edge-core = { path = "../core" }
+ort = { version = "2.0.0-rc.15", optional = true, default-features = false, features = [
+    "download-binaries",
+    "tls-rustls",
+    "std",
+] }
+
+[dev-dependencies]
+edge-conformance = { path = "../conformance" }
 
 [lints]
 workspace = true
