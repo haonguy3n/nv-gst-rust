@@ -12,7 +12,7 @@
 pub mod channel;
 pub mod metrics;
 
-pub use metrics::PipelineMetrics;
+pub use metrics::{LiveMetrics, PipelineMetrics};
 
 use edge_core::{
     Config, Detections, Encoder, Error, FramePoll, FrameSource, GpuStream, HwFrame,
@@ -34,6 +34,10 @@ pub struct Pipeline {
     sink: Box<dyn Sink>,
     config: Config,
     metadata_only: bool,
+    /// External stop request (signals, supervisors, tests).
+    stop: Arc<AtomicBool>,
+    /// Counters observable while a run is in progress.
+    live_metrics: Arc<LiveMetrics>,
 }
 
 impl Pipeline {
@@ -67,16 +71,17 @@ impl Pipeline {
                 ),
             ));
         }
-        if !caps.devices.is_empty() && !caps.devices.contains(&config.model.device) {
-            return Err(Error::invalid(
-                "model.device",
-                format!(
-                    "`{}` not available on platform `{}` (has: {})",
-                    config.model.device,
-                    platform.name(),
-                    caps.devices.join(", ")
-                ),
-            ));
+        if let Some(device) = &config.model.device {
+            if !caps.devices.is_empty() && !caps.devices.contains(device) {
+                return Err(Error::invalid(
+                    "model.device",
+                    format!(
+                        "`{device}` not available on platform `{}` (has: {})",
+                        platform.name(),
+                        caps.devices.join(", ")
+                    ),
+                ));
+            }
         }
         if !caps.formats.contains(&PixelFormat::Nv12) {
             return Err(Error::DomainMismatch {
@@ -109,6 +114,37 @@ impl Pipeline {
         let preprocessor = platform.preprocessor(&pre_cfg)?;
         let mut engine = platform.engine(&config.model)?;
         let input_spec = engine.input_bindings().first().map(|t| t.spec.clone());
+        // The engine's declared input must match the config the
+        // preprocessor was just built for, or the mismatch would
+        // surface only at the first infer (or never, on a
+        // dynamic-shape model).
+        if let Some(spec) = &input_spec {
+            let expected_shape = vec![
+                1,
+                3,
+                config.model.input_height as usize,
+                config.model.input_width as usize,
+            ];
+            if !spec.shape.is_empty() && spec.shape != expected_shape {
+                return Err(Error::DomainMismatch {
+                    stage: "engine",
+                    expected: format!("input shape {expected_shape:?}"),
+                    got: format!("{:?}", spec.shape),
+                });
+            }
+            let expected_dtype = match config.model.precision {
+                edge_core::Precision::Fp32 => edge_core::DType::F32,
+                edge_core::Precision::Fp16 => edge_core::DType::F16,
+                edge_core::Precision::Int8 => edge_core::DType::I8,
+            };
+            if spec.dtype != expected_dtype {
+                return Err(Error::DomainMismatch {
+                    stage: "engine",
+                    expected: format!("input dtype {expected_dtype:?}"),
+                    got: format!("{:?}", spec.dtype),
+                });
+            }
+        }
         let overlay = platform.overlay()?;
 
         let encoder = if config.encoder.enabled {
@@ -183,11 +219,27 @@ impl Pipeline {
             sink,
             config,
             metadata_only,
+            stop: Arc::new(AtomicBool::new(false)),
+            live_metrics: Arc::new(LiveMetrics::default()),
         })
     }
 
     pub fn metadata_only(&self) -> bool {
         self.metadata_only
+    }
+
+    /// Handle for stopping `run()` from another thread (signal
+    /// handlers, supervisors). Setting it ends the run cleanly:
+    /// capture stops, the source is restored, and `run` returns
+    /// the metrics gathered so far with `Ok(())`.
+    /// Counters shared with the running pipeline; snapshot them
+    /// from any thread while `run` is in progress.
+    pub fn live_metrics(&self) -> Arc<LiveMetrics> {
+        Arc::clone(&self.live_metrics)
+    }
+
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
     }
 
     /// The per-frame buffer budget, printed at startup so a hidden
@@ -225,55 +277,74 @@ impl Pipeline {
         )
     }
 
-    /// Run until the source ends or `max_frames` frames are processed.
-    pub fn run(&mut self, max_frames: Option<u64>) -> Result<PipelineMetrics> {
+    /// Run until the source ends, `max_frames` frames are
+    /// captured, the stop handle is set, or a stage fails.
+    ///
+    /// Always returns the metrics gathered so far — including on
+    /// the error path, where the first (processing) error wins —
+    /// and always restores the source, so the pipeline can run
+    /// again. The one exception is a capture-thread panic, where
+    /// the source is lost with the thread.
+    pub fn run(&mut self, max_frames: Option<u64>) -> (PipelineMetrics, Result<()>) {
+        // Each run starts un-stopped; the shutdown path below sets
+        // the flag, and it must not poison a later run.
+        self.stop.store(false, Ordering::Relaxed);
+        self.live_metrics.reset();
         let mut metrics = PipelineMetrics::default();
         let stream = GpuStream::new(0);
         let limit = max_frames.or(self.config.source.frames);
+        let max_idle = Duration::from_millis(self.config.pipeline.max_idle_ms);
 
         let (tx, rx, dropped) = channel::channel::<HwFrame>(self.config.pipeline.queue_depth);
-        // Shared stop flag: the only way the capture thread learns
-        // the consumer is gone (a stage error must never deadlock
-        // against an unbounded source — REVIEW P0-1).
-        let stop = Arc::new(AtomicBool::new(false));
-        let capture_stop = Arc::clone(&stop);
+        let capture_stop = Arc::clone(&self.stop);
+        let capture_live = Arc::clone(&self.live_metrics);
 
         // Temporarily move the source into the capture thread.
-        let mut source = std::mem::replace(&mut self.source, NoopSource::boxed());
-        let capture = std::thread::spawn(move || -> Result<(Box<dyn FrameSource>, u64, u64)> {
-            let mut captured = 0u64;
-            let mut timeouts = 0u64;
-            source.start()?;
-            loop {
-                if capture_stop.load(Ordering::Relaxed) {
-                    break;
+        // It travels through a slot so a failed spawn can hand it
+        // back instead of dropping it with the unspawned closure.
+        let source = std::mem::replace(&mut self.source, NoopSource::boxed());
+        let slot = Arc::new(std::sync::Mutex::new(Some(source)));
+        let thread_slot = Arc::clone(&slot);
+        let capture = std::thread::Builder::new()
+            .name(format!("capture-cam{}", self.config.source.camera_id))
+            .spawn(move || {
+                let mut source = thread_slot
+                    .lock()
+                    .expect("source slot poisoned")
+                    .take()
+                    .expect("source slot empty in capture thread");
+                let (counts, result) = capture_loop(
+                    &mut *source,
+                    &tx,
+                    &capture_stop,
+                    &capture_live,
+                    limit,
+                    max_idle,
+                );
+                // stop() runs on every path; the loop's error wins.
+                let result = result.and_then(|()| source.stop());
+                (source, counts, result)
+            });
+        let capture = match capture {
+            Ok(handle) => handle,
+            Err(e) => {
+                if let Some(source) = slot.lock().expect("source slot poisoned").take() {
+                    self.source = source;
                 }
-                if let Some(limit) = limit {
-                    if captured >= limit {
-                        break;
-                    }
-                }
-                match source.next_frame(Duration::from_millis(100))? {
-                    FramePoll::Frame(frame) => {
-                        captured += 1;
-                        // Drop-oldest: an evicted frame returns its
-                        // buffer to the capture pool here.
-                        drop(tx.send(frame));
-                    }
-                    // A momentary shortage is not the end of
-                    // anything: count it and keep capturing.
-                    FramePoll::Timeout => timeouts += 1,
-                    FramePoll::EndOfStream => break,
-                }
+                return (
+                    metrics,
+                    Err(Error::Platform(format!("spawning capture thread: {e}"))),
+                );
             }
-            source.stop()?;
-            Ok((source, captured, timeouts))
-        });
+        };
 
         let mut detections = Detections::with_capacity(64);
         let mut last_err: Option<Error> = None;
 
         loop {
+            if self.stop.load(Ordering::Relaxed) && rx.is_empty() {
+                break;
+            }
             let Some(frame) = rx.recv_timeout(Duration::from_millis(200)) else {
                 if rx.is_closed_and_empty() || capture.is_finished() {
                     break;
@@ -284,24 +355,40 @@ impl Pipeline {
                 last_err = Some(e);
                 break;
             }
+            self.live_metrics
+                .sync_processing(&metrics, dropped.load(Ordering::Relaxed));
         }
 
         // Tell capture to stop and drop the receiver *before*
         // joining, so an unbounded source cannot block shutdown.
-        stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
         drop(rx);
-        let (source, captured, timeouts) = capture
-            .join()
-            .map_err(|_| Error::Platform("capture thread panicked".into()))??;
-        self.source = source;
-        metrics.frames_captured = captured;
-        metrics.capture_timeouts = timeouts;
+        let capture_result = match capture.join() {
+            Ok((source, (captured, timeouts), result)) => {
+                // Restore the source before inspecting any result:
+                // a failed run must not leave a NoopSource behind.
+                self.source = source;
+                // Counts survive a capture error: partial metrics
+                // are the evidence for what the source did.
+                metrics.frames_captured = captured;
+                metrics.capture_timeouts = timeouts;
+                result
+            }
+            Err(_) => Err(Error::Platform("capture thread panicked".into())),
+        };
         metrics.frames_dropped += dropped.load(Ordering::Relaxed);
+        self.live_metrics
+            .set_capture(metrics.frames_captured, metrics.capture_timeouts);
+        self.live_metrics
+            .sync_processing(&metrics, metrics.frames_dropped);
 
-        match last_err {
+        // Flush sinks on every path; an earlier error still wins.
+        let finish_result = self.sink.finish();
+        let result = match last_err {
             Some(e) => Err(e),
-            None => Ok(metrics),
-        }
+            None => capture_result.and(finish_result),
+        };
+        (metrics, result)
     }
 
     fn process_one(
@@ -390,4 +477,73 @@ impl FrameSource for NoopSource {
     fn memory(&self) -> edge_core::FrameMemory {
         edge_core::FrameMemory::DmaBuf
     }
+    fn layout(&self) -> edge_core::Layout {
+        edge_core::Layout::PitchLinear
+    }
+}
+
+/// The capture thread's loop: pull frames into the channel until
+/// the source ends, the limit is reached, stop is requested, or
+/// no frame has arrived within `max_idle` (0 disables the limit).
+/// Returns ((captured, timeouts), result): the counts are always
+/// returned, even when the loop ends in error, so partial metrics
+/// survive. `source.stop()` is the caller's job, on every path.
+fn capture_loop(
+    source: &mut dyn FrameSource,
+    tx: &channel::Sender<HwFrame>,
+    stop: &AtomicBool,
+    live: &LiveMetrics,
+    limit: Option<u64>,
+    max_idle: Duration,
+) -> ((u64, u64), Result<()>) {
+    let mut captured = 0u64;
+    let mut timeouts = 0u64;
+    if let Err(e) = source.start() {
+        return ((captured, timeouts), Err(e));
+    }
+    let mut last_frame = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Some(limit) = limit {
+            if captured >= limit {
+                break;
+            }
+        }
+        let poll = match source.next_frame(Duration::from_millis(100)) {
+            Ok(poll) => poll,
+            Err(e) => return ((captured, timeouts), Err(e)),
+        };
+        match poll {
+            FramePoll::Frame(frame) => {
+                captured += 1;
+                live.set_capture(captured, timeouts);
+                last_frame = Instant::now();
+                // Drop-oldest: an evicted frame returns its
+                // buffer to the capture pool here.
+                drop(tx.send(frame));
+            }
+            // A momentary shortage is not the end of anything:
+            // count it and keep capturing — unless the source has
+            // been silent past the idle limit, which is a dead
+            // camera a supervisor must hear about.
+            FramePoll::Timeout => {
+                timeouts += 1;
+                live.set_capture(captured, timeouts);
+                if !max_idle.is_zero() && last_frame.elapsed() > max_idle {
+                    return (
+                        (captured, timeouts),
+                        Err(Error::Platform(format!(
+                            "source stalled: no frame for {:?} (max_idle {:?})",
+                            last_frame.elapsed(),
+                            max_idle
+                        ))),
+                    );
+                }
+            }
+            FramePoll::EndOfStream => break,
+        }
+    }
+    ((captured, timeouts), Ok(()))
 }

@@ -47,17 +47,68 @@ impl OnnxEngine {
         }
 
         let (w, h) = (cfg.input_width as usize, cfg.input_height as usize);
+        // Check the model's declared input against the config now,
+        // not at the first infer: a static dim that disagrees (or
+        // a non-F32 input the preprocessor cannot write) is a
+        // load-time error. Dynamic dims (-1) are accepted.
+        let input_name = match session.inputs().first() {
+            Some(declared) => {
+                let dtype = declared.dtype();
+                if let Some(elem) = dtype.tensor_type() {
+                    if elem != ort::value::TensorElementType::Float32 {
+                        return Err(Error::Platform(format!(
+                            "ONNX model {} input `{}` is {elem:?}, expected Float32",
+                            path.display(),
+                            declared.name()
+                        )));
+                    }
+                }
+                if let Some(shape) = dtype.tensor_shape() {
+                    let expected = [1i64, 3, h as i64, w as i64];
+                    let mismatch = shape.len() != expected.len()
+                        || shape
+                            .iter()
+                            .zip(expected.iter())
+                            .any(|(&got, &want)| got > 0 && got != want);
+                    if mismatch {
+                        return Err(Error::Platform(format!(
+                            "ONNX model {} input `{}` shape {shape} does not match \
+                             config [1, 3, {h}, {w}]",
+                            path.display(),
+                            declared.name()
+                        )));
+                    }
+                }
+                declared.name().to_string()
+            }
+            None => {
+                return Err(Error::Platform(format!(
+                    "ONNX model {} declares no inputs",
+                    path.display()
+                )));
+            }
+        };
         let inputs = vec![Tensor::new(
-            TensorSpec::new("images", vec![1, 3, h, w], DType::F32),
+            TensorSpec::new(input_name, vec![1, 3, h, w], DType::F32),
             HostTensor::zeros(3 * h * w),
         )];
-        // Real shapes are published after the first inference.
-        let outputs = output_names
+        // Preallocate outputs from their declared shapes when
+        // static; dynamic outputs grow into place on first infer
+        // and are reused from then on.
+        let outputs = session
+            .outputs()
             .iter()
-            .map(|name| {
+            .map(|o| {
+                let (shape, elems) = match o.dtype().tensor_shape() {
+                    Some(shape) if shape.iter().all(|&d| d > 0) => (
+                        shape.iter().map(|&d| d as usize).collect::<Vec<usize>>(),
+                        shape.num_elements(),
+                    ),
+                    _ => (Vec::new(), 0),
+                };
                 Tensor::new(
-                    TensorSpec::new(name.clone(), Vec::new(), DType::F32),
-                    HostTensor::zeros(0),
+                    TensorSpec::new(o.name().to_string(), shape, DType::F32),
+                    HostTensor::zeros(elems),
                 )
             })
             .collect();
@@ -83,11 +134,12 @@ impl InferenceEngine for OnnxEngine {
     }
 
     fn infer(&mut self, _stream: &GpuStream) -> Result<()> {
-        let data: Vec<f32> = self.inputs[0]
+        // Zero-copy view over the input binding: no per-frame
+        // clone of the (multi-MB) input plane.
+        let data = self.inputs[0]
             .as_f32_slice()
-            .ok_or_else(|| Error::Platform("onnx input binding is not host F32".into()))?
-            .to_vec();
-        let input = ort::value::Tensor::from_array((self.input_shape, data))
+            .ok_or_else(|| Error::Platform("onnx input binding is not host F32".into()))?;
+        let input = ort::value::TensorRef::from_array_view((self.input_shape, data))
             .map_err(|e| Error::Platform(format!("onnx input tensor: {e}")))?;
 
         let outputs = self
@@ -95,7 +147,8 @@ impl InferenceEngine for OnnxEngine {
             .run(ort::inputs![input])
             .map_err(|e| Error::Platform(format!("onnx inference: {e}")))?;
 
-        let mut published = Vec::with_capacity(outputs.len());
+        // Copy into the preallocated output bindings in place;
+        // only the first frame (or a shape change) can grow them.
         for (i, (_name, value)) in outputs.iter().enumerate() {
             let (shape, data) = value
                 .try_extract_tensor::<f32>()
@@ -107,17 +160,25 @@ impl InferenceEngine for OnnxEngine {
                         .map_err(|_| Error::Platform(format!("onnx output {i}: negative dim {d}")))
                 })
                 .collect::<Result<_>>()?;
-            let name = self
-                .output_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("output{i}"));
-            published.push(Tensor::new(
-                TensorSpec::new(name, shape, DType::F32),
-                HostTensor::from_vec(data.to_vec()),
-            ));
+            if i >= self.outputs.len() {
+                let name = self
+                    .output_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("output{i}"));
+                self.outputs.push(Tensor::new(
+                    TensorSpec::new(name, Vec::new(), DType::F32),
+                    HostTensor::zeros(0),
+                ));
+            }
+            let tensor = &mut self.outputs[i];
+            tensor.spec.shape = shape;
+            match tensor.buf.as_any_mut().downcast_mut::<HostTensor>() {
+                Some(host) => host.replace(data),
+                None => tensor.buf = HostTensor::from_vec(data.to_vec()),
+            }
         }
-        self.outputs = published;
+        self.outputs.truncate(outputs.len());
         Ok(())
     }
 }

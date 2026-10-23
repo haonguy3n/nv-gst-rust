@@ -52,6 +52,8 @@ fn parse_args() -> Result<(PathBuf, Option<u64>, bool)> {
             "--prometheus" => prometheus = true,
             "-h" | "--help" => {
                 println!("usage: edge-vision [CONFIG.toml] [--frames N] [--prometheus]");
+                println!("  --frames N   stop after N frames are *captured*;");
+                println!("               with drops under load, fewer are processed");
                 std::process::exit(0);
             }
             _ if arg.starts_with("--frames=") => {
@@ -93,20 +95,32 @@ fn main() -> Result<()> {
         other => bail!("unknown platform `{other}` (known: sim)"),
     };
 
-    let postprocessor: Box<dyn PostProcessor> = match config.model.decoder.as_str() {
-        "yolox" => Box::new(edge_postproc::YoloxPostProcessor::new(
-            config.model.input_width,
-            config.model.input_height,
-            config.model.num_classes,
-            config.model.score_threshold,
-        )),
-        "yolo" => Box::new(edge_postproc::YoloPostProcessor::new(
-            config.model.input_width,
-            config.model.input_height,
-            config.model.num_classes,
-            config.model.score_threshold,
-        )),
-        _ => Box::new(SimPostProcessor::new(config.model.score_threshold)),
+    let postprocessor: Box<dyn PostProcessor> = match config.model.decoder {
+        edge_core::DecoderKind::Yolox => Box::new(
+            edge_postproc::YoloxPostProcessor::new(
+                config.model.input_width,
+                config.model.input_height,
+                config.model.num_classes,
+                config.model.score_threshold,
+            )
+            .with_iou_threshold(config.model.iou_threshold)
+            .with_max_nms(config.model.max_nms)
+            .with_top_k(config.model.top_k),
+        ),
+        edge_core::DecoderKind::Yolo => Box::new(
+            edge_postproc::YoloPostProcessor::new(
+                config.model.input_width,
+                config.model.input_height,
+                config.model.num_classes,
+                config.model.score_threshold,
+            )
+            .with_iou_threshold(config.model.iou_threshold)
+            .with_max_nms(config.model.max_nms)
+            .with_top_k(config.model.top_k),
+        ),
+        edge_core::DecoderKind::Sim => {
+            Box::new(SimPostProcessor::new(config.model.score_threshold))
+        }
     };
     let sink: Box<dyn Sink> = match &config.stream.meta_file {
         Some(path) => Box::new(edge_sinks::MultiSink::new(vec![
@@ -119,10 +133,44 @@ fn main() -> Result<()> {
 
     println!("platform: {}", platform.name());
     println!("{}", pipeline.buffer_budget());
-    let metrics = pipeline.run(frames)?;
+    let stop = pipeline.stop_handle();
+    ctrlc::set_handler(move || stop.store(true, std::sync::atomic::Ordering::Relaxed))
+        .context("installing signal handler")?;
+    // With --prometheus, also serve the counters while the run is
+    // in progress (stderr, so stdout keeps the final exposition).
+    let reporter = if prometheus {
+        let live = pipeline.live_metrics();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_flag = std::sync::Arc::clone(&done);
+        let handle = std::thread::Builder::new()
+            .name("metrics-reporter".into())
+            .spawn(move || {
+                // Sleep in slices so shutdown is not delayed by
+                // up to a whole reporting interval.
+                let mut slept = std::time::Duration::ZERO;
+                while !done_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    slept += std::time::Duration::from_millis(100);
+                    if slept >= std::time::Duration::from_secs(5) {
+                        slept = std::time::Duration::ZERO;
+                        eprintln!("[live] {}", live.snapshot().summary());
+                    }
+                }
+            })
+            .context("spawning metrics reporter")?;
+        Some((done, handle))
+    } else {
+        None
+    };
+    let (metrics, result) = pipeline.run(frames);
+    if let Some((done, handle)) = reporter {
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = handle.join();
+    }
     println!("done: {}", metrics.summary());
     if prometheus {
         print!("{}", metrics.render_prometheus());
     }
+    result?;
     Ok(())
 }

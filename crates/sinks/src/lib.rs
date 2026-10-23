@@ -49,6 +49,13 @@ impl<W: Write + Send> Sink for JsonlMetaSink<W> {
         serde_json::to_writer(&mut self.writer, det)
             .map_err(|e| Error::Platform(format!("serialising detections: {e}")))?;
         self.writer.write_all(b"\n")?;
+        // Lines are small and consumers tail this: flush per frame.
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.writer.flush()?;
         Ok(())
     }
 }
@@ -77,6 +84,14 @@ impl Sink for FileVideoSink {
         self.writer.write_all(&pkt.data)?;
         self.packets += 1;
         self.bytes += pkt.data.len() as u64;
+        if pkt.keyframe {
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.writer.flush()?;
         Ok(())
     }
 }
@@ -114,6 +129,19 @@ impl Sink for MultiSink {
             sink.push_meta(det)?;
         }
         Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        // Finish every child; the first error wins.
+        let mut first: Option<Error> = None;
+        for sink in &mut self.sinks {
+            if let Err(e) = sink.finish() {
+                if first.is_none() {
+                    first = Some(e);
+                }
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 }
 
@@ -172,7 +200,16 @@ mod tests {
 
     fn detections(seq: u64) -> Detections {
         let mut d = Detections::with_capacity(2);
-        d.clear(seq);
+        d.clear(&edge_core::FrameMeta {
+            seq,
+            pts: Duration::from_millis(33 * seq),
+            width: 64,
+            height: 64,
+            format: edge_core::PixelFormat::Nv12,
+            layout: edge_core::Layout::PitchLinear,
+            camera_id: 2,
+            dmabuf_fd: -1,
+        });
         d.push(Detection {
             x: 0.375,
             y: 0.375,
@@ -196,6 +233,22 @@ mod tests {
         assert_eq!(v["frame_seq"], 3);
         assert_eq!(v["items"][0]["class_id"], 1);
         assert!((v["items"][0]["score"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jsonl_lines_are_flushed_and_attributed_before_drop() {
+        let dir = std::env::temp_dir().join(format!("edge-sinks-flush-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.jsonl");
+        let mut sink = JsonlMetaSink::create(&path).unwrap();
+        sink.push_meta(&detections(7)).unwrap();
+        // No finish(), no drop: the line must already be readable.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["frame_seq"], 7);
+        assert_eq!(v["camera_id"], 2);
+        sink.finish().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

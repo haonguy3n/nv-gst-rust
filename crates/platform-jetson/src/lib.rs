@@ -87,7 +87,6 @@ impl Platform for JetsonPlatform {
             // capability the platform cannot supply. Flip this when
             // the M1 encoder stage lands.
             cpu_encode: false,
-            accelerators: vec!["gpu".into()],
         }
     }
 

@@ -139,13 +139,20 @@ impl FrameSource for SimSource {
         }
         // Pace like a real sensor at the configured fps, so the
         // pipeline's backpressure sees realistic arrival times
-        // instead of an instant burst.
+        // instead of an instant burst. The wait honours the
+        // caller's timeout: a frame due later than that is a
+        // Timeout, exactly like a real sensor between frames.
         if let Some(started) = self.started.filter(|_| self.cfg.paced) {
             let due =
                 started + Duration::from_secs_f64(self.seq as f64 / f64::from(self.cfg.fps.max(1)));
             let now = std::time::Instant::now();
             if due > now {
-                std::thread::sleep(due - now);
+                let wait = due - now;
+                if wait > timeout {
+                    std::thread::sleep(timeout);
+                    return Ok(FramePoll::Timeout);
+                }
+                std::thread::sleep(wait);
             }
         }
         // Pool exhaustion waits up to `timeout` for a buffer to be
@@ -180,11 +187,11 @@ impl FrameSource for SimSource {
         if let SourceKind::File { reader } = &mut self.kind {
             // Dev backend only: pixels arrive from a file, so one read
             // into the pooled buffer is unavoidable and intended.
-            let mut chunk = vec![0u8; frame_bytes];
-            match reader.read_exact(&mut chunk) {
+            self.scratch.resize(frame_bytes, 0);
+            match reader.read_exact(&mut self.scratch) {
                 Ok(()) => {
                     file.seek(SeekFrom::Start(0))?;
-                    file.write_all(&chunk)?;
+                    file.write_all(&self.scratch)?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     if let Ok(mut pool) = self.pool.lock() {
@@ -223,6 +230,14 @@ impl FrameSource for SimSource {
     fn memory(&self) -> FrameMemory {
         FrameMemory::DmaBuf
     }
+
+    fn layout(&self) -> Layout {
+        Layout::PitchLinear
+    }
+
+    fn pool_available(&self) -> Option<usize> {
+        self.pool.lock().ok().map(|pool| pool.len())
+    }
 }
 
 // ---------------------------------------------------------------- tensors
@@ -242,6 +257,13 @@ impl HostTensor {
     #[cfg(feature = "onnx")]
     pub(crate) fn from_vec(data: Vec<f32>) -> Box<dyn TensorBuffer> {
         Box::new(Self { data })
+    }
+
+    /// Overwrite contents in place, reusing the allocation.
+    #[cfg(feature = "onnx")]
+    pub(crate) fn replace(&mut self, src: &[f32]) {
+        self.data.clear();
+        self.data.extend_from_slice(src);
     }
 }
 
@@ -462,7 +484,7 @@ impl SimPostProcessor {
 
 impl PostProcessor for SimPostProcessor {
     fn decode(&mut self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
-        out.clear(meta.seq);
+        out.clear(meta);
         let Some(tensor) = outputs.first() else {
             return Ok(());
         };
@@ -518,11 +540,9 @@ impl Platform for SimPlatform {
             max_height: 2160,
             codecs: Vec::new(),
             precisions: vec![Precision::Fp32],
-            // The sim stands in for a GPU target while running on CPU.
-            devices: vec!["cpu".into(), "gpu".into()],
+            devices: vec!["cpu".into()],
             has_hw_encoder: false,
             cpu_encode: false,
-            accelerators: vec!["cpu-sim".into()],
         }
     }
 
@@ -625,7 +645,7 @@ mod tests {
         src.start().unwrap();
         let mut last_pts = Duration::ZERO;
         for expected_seq in 0..5 {
-            let FramePoll::Frame(frame) = src.next_frame(Duration::from_millis(10)).unwrap() else {
+            let FramePoll::Frame(frame) = src.next_frame(Duration::from_secs(2)).unwrap() else {
                 panic!("expected a frame");
             };
             assert_eq!(frame.meta().seq, expected_seq);
@@ -634,7 +654,7 @@ mod tests {
             last_pts = frame.meta().pts;
         }
         assert!(matches!(
-            src.next_frame(Duration::from_millis(10)).unwrap(),
+            src.next_frame(Duration::from_secs(2)).unwrap(),
             FramePoll::EndOfStream
         ));
         src.stop().unwrap();
@@ -647,12 +667,10 @@ mod tests {
         src.start().unwrap();
         // Hold every pooled buffer: the next call must not block.
         let held: Vec<_> = (0..3)
-            .map(
-                |_| match src.next_frame(Duration::from_millis(1)).unwrap() {
-                    FramePoll::Frame(f) => f,
-                    _ => panic!("expected a frame"),
-                },
-            )
+            .map(|_| match src.next_frame(Duration::from_secs(2)).unwrap() {
+                FramePoll::Frame(f) => f,
+                _ => panic!("expected a frame"),
+            })
             .collect();
         assert!(matches!(
             src.next_frame(Duration::from_millis(1)).unwrap(),
@@ -661,7 +679,7 @@ mod tests {
         drop(held);
         // Buffers returned on drop, so capture resumes.
         assert!(matches!(
-            src.next_frame(Duration::from_millis(1)).unwrap(),
+            src.next_frame(Duration::from_secs(2)).unwrap(),
             FramePoll::Frame(_)
         ));
         src.stop().unwrap();

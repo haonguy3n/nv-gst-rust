@@ -1,4 +1,6 @@
+use crate::frame::FrameMeta;
 use serde::Serialize;
+use std::time::Duration;
 
 /// One decoded detection, coordinates normalised to `0.0..=1.0`
 /// of the frame width/height.
@@ -17,6 +19,12 @@ pub struct Detection {
 #[derive(Debug, Default, Serialize)]
 pub struct Detections {
     pub frame_seq: u64,
+    /// Which camera produced this frame (multi-camera metadata
+    /// must be attributable without out-of-band knowledge).
+    pub camera_id: u8,
+    /// Sensor timestamp of the frame, for joining detections to
+    /// encoded packets (which carry the same pts).
+    pub pts: Duration,
     pub items: Vec<Detection>,
 }
 
@@ -24,12 +32,18 @@ impl Detections {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             frame_seq: 0,
+            camera_id: 0,
+            pts: Duration::ZERO,
             items: Vec::with_capacity(capacity),
         }
     }
 
-    pub fn clear(&mut self, frame_seq: u64) {
-        self.frame_seq = frame_seq;
+    /// Reset for a new frame, taking attribution from its meta so
+    /// a decoder cannot forget it.
+    pub fn clear(&mut self, meta: &FrameMeta) {
+        self.frame_seq = meta.seq;
+        self.camera_id = meta.camera_id;
+        self.pts = meta.pts;
         self.items.clear();
     }
 

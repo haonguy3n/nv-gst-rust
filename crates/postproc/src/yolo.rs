@@ -31,6 +31,7 @@ pub struct YoloPostProcessor {
     num_classes: u32,
     score_threshold: f32,
     iou_threshold: f32,
+    top_k: usize,
     /// Cap on candidates entering NMS (its cost is quadratic);
     /// the highest scores survive the cap.
     max_nms: usize,
@@ -50,6 +51,7 @@ impl YoloPostProcessor {
             num_classes,
             score_threshold,
             iou_threshold: 0.45,
+            top_k: 100,
             max_nms: 300,
             scratch: Vec::new(),
         }
@@ -59,11 +61,21 @@ impl YoloPostProcessor {
         self.iou_threshold = iou_threshold;
         self
     }
+
+    pub fn with_max_nms(mut self, max_nms: usize) -> Self {
+        self.max_nms = max_nms.max(1);
+        self
+    }
+
+    pub fn with_top_k(mut self, top_k: usize) -> Self {
+        self.top_k = top_k.max(1);
+        self
+    }
 }
 
 impl PostProcessor for YoloPostProcessor {
     fn decode(&mut self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
-        out.clear(meta.seq);
+        out.clear(meta);
         let tensor = outputs
             .first()
             .ok_or_else(|| Error::Platform("yolo decoder: no output tensor".into()))?;
@@ -113,10 +125,13 @@ impl PostProcessor for YoloPostProcessor {
                     best_class = c as u32;
                 }
             }
-            if best_score < self.score_threshold {
+            if best_score.is_nan() || best_score < self.score_threshold {
                 continue;
             }
             let (cx, cy, w, h) = (at(0, i), at(1, i), at(2, i), at(3, i));
+            if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()) {
+                continue;
+            }
             // Clip both corners to the frame, then derive size from
             // the clipped corners (growing width after clamping x
             // would re-extend past the edge).
@@ -125,7 +140,7 @@ impl PostProcessor for YoloPostProcessor {
             let x2 = ((cx + w / 2.0 - pad_x) / scale / fw).clamp(0.0, 1.0);
             let y2 = ((cy + h / 2.0 - pad_y) / scale / fh).clamp(0.0, 1.0);
             let (width, height) = (x2 - x, y2 - y);
-            if width <= 0.0 || height <= 0.0 {
+            if !(width > 0.0 && height > 0.0) {
                 continue;
             }
             out.push(Detection {
@@ -139,11 +154,13 @@ impl PostProcessor for YoloPostProcessor {
         }
 
         if out.items.len() > self.max_nms {
+            // O(n) pre-cap; nms() does the full sort it needs.
             out.items
-                .sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+                .select_nth_unstable_by(self.max_nms, |a, b| b.score.total_cmp(&a.score));
             out.items.truncate(self.max_nms);
         }
         nms(&mut out.items, self.iou_threshold, &mut self.scratch);
+        out.items.truncate(self.top_k);
         Ok(())
     }
 }
@@ -269,6 +286,24 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out.items[0].class_id, 1);
         assert!((out.items[0].x - 0.375).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nan_and_inf_candidates_are_dropped_not_emitted() {
+        // Regression (review item 2, from the reviewer's probe):
+        // a NaN centre used to pass every filter and reach sinks.
+        let mut pp = YoloPostProcessor::new(64, 64, 1, 0.25);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let t = tensor(&[vec![bad, 32.0, 16.0, 16.0, 0.9]], 1);
+            let mut out = Detections::default();
+            pp.decode(&[t], &meta(64, 64), &mut out).unwrap();
+            assert!(out.is_empty(), "{bad} candidate must be dropped");
+        }
+        // NaN score likewise.
+        let t = tensor(&[vec![32.0, 32.0, 16.0, 16.0, f32::NAN]], 1);
+        let mut out = Detections::default();
+        pp.decode(&[t], &meta(64, 64), &mut out).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]

@@ -15,8 +15,8 @@ pub mod stage;
 pub mod tensor;
 
 pub use config::{
-    Codec, Config, EncoderConfig, InputColor, InputColorspace, InputNormalize, ModelConfig,
-    PipelineConfig, Precision, SourceConfig, StreamConfig, ZeroCopyMode,
+    Codec, Config, DecoderKind, EncoderConfig, InputColor, InputColorspace, InputNormalize,
+    ModelConfig, PipelineConfig, Precision, SourceConfig, StreamConfig, ZeroCopyMode,
 };
 pub use detection::{Detection, Detections};
 pub use error::{Error, Result};

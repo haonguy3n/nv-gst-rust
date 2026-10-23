@@ -3,10 +3,10 @@
 //! combinations build, refuse, or take the CPU opt-in.
 
 use edge_core::{
-    Codec, Config, Detections, EncodedPacket, Encoder, EncoderConfig, FrameMemory, FrameMeta,
-    FramePoll, FrameSource, GpuStream, HwFrame, InferenceEngine, ModelConfig, Overlay, PixelFormat,
-    Platform, PlatformCaps, PostProcessor, PreConfig, Preprocessor, Result, Sink, SourceConfig,
-    Tensor,
+    Codec, Config, DType, Detections, EncodedPacket, Encoder, EncoderConfig, FrameMemory,
+    FrameMeta, FramePoll, FrameSource, GpuStream, HwFrame, InferenceEngine, Layout, ModelConfig,
+    Overlay, PixelFormat, Platform, PlatformCaps, PostProcessor, PreConfig, Preprocessor, Result,
+    Sink, SourceConfig, Tensor, TensorBuffer, TensorSpec,
 };
 use edge_pipeline::Pipeline;
 use std::time::Duration;
@@ -14,6 +14,18 @@ use std::time::Duration;
 struct FakePlatform {
     hw: bool,
     cpu: bool,
+    /// Declare an engine input that disagrees with the config.
+    bad_input: bool,
+}
+
+struct StubBuffer;
+impl TensorBuffer for StubBuffer {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
 
 struct EosSource;
@@ -29,6 +41,9 @@ impl FrameSource for EosSource {
     }
     fn memory(&self) -> FrameMemory {
         FrameMemory::Nvmm
+    }
+    fn layout(&self) -> Layout {
+        Layout::PitchLinear
     }
 }
 
@@ -58,7 +73,7 @@ impl InferenceEngine for NoopEngine {
 struct NoopPost;
 impl PostProcessor for NoopPost {
     fn decode(&mut self, _o: &[Tensor], m: &FrameMeta, out: &mut Detections) -> Result<()> {
-        out.clear(m.seq);
+        out.clear(m);
         Ok(())
     }
 }
@@ -103,7 +118,6 @@ impl Platform for FakePlatform {
             devices: Vec::new(),
             has_hw_encoder: self.hw,
             cpu_encode: self.cpu,
-            accelerators: Vec::new(),
         }
     }
     fn source(&self, _c: &SourceConfig) -> Result<Box<dyn FrameSource>> {
@@ -113,8 +127,16 @@ impl Platform for FakePlatform {
         Ok(Box::new(NoopPre))
     }
     fn engine(&self, _c: &ModelConfig) -> Result<Box<dyn InferenceEngine>> {
+        let inputs = if self.bad_input {
+            vec![Tensor::new(
+                TensorSpec::new("images", vec![1, 3, 999, 999], DType::F32),
+                Box::new(StubBuffer),
+            )]
+        } else {
+            Vec::new()
+        };
         Ok(Box::new(NoopEngine {
-            inputs: Vec::new(),
+            inputs,
             outputs: Vec::new(),
         }))
     }
@@ -160,6 +182,7 @@ fn strict_nano_refuses_cpu_encode() {
     let nano = FakePlatform {
         hw: false,
         cpu: true,
+        bad_input: false,
     };
     // Config validation rejects strict + hardware=false first.
     assert!(Config::from_toml_str(
@@ -174,6 +197,7 @@ fn relaxed_nano_cpu_opt_in_builds() {
     let nano = FakePlatform {
         hw: false,
         cpu: true,
+        bad_input: false,
     };
     let p = build(&nano, config("relaxed", false)).expect("relaxed CPU opt-in must build");
     assert!(!p.metadata_only());
@@ -184,6 +208,7 @@ fn relaxed_without_cpu_path_refuses() {
     let bare = FakePlatform {
         hw: false,
         cpu: false,
+        bad_input: false,
     };
     match build(&bare, config("relaxed", false)) {
         Ok(_) => panic!("must refuse when the platform has no CPU encoder"),
@@ -196,14 +221,34 @@ fn nx_hardware_path_builds_and_nano_hardware_request_refuses() {
     let nx = FakePlatform {
         hw: true,
         cpu: true,
+        bad_input: false,
     };
     assert!(build(&nx, config("strict", true)).is_ok());
     let nano = FakePlatform {
         hw: false,
         cpu: true,
+        bad_input: false,
     };
     match build(&nano, config("relaxed", true)) {
         Ok(_) => panic!("hardware=true on a Nano must refuse"),
         Err(e) => assert!(e.to_string().contains("no hardware encoder"), "{e}"),
+    }
+}
+
+/// Item 13: an engine whose declared input disagrees with the
+/// config is refused at build time.
+#[test]
+fn builder_refuses_engine_input_shape_mismatch() {
+    let platform = FakePlatform {
+        hw: true,
+        cpu: false,
+        bad_input: true,
+    };
+    match build(&platform, config("strict", true)) {
+        Ok(_) => panic!("mismatched engine input must not build"),
+        Err(e) => assert!(
+            e.to_string().contains("engine"),
+            "error must name the stage: {e}"
+        ),
     }
 }

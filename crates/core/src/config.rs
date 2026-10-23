@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 /// One TOML file picks the platform, camera, model, encoder and outputs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// `"sim"` always available; `"jetson"` requires a build with that
     /// platform feature, and fails with a clear error otherwise.
@@ -31,6 +32,7 @@ pub enum ZeroCopyMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     /// `"synthetic"` | `"file"` (sim), `"argus"` (jetson), `"v4l2"` (nxp).
     pub kind: String,
@@ -72,15 +74,15 @@ fn default_pool_size() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// ONNX model on sim; `.engine` built on-device on Jetson.
     #[serde(default)]
     pub path: Option<PathBuf>,
-    /// Output decoder: `"sim"` (deterministic sim engine rows),
-    /// `"yolo"` (YOLOv8/v11 raw head, `[1, 4 + classes, N]`), or
-    /// `"yolox"` (three outputs: boxes xyxy, objectness, scores).
-    #[serde(default = "default_decoder")]
-    pub decoder: String,
+    /// Output decoder. Serde rejects unknown values with a
+    /// position, and every match on it is exhaustive.
+    #[serde(default)]
+    pub decoder: DecoderKind,
     /// Channel order the model expects (YOLOv8: RGB, YOLOX: BGR).
     #[serde(default)]
     pub input_color: InputColor,
@@ -99,19 +101,38 @@ pub struct ModelConfig {
     #[serde(default)]
     pub precision: Precision,
     /// Accelerator to run on: backend-defined name ("gpu", "dla0",
-    /// "cpu", ...), validated against platform caps.
-    #[serde(default = "default_device")]
-    pub device: String,
+    /// "cpu", ...), validated against platform caps in the
+    /// builder (the one place). `None` takes the platform's
+    /// first declared device.
+    #[serde(default)]
+    pub device: Option<String>,
     pub input_width: u32,
     pub input_height: u32,
     #[serde(default = "default_num_classes")]
     pub num_classes: u32,
     #[serde(default = "default_score_threshold")]
     pub score_threshold: f32,
+    /// NMS IoU threshold.
+    #[serde(default = "default_iou_threshold")]
+    pub iou_threshold: f32,
+    /// Cap on candidates entering NMS (bounds its O(n^2)).
+    #[serde(default = "default_max_nms")]
+    pub max_nms: usize,
+    /// Cap on detections kept after NMS.
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
 }
 
-fn default_decoder() -> String {
-    "sim".into()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DecoderKind {
+    /// Deterministic sim engine rows.
+    #[default]
+    Sim,
+    /// YOLOv8/v11 raw head, `[1, 4 + classes, N]` (or transposed).
+    Yolo,
+    /// YOLOX three outputs: boxes xyxy, objectness, scores.
+    Yolox,
 }
 fn default_pad_value() -> u8 {
     114
@@ -134,10 +155,6 @@ pub enum InputNormalize {
     /// Pixels left in 0.0..=255.0.
     None,
 }
-fn default_device() -> String {
-    "gpu".into()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Precision {
@@ -175,6 +192,18 @@ fn default_score_threshold() -> f32 {
     0.25
 }
 
+fn default_iou_threshold() -> f32 {
+    0.45
+}
+
+fn default_max_nms() -> usize {
+    300
+}
+
+fn default_top_k() -> usize {
+    100
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Codec {
     H264,
@@ -182,6 +211,7 @@ pub enum Codec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EncoderConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -223,6 +253,7 @@ fn default_gop_frames() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StreamConfig {
     /// Detections only, no video. Defaults to true: video is what
     /// a config asks for explicitly (with an enabled encoder), so
@@ -253,18 +284,29 @@ fn default_rtsp_port() -> u16 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     /// Bounded channel depth between capture and processing.
     #[serde(default = "default_queue_depth")]
     pub queue_depth: usize,
+    /// Fail the run when no frame arrives for this long. A dead
+    /// camera must be an error a supervisor can act on, not an
+    /// idle process counting timeouts forever. 0 disables.
+    #[serde(default = "default_max_idle_ms")]
+    pub max_idle_ms: u64,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             queue_depth: default_queue_depth(),
+            max_idle_ms: default_max_idle_ms(),
         }
     }
+}
+
+fn default_max_idle_ms() -> u64 {
+    5_000
 }
 
 fn default_queue_depth() -> usize {
@@ -303,7 +345,7 @@ impl Config {
         // The pool must cover the channel queue plus capture and
         // in-flight processing, or pool exhaustion masquerades as
         // a starved (and formerly truncated) run.
-        let min_pool = self.pipeline.queue_depth + 3;
+        let min_pool = self.pipeline.queue_depth.saturating_add(3);
         if s.pool_size < min_pool {
             return Err(Error::invalid(
                 "source.pool_size",
@@ -323,12 +365,6 @@ impl Config {
         if m.input_width == 0 || m.input_height == 0 {
             return Err(Error::invalid("model.input_width/height", "must be > 0"));
         }
-        if !matches!(m.decoder.as_str(), "sim" | "yolo" | "yolox") {
-            return Err(Error::invalid(
-                "model.decoder",
-                "must be \"sim\", \"yolo\" or \"yolox\"",
-            ));
-        }
         if !(0.0..=1.0).contains(&m.score_threshold) {
             return Err(Error::invalid(
                 "model.score_threshold",
@@ -346,7 +382,8 @@ impl Config {
         if !self.encoder.enabled && !self.stream.metadata_only {
             return Err(Error::invalid(
                 "stream.metadata_only",
-                "false promises video but the encoder is disabled;                  enable the encoder or set metadata_only = true",
+                "false promises video but the encoder is disabled; \
+                 enable the encoder or set metadata_only = true",
             ));
         }
         if self.encoder.enabled && self.stream.metadata_only {
@@ -357,6 +394,53 @@ impl Config {
         }
         if self.pipeline.queue_depth == 0 {
             return Err(Error::invalid("pipeline.queue_depth", "must be >= 1"));
+        }
+        for (name, gain) in [
+            ("source.gain_min", s.gain_min),
+            ("source.gain_max", s.gain_max),
+        ] {
+            if let Some(g) = gain {
+                if !g.is_finite() || g <= 0.0 {
+                    return Err(Error::invalid(name, "must be finite and > 0"));
+                }
+            }
+        }
+        if let (Some(lo), Some(hi)) = (s.gain_min, s.gain_max) {
+            if lo > hi {
+                return Err(Error::invalid("source.gain_min", "must be <= gain_max"));
+            }
+        }
+        if s.exposure_us == Some(0) {
+            return Err(Error::invalid("source.exposure_us", "must be > 0 when set"));
+        }
+        if self.encoder.enabled {
+            if self.encoder.bitrate_kbps == 0 {
+                return Err(Error::invalid(
+                    "encoder.bitrate_kbps",
+                    "must be > 0 when the encoder is enabled",
+                ));
+            }
+            if self.encoder.gop_frames == 0 {
+                return Err(Error::invalid(
+                    "encoder.gop_frames",
+                    "must be > 0 when the encoder is enabled",
+                ));
+            }
+        }
+        if m.num_classes == 0 {
+            return Err(Error::invalid("model.num_classes", "must be > 0"));
+        }
+        if !(0.0..=1.0).contains(&m.iou_threshold) {
+            return Err(Error::invalid(
+                "model.iou_threshold",
+                "must be within 0.0..=1.0",
+            ));
+        }
+        if m.max_nms == 0 {
+            return Err(Error::invalid("model.max_nms", "must be > 0"));
+        }
+        if m.top_k == 0 {
+            return Err(Error::invalid("model.top_k", "must be > 0"));
         }
         Ok(())
     }
@@ -377,6 +461,32 @@ fps = 30
 input_width = 320
 input_height = 320
 "#;
+
+    #[test]
+    fn misspelled_keys_are_rejected() {
+        // Regression (review item 3, from the reviewer's probe):
+        // pool_sise/enabeld used to load silently with defaults.
+        let typo = VALID
+            .replace("fps = 30", "fps = 30\npool_sise = 2")
+            .replace("[model]", "[encoder]\nenabeld = true\n[model]");
+        let err = Config::from_toml_str(&typo).unwrap_err().to_string();
+        assert!(
+            err.contains("pool_sise") || err.contains("enabeld"),
+            "error must name the unknown key: {err}"
+        );
+    }
+
+    /// Item 9: the decoder is an enum, so an unknown value is a
+    /// parse error naming the variants, not a silent fallback.
+    #[test]
+    fn unknown_decoder_value_is_rejected() {
+        let bad = VALID.replace("[model]", "[model]\ndecoder = \"yollo\"");
+        let err = Config::from_toml_str(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("yollo") || err.contains("unknown variant"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn parses_minimal_config_with_defaults() {

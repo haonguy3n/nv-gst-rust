@@ -20,6 +20,22 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base
       - run: cargo clippy -p platform-jetson --features gst --all-targets -- -D warnings
       - run: cargo test -p platform-jetson --features gst
+      # The feature combination the app actually ships with.
+      - run: cargo clippy -p edge-vision --features jetson,onnx --all-targets -- -D warnings
+      - run: cargo build -p edge-vision --features jetson,onnx
+      # Every feature combination must at least type-check
+      # (round 1's U-1 build break was a feature-gated path).
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo hack check --feature-powerset --workspace
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92"
+      - run: cargo test --workspace
 
   deny:
     runs-on: ubuntu-latest
@@ -42,3 +58,7 @@ jobs:
           targets: aarch64-unknown-linux-gnu
       - run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       - run: cargo build --workspace --target aarch64-unknown-linux-gnu
+      - run: cargo check -p edge-vision --features onnx --target aarch64-unknown-linux-gnu
+      # --features jetson (GStreamer) cross-check needs an arm64
+      # sysroot for pkg-config; that lands with the device
+      # sysroot work, not this job.

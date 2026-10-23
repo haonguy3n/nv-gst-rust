@@ -51,6 +51,9 @@ impl FrameSource for StubSource {
     fn memory(&self) -> FrameMemory {
         FrameMemory::DmaBuf
     }
+    fn layout(&self) -> Layout {
+        Layout::PitchLinear
+    }
 }
 
 /// Advertises a hardware encoder it does not have.
@@ -70,7 +73,6 @@ impl Platform for BrokenPlatform {
             devices: Vec::new(),
             has_hw_encoder: true, // the lie under test
             cpu_encode: false,
-            accelerators: Vec::new(),
         }
     }
     fn source(&self, _cfg: &SourceConfig) -> Result<Box<dyn FrameSource>> {

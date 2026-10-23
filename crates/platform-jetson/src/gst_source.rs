@@ -313,6 +313,10 @@ impl FrameSource for GstLaunchSource {
     fn layout(&self) -> Layout {
         self.layout
     }
+
+    fn pool_available(&self) -> Option<usize> {
+        self.pool.lock().ok().map(|pool| pool.len())
+    }
 }
 
 impl Drop for GstLaunchSource {

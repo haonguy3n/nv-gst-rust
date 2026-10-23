@@ -22,6 +22,7 @@ edge-sinks = { path = "../../crates/sinks" }
 platform-jetson = { path = "../../crates/platform-jetson", optional = true }
 platform-sim = { path = "../../crates/platform-sim" }
 anyhow.workspace = true
+ctrlc = { version = "3.4", features = ["termination"] }
 
 [lints]
 workspace = true

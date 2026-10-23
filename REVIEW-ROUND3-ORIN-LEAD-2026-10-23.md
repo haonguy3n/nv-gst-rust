@@ -197,3 +197,13 @@ crate; same-`gst::Buffer` NVENC hypothesis first on the board), L7
 (clocks pinned as a measurement precondition), L8 (boot-ok, watchdog,
 sandbox/camera-guard, bounded disk writer). None of it is claimed done;
 each item closes on the board or in the M1 stage work it gates.
+
+## Addendum — 2026-10-23 (Rust-review pass, PC only)
+
+No round-3 item is closed by this pass; L1–L9 still close on the
+board or in the M1 stage work they gate. PC-side changes that
+support them: conformance now asserts every pooled buffer returns
+across a start/stop cycle (`pool_available()`, towards L2's
+in-flight budget), pipeline counters are observable live from
+another thread (towards L7 measurement), and the engine's
+declared input is checked against the config at build/load.

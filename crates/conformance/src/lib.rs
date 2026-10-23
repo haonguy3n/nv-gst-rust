@@ -350,6 +350,17 @@ pub fn check_clean_shutdown(platform: &dyn Platform, cfg: &SourceConfig) {
     source
         .stop()
         .unwrap_or_else(|e| panic!("{}: source stop: {e}", platform.name()));
+    // The frame above was dropped: every pooled buffer must be
+    // back. A leak here starves the next start.
+    if let Some(available) = source.pool_available() {
+        assert_eq!(
+            available,
+            cfg.pool_size,
+            "{}: pool leak across start/stop ({available} of {} buffers back)",
+            platform.name(),
+            cfg.pool_size
+        );
+    }
     // Dropping a stopped source (and any frames above) must not hang
     // or panic; reaching this line with `drop` is the assertion.
     drop(source);

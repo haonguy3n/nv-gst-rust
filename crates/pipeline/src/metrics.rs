@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Counters and per-stage timings, measured from day one.
@@ -102,6 +103,84 @@ impl PipelineMetrics {
             self.avg(self.overlay_total),
             self.avg(self.encode_total),
         )
+    }
+}
+
+/// Live view of the counters, updated by the capture and
+/// processing threads as the run progresses. Handed out by
+/// `Pipeline::live_metrics` so a supervisor (or a `/metrics`
+/// endpoint) can observe a long-running pipeline instead of
+/// waiting for `run()` to return.
+#[derive(Debug, Default)]
+pub struct LiveMetrics {
+    frames_captured: AtomicU64,
+    frames_dropped: AtomicU64,
+    capture_timeouts: AtomicU64,
+    frames_processed: AtomicU64,
+    detections: AtomicU64,
+    pre_ns: AtomicU64,
+    infer_ns: AtomicU64,
+    post_ns: AtomicU64,
+    overlay_ns: AtomicU64,
+    encode_ns: AtomicU64,
+}
+
+impl LiveMetrics {
+    /// Point-in-time copy of every counter.
+    pub fn snapshot(&self) -> PipelineMetrics {
+        PipelineMetrics {
+            frames_captured: self.frames_captured.load(Ordering::Relaxed),
+            frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
+            capture_timeouts: self.capture_timeouts.load(Ordering::Relaxed),
+            frames_processed: self.frames_processed.load(Ordering::Relaxed),
+            detections: self.detections.load(Ordering::Relaxed),
+            pre_total: Duration::from_nanos(self.pre_ns.load(Ordering::Relaxed)),
+            infer_total: Duration::from_nanos(self.infer_ns.load(Ordering::Relaxed)),
+            post_total: Duration::from_nanos(self.post_ns.load(Ordering::Relaxed)),
+            overlay_total: Duration::from_nanos(self.overlay_ns.load(Ordering::Relaxed)),
+            encode_total: Duration::from_nanos(self.encode_ns.load(Ordering::Relaxed)),
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        for counter in [
+            &self.frames_captured,
+            &self.frames_dropped,
+            &self.capture_timeouts,
+            &self.frames_processed,
+            &self.detections,
+            &self.pre_ns,
+            &self.infer_ns,
+            &self.post_ns,
+            &self.overlay_ns,
+            &self.encode_ns,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn set_capture(&self, captured: u64, timeouts: u64) {
+        self.frames_captured.store(captured, Ordering::Relaxed);
+        self.capture_timeouts.store(timeouts, Ordering::Relaxed);
+    }
+
+    /// Publish the processing thread's counters (and the channel
+    /// drop count it can see) after each frame.
+    pub(crate) fn sync_processing(&self, metrics: &PipelineMetrics, dropped: u64) {
+        self.frames_processed
+            .store(metrics.frames_processed, Ordering::Relaxed);
+        self.detections.store(metrics.detections, Ordering::Relaxed);
+        self.frames_dropped.store(dropped, Ordering::Relaxed);
+        self.pre_ns
+            .store(metrics.pre_total.as_nanos() as u64, Ordering::Relaxed);
+        self.infer_ns
+            .store(metrics.infer_total.as_nanos() as u64, Ordering::Relaxed);
+        self.post_ns
+            .store(metrics.post_total.as_nanos() as u64, Ordering::Relaxed);
+        self.overlay_ns
+            .store(metrics.overlay_total.as_nanos() as u64, Ordering::Relaxed);
+        self.encode_ns
+            .store(metrics.encode_total.as_nanos() as u64, Ordering::Relaxed);
     }
 }
 

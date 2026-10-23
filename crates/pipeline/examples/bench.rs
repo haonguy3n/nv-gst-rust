@@ -51,7 +51,8 @@ queue_depth = 256
     .expect("build pipeline");
 
     let started = Instant::now();
-    let metrics = pipeline.run(None).expect("run pipeline");
+    let (metrics, result) = pipeline.run(None);
+    result.expect("run pipeline");
     let elapsed = started.elapsed();
 
     let fps = metrics.frames_processed as f64 / elapsed.as_secs_f64();

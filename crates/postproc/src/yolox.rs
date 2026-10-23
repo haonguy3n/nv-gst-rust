@@ -43,6 +43,21 @@ impl YoloxPostProcessor {
             scratch: Vec::new(),
         }
     }
+
+    pub fn with_iou_threshold(mut self, iou_threshold: f32) -> Self {
+        self.iou_threshold = iou_threshold;
+        self
+    }
+
+    pub fn with_max_nms(mut self, max_nms: usize) -> Self {
+        self.max_nms = max_nms.max(1);
+        self
+    }
+
+    pub fn with_top_k(mut self, top_k: usize) -> Self {
+        self.top_k = top_k.max(1);
+        self
+    }
 }
 
 fn pick<'a>(outputs: &'a [Tensor], name: &str, index: usize) -> Option<&'a Tensor> {
@@ -54,7 +69,7 @@ fn pick<'a>(outputs: &'a [Tensor], name: &str, index: usize) -> Option<&'a Tenso
 
 impl PostProcessor for YoloxPostProcessor {
     fn decode(&mut self, outputs: &[Tensor], meta: &FrameMeta, out: &mut Detections) -> Result<()> {
-        out.clear(meta.seq);
+        out.clear(meta);
         let missing = |what: &str| Error::Platform(format!("yolox decoder: missing {what}"));
         let boxes_t = pick(outputs, "boxes", 0).ok_or_else(|| missing("boxes output"))?;
         let obj_t = pick(outputs, "objectness", 1).ok_or_else(|| missing("objectness output"))?;
@@ -105,7 +120,9 @@ impl PostProcessor for YoloxPostProcessor {
                 }
             }
             let score = obj * best_score;
-            if score < self.score_threshold {
+            // Written so NaN fails: a NaN score must never keep
+            // the candidate (it would win every NMS comparison).
+            if score.is_nan() || score < self.score_threshold {
                 continue;
             }
             let (x1, y1, x2, y2) = (
@@ -114,11 +131,16 @@ impl PostProcessor for YoloxPostProcessor {
                 boxes[a * 4 + 2],
                 boxes[a * 4 + 3],
             );
+            // A non-finite coordinate would panic f32::clamp below
+            // (release builds abort); drop the candidate instead.
+            if !(x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite()) {
+                continue;
+            }
             let x = ((x1 - pad_x) / scale / fw).clamp(0.0, 1.0);
             let y = ((y1 - pad_y) / scale / fh).clamp(0.0, 1.0);
             let width = (((x2 - pad_x) / scale / fw) - x).clamp(0.0, 1.0 - x);
             let height = (((y2 - pad_y) / scale / fh) - y).clamp(0.0, 1.0 - y);
-            if width <= 0.0 || height <= 0.0 {
+            if !(width > 0.0 && height > 0.0) {
                 continue;
             }
             out.push(Detection {
@@ -132,8 +154,9 @@ impl PostProcessor for YoloxPostProcessor {
         }
 
         if out.items.len() > self.max_nms {
+            // O(n) pre-cap; nms() does the full sort it needs.
             out.items
-                .sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+                .select_nth_unstable_by(self.max_nms, |a, b| b.score.total_cmp(&a.score));
             out.items.truncate(self.max_nms);
         }
         nms_agnostic(&mut out.items, self.iou_threshold, &mut self.scratch);
@@ -211,6 +234,31 @@ mod tests {
         assert!((d.score - 0.72).abs() < 1e-6, "score {}", d.score);
         assert!((d.x - 0.25).abs() < 1e-6 && (d.y - 0.25).abs() < 1e-6);
         assert!((d.width - 0.5).abs() < 1e-6 && (d.height - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nan_box_does_not_panic_and_nan_objectness_is_dropped() {
+        // Regression (review items 1-2, from the reviewer's probes):
+        // a NaN box coordinate used to panic inside f32::clamp
+        // (aborting release builds), and NaN objectness used to
+        // pass the threshold and win NMS.
+        let mut pp = YoloxPostProcessor::new(416, 416, 1, 0.25);
+        let outputs = vec![
+            tensor("boxes", vec![1, 1, 4], vec![f32::NAN, 10.0, 20.0, 20.0]),
+            tensor("objectness", vec![1, 1, 1], vec![1.0]),
+            tensor("scores", vec![1, 1, 1], vec![0.9]),
+        ];
+        let mut out = Detections::default();
+        pp.decode(&outputs, &meta(), &mut out).unwrap();
+        assert!(out.is_empty());
+
+        let outputs = vec![
+            tensor("boxes", vec![1, 1, 4], vec![10.0, 10.0, 20.0, 20.0]),
+            tensor("objectness", vec![1, 1, 1], vec![f32::NAN]),
+            tensor("scores", vec![1, 1, 1], vec![0.9]),
+        ];
+        pp.decode(&outputs, &meta(), &mut out).unwrap();
+        assert!(out.is_empty(), "NaN score must never be emitted");
     }
 
     #[test]

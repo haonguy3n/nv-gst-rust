@@ -47,6 +47,9 @@ cargo run -p edge-vision -- config/x86-dev.toml --frames 30
 cargo test --workspace
 ```
 
+`--frames N` limits frames *captured*; under load the drop-oldest
+queue may process fewer (the metrics line reports both counts).
+
 The sim backend has no encoder at all, so it streams detections only.
 `zero_copy = "strict"` (the default) refuses CPU-encode profiles at
 load time; on a platform that offers a CPU path, video without NVENC

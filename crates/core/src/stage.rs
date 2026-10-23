@@ -85,8 +85,12 @@ pub trait FrameSource: Send {
     /// NVMM is block-linear; most file/sim sources pitch-linear).
     /// The builder feeds this to the preprocessor instead of
     /// assuming a layout, and equals `FrameMeta::layout`.
-    fn layout(&self) -> Layout {
-        Layout::PitchLinear
+    fn layout(&self) -> Layout;
+    /// Buffers currently back in the pool, when the backend can
+    /// report it. Conformance uses this to prove no frame leak
+    /// across a start/stop cycle; `None` means "not reportable".
+    fn pool_available(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -129,6 +133,11 @@ pub trait Sink: Send {
         let _ = det;
         Ok(())
     }
+    /// Flush buffered output. The runner calls this on every
+    /// exit path so flush errors surface instead of dying in Drop.
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// What a backend can do. The builder validates config against this
@@ -149,8 +158,6 @@ pub struct PlatformCaps {
     /// Jetson). Only reachable under `zero_copy = "relaxed"` with
     /// `encoder.hardware = false`; strict mode never uses it.
     pub cpu_encode: bool,
-    /// e.g. `["gpu", "dla0", "dla1"]` on Orin NX, `["cpu-sim"]` in sim.
-    pub accelerators: Vec<String>,
 }
 
 /// One per platform crate; the binary picks it from config.

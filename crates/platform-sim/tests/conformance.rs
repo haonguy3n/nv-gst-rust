@@ -27,17 +27,20 @@ fn source_cfg() -> SourceConfig {
 fn model_cfg() -> ModelConfig {
     ModelConfig {
         path: None,
-        decoder: "sim".into(),
+        decoder: Default::default(),
         input_color: Default::default(),
         input_normalize: Default::default(),
         pad_value: 114,
         input_colorspace: Default::default(),
         precision: Default::default(),
-        device: "gpu".into(),
+        device: None,
         input_width: 32,
         input_height: 32,
         num_classes: 80,
         score_threshold: 0.25,
+        iou_threshold: 0.45,
+        max_nms: 300,
+        top_k: 100,
     }
 }
 

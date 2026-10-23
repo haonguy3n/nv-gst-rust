@@ -11,17 +11,20 @@ use std::path::PathBuf;
 fn fixture_cfg() -> ModelConfig {
     ModelConfig {
         path: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relu.onnx")),
-        decoder: "sim".into(),
+        decoder: Default::default(),
         input_color: Default::default(),
         input_normalize: Default::default(),
         pad_value: 114,
         input_colorspace: Default::default(),
         precision: Default::default(),
-        device: "gpu".into(),
+        device: None,
         input_width: 4,
         input_height: 4,
         num_classes: 80,
         score_threshold: 0.25,
+        iou_threshold: 0.45,
+        max_nms: 300,
+        top_k: 100,
     }
 }
 
@@ -47,6 +50,24 @@ fn onnx_engine_runs_fixture_and_returns_relu_values() {
     let data = output.as_f32_slice().expect("host F32 output");
     let expected: Vec<f32> = (0..48).map(|i| (i as f32 - 24.0).max(0.0)).collect();
     assert_eq!(data, expected.as_slice(), "output must be relu(input)");
+}
+
+/// Item 13: the fixture declares `[1, 3, 4, 4]`; a config that
+/// says 8x8 must be refused at load, not at the first infer.
+#[cfg(feature = "onnx")]
+#[test]
+fn onnx_engine_rejects_config_shape_mismatch_at_load() {
+    let platform = SimPlatform;
+    let mut cfg = fixture_cfg();
+    cfg.input_width = 8;
+    cfg.input_height = 8;
+    match platform.engine(&cfg) {
+        Ok(_) => panic!("shape mismatch must fail to load"),
+        Err(e) => assert!(
+            e.to_string().contains("does not match"),
+            "error must describe the mismatch: {e}"
+        ),
+    }
 }
 
 #[cfg(feature = "onnx")]
