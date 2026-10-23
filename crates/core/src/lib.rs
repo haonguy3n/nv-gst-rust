@@ -11,6 +11,7 @@ pub mod config;
 pub mod detection;
 pub mod error;
 pub mod frame;
+pub mod letterbox;
 pub mod stage;
 pub mod tensor;
 
@@ -21,8 +22,9 @@ pub use config::{
 pub use detection::{Detection, Detections};
 pub use error::{Error, Result};
 pub use frame::{FrameMemory, FrameMeta, HwBuffer, HwFrame, Layout, PixelFormat};
+pub use letterbox::{normalize_factor, order_channels, Letterbox};
 pub use stage::{
-    EncodedPacket, Encoder, FramePoll, FrameSource, GpuStream, InferenceEngine, Overlay, Platform,
-    PlatformCaps, PostProcessor, PreConfig, Preprocessor, Sink,
+    EncodedPacket, Encoder, EngineState, EngineWarmup, FramePoll, FrameSource, GpuStream,
+    InferenceEngine, Overlay, Platform, PlatformCaps, PostProcessor, PreConfig, Preprocessor, Sink,
 };
 pub use tensor::{DType, Tensor, TensorBuffer, TensorSpec};

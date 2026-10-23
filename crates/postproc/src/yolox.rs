@@ -1,6 +1,7 @@
 use crate::nms::{nms, nms_agnostic};
-use crate::yolo::letterbox_params;
-use edge_core::{Detection, Detections, Error, FrameMeta, PostProcessor, Result, Tensor};
+use edge_core::{
+    Detection, Detections, Error, FrameMeta, Letterbox, PostProcessor, Result, Tensor,
+};
 
 /// Decoder for YOLOX exports with the box decode already in the
 /// graph (e.g. Megvii's official ONNX re-exported by the reference
@@ -106,8 +107,8 @@ impl PostProcessor for YoloxPostProcessor {
         }
 
         let (fw, fh) = (meta.width as f32, meta.height as f32);
-        let (scale, pad_x, pad_y) =
-            letterbox_params(self.model_width, self.model_height, meta.width, meta.height);
+        let lb = Letterbox::new(meta.width, meta.height, self.model_width, self.model_height);
+        let (scale, pad_x, pad_y) = (lb.scale, lb.pad_x_f32(), lb.pad_y_f32());
 
         for a in 0..anchors {
             let obj = objectness[a * obj_stride];

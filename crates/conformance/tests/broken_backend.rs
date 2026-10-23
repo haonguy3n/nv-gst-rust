@@ -2,9 +2,9 @@
 //! These stubs violate the contract on purpose.
 
 use edge_core::{
-    Codec, Encoder, EncoderConfig, Error, FrameMemory, FrameMeta, FramePoll, FrameSource, HwBuffer,
-    HwFrame, InferenceEngine, Layout, ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps,
-    PreConfig, Preprocessor, Result, SourceConfig,
+    Codec, Encoder, EncoderConfig, EngineState, Error, FrameMemory, FrameMeta, FramePoll,
+    FrameSource, HwBuffer, HwFrame, Layout, ModelConfig, Overlay, PixelFormat, Platform,
+    PlatformCaps, PreConfig, Preprocessor, Result, SourceConfig,
 };
 use std::any::Any;
 use std::os::fd::RawFd;
@@ -81,7 +81,7 @@ impl Platform for BrokenPlatform {
     fn preprocessor(&self, _cfg: &PreConfig) -> Result<Box<dyn Preprocessor>> {
         Err(Error::Unsupported("stub".into()))
     }
-    fn engine(&self, _cfg: &ModelConfig) -> Result<Box<dyn InferenceEngine>> {
+    fn engine(&self, _cfg: &ModelConfig) -> Result<EngineState> {
         Err(Error::Unsupported("stub".into()))
     }
     fn overlay(&self) -> Result<Box<dyn Overlay>> {

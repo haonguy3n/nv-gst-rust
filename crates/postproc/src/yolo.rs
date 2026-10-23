@@ -1,21 +1,7 @@
 use crate::nms::nms;
-use edge_core::{Detection, Detections, Error, FrameMeta, PostProcessor, Result, Tensor};
-
-/// Letterbox geometry shared by the decoders: the preprocessor
-/// scaled the frame by `scale` and padded it symmetrically, so
-/// `model_px = frame_px * scale + pad`. Returns
-/// `(scale, pad_x, pad_y)` in model pixels.
-pub(crate) fn letterbox_params(
-    model_width: u32,
-    model_height: u32,
-    frame_width: u32,
-    frame_height: u32,
-) -> (f32, f32, f32) {
-    let (mw, mh) = (model_width as f32, model_height as f32);
-    let (fw, fh) = (frame_width as f32, frame_height as f32);
-    let scale = (mw / fw).min(mh / fh);
-    (scale, (mw - fw * scale) / 2.0, (mh - fh * scale) / 2.0)
-}
+use edge_core::{
+    Detection, Detections, Error, FrameMeta, Letterbox, PostProcessor, Result, Tensor,
+};
 
 /// Decoder for the YOLOv8/v11 raw head output: one tensor of shape
 /// `[1, 4 + num_classes, num_candidates]` where each candidate is
@@ -112,8 +98,8 @@ impl PostProcessor for YoloPostProcessor {
 
         // Undo the letterbox: model = frame * scale + pad.
         let (fw, fh) = (meta.width as f32, meta.height as f32);
-        let (scale, pad_x, pad_y) =
-            letterbox_params(self.model_width, self.model_height, meta.width, meta.height);
+        let lb = Letterbox::new(meta.width, meta.height, self.model_width, self.model_height);
+        let (scale, pad_x, pad_y) = (lb.scale, lb.pad_x_f32(), lb.pad_y_f32());
 
         for i in 0..candidates {
             // Best class for this candidate.

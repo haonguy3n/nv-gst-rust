@@ -3,10 +3,10 @@
 //! combinations build, refuse, or take the CPU opt-in.
 
 use edge_core::{
-    Codec, Config, DType, Detections, EncodedPacket, Encoder, EncoderConfig, FrameMemory,
-    FrameMeta, FramePoll, FrameSource, GpuStream, HwFrame, InferenceEngine, Layout, ModelConfig,
-    Overlay, PixelFormat, Platform, PlatformCaps, PostProcessor, PreConfig, Preprocessor, Result,
-    Sink, SourceConfig, Tensor, TensorBuffer, TensorSpec,
+    Codec, Config, DType, Detections, EncodedPacket, Encoder, EncoderConfig, EngineState,
+    FrameMemory, FrameMeta, FramePoll, FrameSource, GpuStream, HwFrame, InferenceEngine, Layout,
+    ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps, PostProcessor, PreConfig,
+    Preprocessor, Result, Sink, SourceConfig, Tensor, TensorBuffer, TensorSpec,
 };
 use edge_pipeline::Pipeline;
 use std::time::Duration;
@@ -126,7 +126,7 @@ impl Platform for FakePlatform {
     fn preprocessor(&self, _c: &PreConfig) -> Result<Box<dyn Preprocessor>> {
         Ok(Box::new(NoopPre))
     }
-    fn engine(&self, _c: &ModelConfig) -> Result<Box<dyn InferenceEngine>> {
+    fn engine(&self, _c: &ModelConfig) -> Result<EngineState> {
         let inputs = if self.bad_input {
             vec![Tensor::new(
                 TensorSpec::new("images", vec![1, 3, 999, 999], DType::F32),
@@ -135,10 +135,10 @@ impl Platform for FakePlatform {
         } else {
             Vec::new()
         };
-        Ok(Box::new(NoopEngine {
+        Ok(EngineState::Ready(Box::new(NoopEngine {
             inputs,
             outputs: Vec::new(),
-        }))
+        })))
     }
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
         Ok(Box::new(NoopOverlay))

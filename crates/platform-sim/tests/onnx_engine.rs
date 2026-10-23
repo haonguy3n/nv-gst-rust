@@ -32,7 +32,11 @@ fn fixture_cfg() -> ModelConfig {
 #[test]
 fn onnx_engine_runs_fixture_and_returns_relu_values() {
     let platform = SimPlatform;
-    let mut engine = platform.engine(&fixture_cfg()).expect("load fixture model");
+    let mut engine = platform
+        .engine(&fixture_cfg())
+        .expect("load fixture model")
+        .wait_ready(std::time::Duration::from_secs(5))
+        .expect("sim engine is ready immediately");
 
     // Fill the input binding the way a preprocessor would.
     let input = &mut engine.input_bindings()[0];
@@ -43,7 +47,7 @@ fn onnx_engine_runs_fixture_and_returns_relu_values() {
         *v = i as f32 - 24.0; // -24.0 ..= 23.0
     }
 
-    engine.infer(&GpuStream::new(0)).expect("infer");
+    engine.infer(&GpuStream::noop()).expect("infer");
 
     let output = &engine.output_bindings()[0];
     assert_eq!(output.spec.shape, vec![1, 3, 4, 4]);

@@ -1,6 +1,6 @@
 use edge_core::{Config, Detections, EncodedPacket, Error, Result, Sink};
 use edge_pipeline::Pipeline;
-use platform_sim::{SimPlatform, SimPostProcessor};
+use platform_sim::{DelayedSimPlatform, SimPlatform, SimPostProcessor};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -296,6 +296,65 @@ fn live_metrics_are_visible_during_run() {
     assert_eq!(final_snap.frames_captured, metrics.frames_captured);
     assert_eq!(final_snap.frames_processed, metrics.frames_processed);
     assert_eq!(final_snap.detections, metrics.detections);
+}
+
+/// C2 (Jetson inference plan): while the engine warms up (plan
+/// build), frames flow with empty detections; once it is ready,
+/// the same run starts producing detections — video and metadata
+/// both flow from the first frame.
+#[test]
+fn warming_engine_flows_empty_then_detects() {
+    #[derive(Default)]
+    struct LenSink {
+        seen: Arc<Mutex<Vec<usize>>>,
+    }
+    impl Sink for LenSink {
+        fn push_video(&mut self, _pkt: EncodedPacket) -> Result<()> {
+            Ok(())
+        }
+        fn push_meta(&mut self, det: &Detections) -> Result<()> {
+            self.seen.lock().unwrap().push(det.items.len());
+            Ok(())
+        }
+    }
+
+    // 60 frames at 30 fps paced = ~2 s of run; engine ready at 0.6 s.
+    let cfg = test_config(60);
+    let platform = DelayedSimPlatform {
+        ready_after: std::time::Duration::from_millis(600),
+    };
+    let sink = LenSink::default();
+    let seen = Arc::clone(&sink.seen);
+    let mut pipeline = Pipeline::build(
+        &platform,
+        cfg,
+        Box::new(SimPostProcessor::new(0.25)),
+        Box::new(sink),
+    )
+    .expect("build pipeline");
+    let (metrics, result) = pipeline.run(None);
+    result.expect("run pipeline");
+
+    assert_eq!(
+        metrics.frames_processed + metrics.frames_dropped,
+        metrics.frames_captured,
+        "every captured frame accounted for: {}",
+        metrics.summary()
+    );
+    let lens = seen.lock().unwrap();
+    assert!(!lens.is_empty(), "metadata must flow from frame one");
+    assert_eq!(
+        lens[0], 0,
+        "first frames carry empty detections while warming"
+    );
+    assert!(
+        lens.iter().any(|&n| n > 0),
+        "detections must start once the engine is ready: {lens:?}"
+    );
+    assert!(
+        *lens.last().unwrap() > 0,
+        "final frames must have detections: {lens:?}"
+    );
 }
 
 #[test]

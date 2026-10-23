@@ -17,9 +17,9 @@
 mod onnx;
 
 use edge_core::{
-    DType, Detection, Detections, Encoder, EncoderConfig, Error, FrameMemory, FrameMeta, FramePoll,
-    FrameSource, GpuStream, HwBuffer, HwFrame, InferenceEngine, InputColor, InputColorspace,
-    InputNormalize, Layout, ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps,
+    DType, Detection, Detections, Encoder, EncoderConfig, EngineState, Error, FrameMemory,
+    FrameMeta, FramePoll, FrameSource, GpuStream, HwBuffer, HwFrame, InferenceEngine,
+    InputColorspace, Layout, ModelConfig, Overlay, PixelFormat, Platform, PlatformCaps,
     PostProcessor, PreConfig, Precision, Preprocessor, Result, SourceConfig, Tensor, TensorBuffer,
     TensorSpec,
 };
@@ -353,18 +353,13 @@ impl Preprocessor for SimPreprocessor {
             )));
         }
 
-        let norm = match self.cfg.normalize {
-            InputNormalize::Unit => 1.0 / 255.0,
-            InputNormalize::None => 1.0,
-        };
+        let norm = edge_core::normalize_factor(self.cfg.normalize);
         out[..3 * dw * dh].fill(self.cfg.pad_value as f32 * norm);
 
-        let scale = (dw as f32 / sw as f32).min(dh as f32 / sh as f32);
-        let (rw, rh) = (
-            ((sw as f32 * scale).round() as usize).max(1),
-            ((sh as f32 * scale).round() as usize).max(1),
-        );
-        let (ox, oy) = ((dw - rw) / 2, (dh - rh) / 2);
+        let lb = edge_core::Letterbox::new(sw as u32, sh as u32, dw as u32, dh as u32);
+        let scale = lb.scale;
+        let (rw, rh) = (lb.resized_width as usize, lb.resized_height as usize);
+        let (ox, oy) = (lb.pad_x as usize, lb.pad_y as usize);
         let (y_plane, uv_plane) = self.scratch.split_at(sw * sh);
 
         let sample_y = |x: usize, y: usize| y_plane[(y.min(sh - 1)) * sw + x.min(sw - 1)] as f32;
@@ -390,10 +385,7 @@ impl Preprocessor for SimPreprocessor {
                     + sample_y(x0 + 1, y0 + 1) * fx * fy;
                 let (u, v) = sample_uv(x0, y0);
                 let (r, g, b) = nv12_rgb(self.cfg.colorspace, yv, u, v);
-                let (c0, c1, c2) = match self.cfg.color {
-                    InputColor::Rgb => (r, g, b),
-                    InputColor::Bgr => (b, g, r),
-                };
+                let (c0, c1, c2) = edge_core::order_channels(self.cfg.color, r, g, b);
                 let (dx, dy) = (ox + rx, oy + ry);
                 out[dy * dw + dx] = c0 * norm;
                 out[dw * dh + dy * dw + dx] = c1 * norm;
@@ -586,13 +578,15 @@ impl Platform for SimPlatform {
         }))
     }
 
-    fn engine(&self, cfg: &ModelConfig) -> Result<Box<dyn InferenceEngine>> {
+    fn engine(&self, cfg: &ModelConfig) -> Result<EngineState> {
         match &cfg.path {
-            None => Ok(Box::new(SimEngine::new(cfg))),
+            None => Ok(EngineState::Ready(Box::new(SimEngine::new(cfg)))),
             Some(path) => {
                 #[cfg(feature = "onnx")]
                 {
-                    Ok(Box::new(onnx::OnnxEngine::load(path, cfg)?))
+                    Ok(EngineState::Ready(Box::new(onnx::OnnxEngine::load(
+                        path, cfg,
+                    )?)))
                 }
                 #[cfg(not(feature = "onnx"))]
                 {
@@ -614,6 +608,59 @@ impl Platform for SimPlatform {
     fn encoder(&self, _cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
         // Like Orin Nano: no hardware encoder, metadata only.
         Ok(None)
+    }
+}
+
+/// Sim platform whose engine takes `ready_after` to become
+/// available, modelling a TensorRT plan build on first boot.
+/// Everything except `engine()` delegates to [`SimPlatform`]; it
+/// exists so the runner's warming path (video flows, detections
+/// empty, then inference joins) is testable without hardware.
+pub struct DelayedSimPlatform {
+    pub ready_after: Duration,
+}
+
+struct SimWarmup {
+    ready_at: std::time::Instant,
+    cfg: ModelConfig,
+}
+
+impl edge_core::EngineWarmup for SimWarmup {
+    fn poll_ready(&mut self) -> Result<Option<Box<dyn InferenceEngine>>> {
+        if std::time::Instant::now() < self.ready_at {
+            return Ok(None);
+        }
+        match SimPlatform.engine(&self.cfg)? {
+            EngineState::Ready(engine) => Ok(Some(engine)),
+            EngineState::Warming(_) => Ok(None),
+        }
+    }
+}
+
+impl Platform for DelayedSimPlatform {
+    fn name(&self) -> &'static str {
+        "sim-delayed"
+    }
+    fn caps(&self) -> PlatformCaps {
+        SimPlatform.caps()
+    }
+    fn source(&self, cfg: &SourceConfig) -> Result<Box<dyn FrameSource>> {
+        SimPlatform.source(cfg)
+    }
+    fn preprocessor(&self, cfg: &PreConfig) -> Result<Box<dyn Preprocessor>> {
+        SimPlatform.preprocessor(cfg)
+    }
+    fn engine(&self, cfg: &ModelConfig) -> Result<EngineState> {
+        Ok(EngineState::Warming(Box::new(SimWarmup {
+            ready_at: std::time::Instant::now() + self.ready_after,
+            cfg: cfg.clone(),
+        })))
+    }
+    fn overlay(&self) -> Result<Box<dyn Overlay>> {
+        SimPlatform.overlay()
+    }
+    fn encoder(&self, cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
+        SimPlatform.encoder(cfg)
     }
 }
 

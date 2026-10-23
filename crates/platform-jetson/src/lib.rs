@@ -30,7 +30,7 @@ pub use probe::{choose_encoder, probe_media_engines, EncoderChoice, EncoderKind,
 #[cfg(feature = "gst")]
 use edge_core::Layout;
 use edge_core::{
-    Codec, Encoder, EncoderConfig, Error, FrameMemory, FrameSource, InferenceEngine, ModelConfig,
+    Codec, Encoder, EncoderConfig, EngineState, Error, FrameMemory, FrameSource, ModelConfig,
     Overlay, PixelFormat, Platform, PlatformCaps, PreConfig, Precision, Preprocessor, Result,
     SourceConfig,
 };
@@ -129,7 +129,7 @@ impl Platform for JetsonPlatform {
         Err(Error::Unsupported(M1_PENDING.into()))
     }
 
-    fn engine(&self, _cfg: &ModelConfig) -> Result<Box<dyn InferenceEngine>> {
+    fn engine(&self, _cfg: &ModelConfig) -> Result<EngineState> {
         Err(Error::Unsupported(M1_PENDING.into()))
     }
 

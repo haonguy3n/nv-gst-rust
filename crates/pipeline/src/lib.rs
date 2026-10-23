@@ -15,9 +15,9 @@ pub mod metrics;
 pub use metrics::{LiveMetrics, PipelineMetrics};
 
 use edge_core::{
-    Config, Detections, Encoder, Error, FramePoll, FrameSource, GpuStream, HwFrame,
-    InferenceEngine, Overlay, PixelFormat, Platform, PostProcessor, PreConfig, Preprocessor,
-    Result, Sink,
+    Config, Detections, Encoder, EngineState, EngineWarmup, Error, FramePoll, FrameSource,
+    GpuStream, HwFrame, InferenceEngine, ModelConfig, Overlay, PixelFormat, Platform,
+    PostProcessor, PreConfig, Preprocessor, Result, Sink, TensorSpec,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ pub struct Pipeline {
     input_spec: Option<edge_core::TensorSpec>,
     source: Box<dyn FrameSource>,
     preprocessor: Box<dyn Preprocessor>,
-    engine: Box<dyn InferenceEngine>,
+    engine: EngineSlot,
     postprocessor: Box<dyn PostProcessor>,
     overlay: Box<dyn Overlay>,
     encoder: Option<Box<dyn Encoder>>,
@@ -38,6 +38,48 @@ pub struct Pipeline {
     stop: Arc<AtomicBool>,
     /// Counters observable while a run is in progress.
     live_metrics: Arc<LiveMetrics>,
+    /// The camera's ordered GPU work queue, from the platform.
+    stream: GpuStream,
+}
+
+/// The engine stage: ready, or still warming (plan build). While
+/// warming, frames skip pre/infer/post and carry empty detections.
+enum EngineSlot {
+    Ready(Box<dyn InferenceEngine>),
+    Warming(Box<dyn EngineWarmup>),
+}
+
+/// The engine's declared input must match the config the
+/// preprocessor was built for, or the mismatch would surface
+/// only at the first infer (or never, on a dynamic-shape model).
+fn check_input_spec(spec: Option<&TensorSpec>, model: &ModelConfig) -> Result<()> {
+    let Some(spec) = spec else { return Ok(()) };
+    let expected_shape = vec![
+        1,
+        3,
+        model.input_height as usize,
+        model.input_width as usize,
+    ];
+    if !spec.shape.is_empty() && spec.shape != expected_shape {
+        return Err(Error::DomainMismatch {
+            stage: "engine",
+            expected: format!("input shape {expected_shape:?}"),
+            got: format!("{:?}", spec.shape),
+        });
+    }
+    let expected_dtype = match model.precision {
+        edge_core::Precision::Fp32 => edge_core::DType::F32,
+        edge_core::Precision::Fp16 => edge_core::DType::F16,
+        edge_core::Precision::Int8 => edge_core::DType::I8,
+    };
+    if spec.dtype != expected_dtype {
+        return Err(Error::DomainMismatch {
+            stage: "engine",
+            expected: format!("input dtype {expected_dtype:?}"),
+            got: format!("{:?}", spec.dtype),
+        });
+    }
+    Ok(())
 }
 
 impl Pipeline {
@@ -112,39 +154,17 @@ impl Pipeline {
             pad_value: config.model.pad_value,
         };
         let preprocessor = platform.preprocessor(&pre_cfg)?;
-        let mut engine = platform.engine(&config.model)?;
-        let input_spec = engine.input_bindings().first().map(|t| t.spec.clone());
-        // The engine's declared input must match the config the
-        // preprocessor was just built for, or the mismatch would
-        // surface only at the first infer (or never, on a
-        // dynamic-shape model).
-        if let Some(spec) = &input_spec {
-            let expected_shape = vec![
-                1,
-                3,
-                config.model.input_height as usize,
-                config.model.input_width as usize,
-            ];
-            if !spec.shape.is_empty() && spec.shape != expected_shape {
-                return Err(Error::DomainMismatch {
-                    stage: "engine",
-                    expected: format!("input shape {expected_shape:?}"),
-                    got: format!("{:?}", spec.shape),
-                });
+        // The engine may still be warming (plan build); its input
+        // spec is checked now when ready, or at the moment it
+        // becomes ready. Video flows either way.
+        let (engine, input_spec) = match platform.engine(&config.model)? {
+            EngineState::Ready(mut engine) => {
+                let spec = engine.input_bindings().first().map(|t| t.spec.clone());
+                check_input_spec(spec.as_ref(), &config.model)?;
+                (EngineSlot::Ready(engine), spec)
             }
-            let expected_dtype = match config.model.precision {
-                edge_core::Precision::Fp32 => edge_core::DType::F32,
-                edge_core::Precision::Fp16 => edge_core::DType::F16,
-                edge_core::Precision::Int8 => edge_core::DType::I8,
-            };
-            if spec.dtype != expected_dtype {
-                return Err(Error::DomainMismatch {
-                    stage: "engine",
-                    expected: format!("input dtype {expected_dtype:?}"),
-                    got: format!("{:?}", spec.dtype),
-                });
-            }
-        }
+            EngineState::Warming(warmup) => (EngineSlot::Warming(warmup), None),
+        };
         let overlay = platform.overlay()?;
 
         let encoder = if config.encoder.enabled {
@@ -207,6 +227,7 @@ impl Pipeline {
             None
         };
         let metadata_only = encoder.is_none();
+        let stream = platform.stream(config.source.camera_id)?;
 
         Ok(Self {
             input_spec,
@@ -221,6 +242,7 @@ impl Pipeline {
             metadata_only,
             stop: Arc::new(AtomicBool::new(false)),
             live_metrics: Arc::new(LiveMetrics::default()),
+            stream,
         })
     }
 
@@ -228,16 +250,16 @@ impl Pipeline {
         self.metadata_only
     }
 
-    /// Handle for stopping `run()` from another thread (signal
-    /// handlers, supervisors). Setting it ends the run cleanly:
-    /// capture stops, the source is restored, and `run` returns
-    /// the metrics gathered so far with `Ok(())`.
     /// Counters shared with the running pipeline; snapshot them
     /// from any thread while `run` is in progress.
     pub fn live_metrics(&self) -> Arc<LiveMetrics> {
         Arc::clone(&self.live_metrics)
     }
 
+    /// Handle for stopping `run()` from another thread (signal
+    /// handlers, supervisors). Setting it ends the run cleanly:
+    /// capture stops, the source is restored, and `run` returns
+    /// the metrics gathered so far with `Ok(())`.
     pub fn stop_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stop)
     }
@@ -291,7 +313,6 @@ impl Pipeline {
         self.stop.store(false, Ordering::Relaxed);
         self.live_metrics.reset();
         let mut metrics = PipelineMetrics::default();
-        let stream = GpuStream::new(0);
         let limit = max_frames.or(self.config.source.frames);
         let max_idle = Duration::from_millis(self.config.pipeline.max_idle_ms);
 
@@ -351,7 +372,7 @@ impl Pipeline {
                 }
                 continue;
             };
-            if let Err(e) = self.process_one(frame, &stream, &mut detections, &mut metrics) {
+            if let Err(e) = self.process_one(frame, &mut detections, &mut metrics) {
                 last_err = Some(e);
                 break;
             }
@@ -391,34 +412,57 @@ impl Pipeline {
         (metrics, result)
     }
 
+    /// Advance a warming engine, if any. On transition the new
+    /// engine's input spec gets the same check the builder
+    /// applies to an engine that was ready up front.
+    fn poll_engine(&mut self) -> Result<()> {
+        let EngineSlot::Warming(warmup) = &mut self.engine else {
+            return Ok(());
+        };
+        let Some(mut engine) = warmup.poll_ready()? else {
+            return Ok(());
+        };
+        let spec = engine.input_bindings().first().map(|t| t.spec.clone());
+        check_input_spec(spec.as_ref(), &self.config.model)?;
+        self.input_spec = spec;
+        self.engine = EngineSlot::Ready(engine);
+        Ok(())
+    }
+
     fn process_one(
         &mut self,
         frame: HwFrame,
-        stream: &GpuStream,
         detections: &mut Detections,
         metrics: &mut PipelineMetrics,
     ) -> Result<()> {
-        let t = Instant::now();
-        let engine = &mut *self.engine;
-        let input = engine
-            .input_bindings()
-            .first_mut()
-            .ok_or_else(|| Error::Platform("engine exposes no input binding".into()))?;
-        self.preprocessor.run(&frame, input, stream)?;
-        metrics.pre_total += t.elapsed();
+        self.poll_engine()?;
+        match &mut self.engine {
+            EngineSlot::Ready(engine) => {
+                let t = Instant::now();
+                let input = engine
+                    .input_bindings()
+                    .first_mut()
+                    .ok_or_else(|| Error::Platform("engine exposes no input binding".into()))?;
+                self.preprocessor.run(&frame, input, &self.stream)?;
+                metrics.pre_total += t.elapsed();
+
+                let t = Instant::now();
+                engine.infer(&self.stream)?;
+                metrics.infer_total += t.elapsed();
+
+                let t = Instant::now();
+                self.postprocessor
+                    .decode(engine.output_bindings(), frame.meta(), detections)?;
+                metrics.post_total += t.elapsed();
+                metrics.detections += detections.len() as u64;
+            }
+            // Still warming: video and metadata flow with empty
+            // detections rather than waiting for the engine.
+            EngineSlot::Warming(_) => detections.clear(frame.meta()),
+        }
 
         let t = Instant::now();
-        self.engine.infer(stream)?;
-        metrics.infer_total += t.elapsed();
-
-        let t = Instant::now();
-        self.postprocessor
-            .decode(self.engine.output_bindings(), frame.meta(), detections)?;
-        metrics.post_total += t.elapsed();
-        metrics.detections += detections.len() as u64;
-
-        let t = Instant::now();
-        self.overlay.draw(&frame, detections, stream)?;
+        self.overlay.draw(&frame, detections, &self.stream)?;
         metrics.overlay_total += t.elapsed();
 
         let t = Instant::now();

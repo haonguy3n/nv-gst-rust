@@ -24,7 +24,7 @@
 #![forbid(unsafe_code)]
 
 use edge_core::{
-    EncoderConfig, FramePoll, GpuStream, HwFrame, ModelConfig, Platform, PreConfig, SourceConfig,
+    EncoderConfig, FramePoll, HwFrame, ModelConfig, Platform, PreConfig, SourceConfig,
 };
 
 /// Unwrap a poll that must yield a frame.
@@ -240,7 +240,11 @@ pub fn check_preprocess_and_inference(
         .unwrap_or_else(|e| panic!("{}: creating source: {e}", platform.name()));
     let mut engine = platform
         .engine(model_cfg)
-        .unwrap_or_else(|e| panic!("{}: creating engine: {e}", platform.name()));
+        .unwrap_or_else(|e| panic!("{}: creating engine: {e}", platform.name()))
+        // Conformance measures the ready engine; warming (plan
+        // build) may legitimately take a while on device.
+        .wait_ready(Duration::from_secs(600))
+        .unwrap_or_else(|e| panic!("{}: engine warmup: {e}", platform.name()));
     let mut pre = platform
         .preprocessor(&PreConfig {
             src_width: source_cfg.width,
@@ -254,7 +258,9 @@ pub fn check_preprocess_and_inference(
             pad_value: model_cfg.pad_value,
         })
         .unwrap_or_else(|e| panic!("{}: creating preprocessor: {e}", platform.name()));
-    let stream = GpuStream::new(0);
+    let stream = platform
+        .stream(source_cfg.camera_id)
+        .unwrap_or_else(|e| panic!("{}: creating stream: {e}", platform.name()));
 
     source
         .start()
