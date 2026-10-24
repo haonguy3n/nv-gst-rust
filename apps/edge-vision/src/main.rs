@@ -92,7 +92,9 @@ fn main() -> Result<()> {
                 )
             }
         }
-        other => bail!("unknown platform `{other}` (known: sim)"),
+        other => {
+            bail!("unknown platform `{other}` (known: sim, jetson; jetson needs --features jetson)")
+        }
     };
 
     let postprocessor: Box<dyn PostProcessor> = match config.model.decoder {

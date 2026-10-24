@@ -3,6 +3,9 @@
 //! consumes loaded ones; everything about *where* a plan lives
 //! and *whether the copy on disk is intact* is decided here.
 //!
+//! Layout: `<cache>/<model_id>/<key>.plan`. The model namespace means
+//! pruning one model's old plans cannot evict another model's.
+//!
 //! On-disk format per entry: an 8-byte magic, a little-endian
 //! u64 payload length, the payload's SHA-256, then the plan
 //! bytes. A file that fails any of those checks (truncated by a
@@ -17,6 +20,9 @@ use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Where the camera image keeps built plans (systemd
 /// `CacheDirectory=edge-vision`).
@@ -85,6 +91,14 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Stable per-model cache namespace. Plans live under
+/// `<cache>/<model_id>/`, so pruning one model can never evict another
+/// model's multi-minute build.
+pub fn model_id(onnx_bytes: &[u8]) -> String {
+    let digest = Sha256::digest(onnx_bytes);
+    hex(&digest[..8])
+}
+
 pub struct PlanCache {
     dir: PathBuf,
 }
@@ -98,14 +112,18 @@ impl PlanCache {
         Self::new(DEFAULT_CACHE_DIR)
     }
 
-    pub fn path_for(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.plan"))
+    pub fn model_dir(&self, model_id: &str) -> PathBuf {
+        self.dir.join(model_id)
+    }
+
+    pub fn path_for(&self, model_id: &str, key: &str) -> PathBuf {
+        self.model_dir(model_id).join(format!("{key}.plan"))
     }
 
     /// The cached plan bytes, or `None` when missing or not
     /// intact (both mean: rebuild).
-    pub fn load(&self, key: &str) -> Option<Vec<u8>> {
-        let raw = std::fs::read(self.path_for(key)).ok()?;
+    pub fn load(&self, model_id: &str, key: &str) -> Option<Vec<u8>> {
+        let raw = std::fs::read(self.path_for(model_id, key)).ok()?;
         if raw.len() < HEADER_LEN || &raw[..8] != MAGIC {
             return None;
         }
@@ -121,16 +139,20 @@ impl PlanCache {
         Some(payload.to_vec())
     }
 
-    /// Atomically store a built plan under `key`.
-    pub fn store(&self, key: &str, plan: &[u8]) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)?;
-        let tmp = self.dir.join(format!(".{key}.tmp-{}", std::process::id()));
+    /// Atomically store a built plan under `key` for one model.
+    pub fn store(&self, model_id: &str, key: &str, plan: &[u8]) -> Result<()> {
+        let dir = self.model_dir(model_id);
+        std::fs::create_dir_all(&dir)?;
+        // create_new: two builders in one process (or two processes)
+        // must never share a temporary path. The sequence makes even
+        // same-process collisions impossible.
+        let tmp = dir.join(format!(
+            ".{key}.tmp-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let write_tmp = |path: &Path| -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)?;
+            let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
             file.write_all(MAGIC)?;
             file.write_all(&(plan.len() as u64).to_le_bytes())?;
             file.write_all(&Sha256::digest(plan))?;
@@ -141,17 +163,18 @@ impl PlanCache {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
-        std::fs::rename(&tmp, self.path_for(key))?;
-        File::open(&self.dir)?.sync_all()?;
+        std::fs::rename(&tmp, self.path_for(model_id, key))?;
+        File::open(&dir)?.sync_all()?;
         Ok(())
     }
 
-    /// Remove every cached plan except `keep`. Returns how many
-    /// were removed. A missing cache directory removes nothing.
-    pub fn prune_except(&self, keep: &str) -> Result<usize> {
+    /// Remove every cached plan of `model_id` except `keep`. Plans for
+    /// other models are untouched. A missing model directory removes
+    /// nothing.
+    pub fn prune_except(&self, model_id: &str, keep: &str) -> Result<usize> {
         let keep_name = format!("{keep}.plan");
         let mut removed = 0;
-        let entries = match std::fs::read_dir(&self.dir) {
+        let entries = match std::fs::read_dir(self.model_dir(model_id)) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
@@ -226,43 +249,56 @@ mod tests {
     #[test]
     fn store_then_load_round_trips() {
         let cache = temp_cache("roundtrip");
+        let model = model_id(b"m");
         let key = plan_key(&inputs(b"m"));
-        assert_eq!(cache.load(&key), None, "missing before store");
-        cache.store(&key, b"plan-bytes").unwrap();
-        assert_eq!(cache.load(&key).as_deref(), Some(b"plan-bytes".as_slice()));
+        assert_eq!(cache.load(&model, &key), None, "missing before store");
+        cache.store(&model, &key, b"plan-bytes").unwrap();
+        assert_eq!(
+            cache.load(&model, &key).as_deref(),
+            Some(b"plan-bytes".as_slice())
+        );
     }
 
     #[test]
     fn truncated_or_corrupt_plan_loads_as_missing() {
         let cache = temp_cache("corrupt");
+        let model = model_id(b"m");
         let key = plan_key(&inputs(b"m"));
-        cache.store(&key, b"plan-bytes").unwrap();
-        let path = cache.path_for(&key);
+        cache.store(&model, &key, b"plan-bytes").unwrap();
+        let path = cache.path_for(&model, &key);
 
         // Truncated (power cut mid-write on a non-atomic writer).
         let raw = std::fs::read(&path).unwrap();
         std::fs::write(&path, &raw[..raw.len() - 3]).unwrap();
-        assert_eq!(cache.load(&key), None);
+        assert_eq!(cache.load(&model, &key), None);
 
         // Corrupted payload (checksum mismatch).
-        cache.store(&key, b"plan-bytes").unwrap();
+        cache.store(&model, &key, b"plan-bytes").unwrap();
         let mut raw = std::fs::read(&path).unwrap();
         *raw.last_mut().unwrap() ^= 0xff;
         std::fs::write(&path, raw).unwrap();
-        assert_eq!(cache.load(&key), None);
+        assert_eq!(cache.load(&model, &key), None);
     }
 
     #[test]
-    fn prune_removes_other_keys_only() {
+    fn prune_removes_other_keys_of_the_same_model_only() {
         let cache = temp_cache("prune");
-        cache.store("aaa", b"1").unwrap();
-        cache.store("bbb", b"2").unwrap();
-        cache.store("ccc", b"3").unwrap();
-        assert_eq!(cache.prune_except("bbb").unwrap(), 2);
-        assert_eq!(cache.load("bbb").as_deref(), Some(b"2".as_slice()));
-        assert_eq!(cache.load("aaa"), None);
+        let model = model_id(b"model-a");
+        let other_model = model_id(b"model-b");
+        cache.store(&model, "aaa", b"1").unwrap();
+        cache.store(&model, "bbb", b"2").unwrap();
+        cache.store(&model, "ccc", b"3").unwrap();
+        cache.store(&other_model, "ddd", b"4").unwrap();
+        assert_eq!(cache.prune_except(&model, "bbb").unwrap(), 2);
+        assert_eq!(cache.load(&model, "bbb").as_deref(), Some(b"2".as_slice()));
+        assert_eq!(cache.load(&model, "aaa"), None);
         assert_eq!(
-            cache.prune_except("bbb").unwrap(),
+            cache.load(&other_model, "ddd").as_deref(),
+            Some(b"4".as_slice()),
+            "pruning one model must not evict another model's plan"
+        );
+        assert_eq!(
+            cache.prune_except(&model, "bbb").unwrap(),
             0,
             "second prune is a no-op"
         );

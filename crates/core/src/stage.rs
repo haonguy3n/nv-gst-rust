@@ -213,6 +213,14 @@ pub trait Encoder: Send {
         let _ = out;
         Ok(())
     }
+
+    /// Emit packets that are ready without a new frame. The runner
+    /// calls this on idle encoder-thread ticks, so packets from frames
+    /// dropped by the hand-off are not stranded until the next frame.
+    fn poll(&mut self, out: &mut dyn FnMut(EncodedPacket)) -> Result<()> {
+        let _ = out;
+        Ok(())
+    }
 }
 
 /// RTSP, WebRTC, file, MQTT metadata.

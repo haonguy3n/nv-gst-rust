@@ -19,6 +19,10 @@ struct FakePlatform {
     /// Declare a normal F32 engine input (TensorRT FP16 plans still
     /// expose F32 I/O bindings).
     f32_input: bool,
+    /// Declare an F16 input binding, which no preprocessor can write yet.
+    f16_input: bool,
+    /// Omit every output binding.
+    empty_output: bool,
 }
 
 struct StubBuffer;
@@ -140,13 +144,26 @@ impl Platform for FakePlatform {
                 TensorSpec::new("images", vec![1, 3, 416, 416], DType::F32),
                 Box::new(StubBuffer),
             )]
+        } else if self.f16_input {
+            vec![Tensor::new(
+                TensorSpec::new("images", vec![1, 3, 416, 416], DType::F16),
+                Box::new(StubBuffer),
+            )]
         } else {
-            Vec::new()
+            vec![Tensor::new(
+                TensorSpec::new("images", vec![1, 3, 416, 416], DType::F32),
+                Box::new(StubBuffer),
+            )]
         };
-        Ok(EngineState::Ready(Box::new(NoopEngine {
-            inputs,
-            outputs: Vec::new(),
-        })))
+        let outputs = if self.empty_output {
+            Vec::new()
+        } else {
+            vec![Tensor::new(
+                TensorSpec::new("detections", vec![1, 1, 1], DType::F32),
+                Box::new(StubBuffer),
+            )]
+        };
+        Ok(EngineState::Ready(Box::new(NoopEngine { inputs, outputs })))
     }
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
         Ok(Box::new(NoopOverlay))
@@ -201,6 +218,8 @@ fn strict_nano_refuses_cpu_encode() {
         cpu: true,
         bad_input: false,
         f32_input: false,
+        f16_input: false,
+        empty_output: false,
     };
     // Config validation rejects strict + hardware=false first.
     assert!(Config::from_toml_str(
@@ -217,6 +236,8 @@ fn relaxed_nano_cpu_opt_in_builds() {
         cpu: true,
         bad_input: false,
         f32_input: false,
+        f16_input: false,
+        empty_output: false,
     };
     let p = build(&nano, config("relaxed", false)).expect("relaxed CPU opt-in must build");
     assert!(!p.metadata_only());
@@ -229,6 +250,8 @@ fn relaxed_without_cpu_path_refuses() {
         cpu: false,
         bad_input: false,
         f32_input: false,
+        f16_input: false,
+        empty_output: false,
     };
     match build(&bare, config("relaxed", false)) {
         Ok(_) => panic!("must refuse when the platform has no CPU encoder"),
@@ -243,6 +266,8 @@ fn nx_hardware_path_builds_and_nano_hardware_request_refuses() {
         cpu: true,
         bad_input: false,
         f32_input: false,
+        f16_input: false,
+        empty_output: false,
     };
     assert!(build(&nx, config("strict", true)).is_ok());
     let nano = FakePlatform {
@@ -250,6 +275,8 @@ fn nx_hardware_path_builds_and_nano_hardware_request_refuses() {
         cpu: true,
         bad_input: false,
         f32_input: false,
+        f16_input: false,
+        empty_output: false,
     };
     match build(&nano, config("relaxed", true)) {
         Ok(_) => panic!("hardware=true on a Nano must refuse"),
@@ -266,6 +293,8 @@ fn builder_refuses_engine_input_shape_mismatch() {
         cpu: false,
         bad_input: true,
         f32_input: false,
+        f16_input: false,
+        empty_output: false,
     };
     match build(&platform, config("strict", true)) {
         Ok(_) => panic!("mismatched engine input must not build"),
@@ -286,6 +315,8 @@ fn fp16_config_accepts_an_f32_engine_input_binding() {
         cpu: false,
         bad_input: false,
         f32_input: true,
+        f16_input: false,
+        empty_output: false,
     };
     let cfg = Config::from_toml_str(
         r#"
@@ -313,4 +344,39 @@ metadata_only = false
         build(&platform, cfg).is_ok(),
         "FP16 execution with F32 bindings must build"
     );
+}
+
+/// FP16 input bindings are not writable by any preprocessor yet, so
+/// the builder must refuse them instead of accepting a config that
+/// will fail at the first frame.
+#[test]
+fn f16_engine_input_is_rejected_until_a_preprocessor_writes_it() {
+    let platform = FakePlatform {
+        hw: true,
+        cpu: false,
+        bad_input: false,
+        f32_input: false,
+        f16_input: true,
+        empty_output: false,
+    };
+    match build(&platform, config("strict", true)) {
+        Ok(_) => panic!("F16 input must be refused"),
+        Err(e) => assert!(e.to_string().contains("F32"), "{e}"),
+    }
+}
+
+#[test]
+fn builder_refuses_an_engine_without_outputs() {
+    let platform = FakePlatform {
+        hw: true,
+        cpu: false,
+        bad_input: false,
+        f32_input: false,
+        f16_input: false,
+        empty_output: true,
+    };
+    match build(&platform, config("strict", true)) {
+        Ok(_) => panic!("an engine with no outputs must not build"),
+        Err(e) => assert!(e.to_string().contains("output binding"), "{e}"),
+    }
 }

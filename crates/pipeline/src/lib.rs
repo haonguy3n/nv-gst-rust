@@ -53,38 +53,80 @@ enum EngineSlot {
 /// can run again.
 type EncoderJoin = std::thread::JoinHandle<(Box<dyn Encoder>, Result<()>)>;
 
-/// The engine's declared input must match the config the
-/// preprocessor was built for, or the mismatch would surface
-/// only at the first infer (or never, on a dynamic-shape model).
-fn check_input_spec(spec: Option<&TensorSpec>, model: &ModelConfig) -> Result<()> {
-    let Some(spec) = spec else { return Ok(()) };
+/// The engine's bindings are a contract, not a suggestion. A
+/// TensorRT engine (T5) is bound to one static FP32 NCHW input and
+/// float outputs; checking that here turns a mismatch into a startup
+/// error instead of a first-frame ORT/TensorRT failure or a decoder
+/// over-read on a wrong output shape.
+fn check_engine_bindings(
+    engine: &mut dyn InferenceEngine,
+    model: &ModelConfig,
+) -> Result<TensorSpec> {
+    let spec = {
+        let inputs = engine.input_bindings();
+        if inputs.len() != 1 {
+            return Err(Error::DomainMismatch {
+                stage: "engine",
+                expected: "exactly one input binding".into(),
+                got: format!("{} input bindings", inputs.len()),
+            });
+        }
+        inputs[0].spec.clone()
+    };
+
     let expected_shape = vec![
         1,
         3,
         model.input_height as usize,
         model.input_width as usize,
     ];
-    if !spec.shape.is_empty() && spec.shape != expected_shape {
+    // No empty/dynamic shape: the mapped-host preprocessor and the
+    // TensorRT plan build both assume a fixed NCHW input.
+    if spec.shape != expected_shape {
         return Err(Error::DomainMismatch {
             stage: "engine",
-            expected: format!("input shape {expected_shape:?}"),
+            expected: format!("static input shape {expected_shape:?}"),
             got: format!("{:?}", spec.shape),
         });
     }
     // `model.precision` is a builder choice for layer execution, not
     // the dtype of the I/O bindings: a TensorRT plan built with FP16
     // (or INT8) still exposes FP32 input/output tensors, which is what
-    // the mapped-host design reads and writes. The engine's own spec is
-    // authoritative; only reject a non-float input that no
-    // preprocessor in this workspace can write.
-    if !matches!(spec.dtype, edge_core::DType::F32 | edge_core::DType::F16) {
+    // the mapped-host design reads and writes. Only F32 is accepted
+    // until a preprocessor can write FP16 bindings.
+    if spec.dtype != edge_core::DType::F32 {
         return Err(Error::DomainMismatch {
             stage: "engine",
-            expected: "float input binding (F32 or F16)".into(),
+            expected: "F32 input binding (no preprocessor writes F16 yet)".into(),
             got: format!("{:?}", spec.dtype),
         });
     }
-    Ok(())
+
+    let outputs = engine.output_bindings();
+    if outputs.is_empty() {
+        return Err(Error::DomainMismatch {
+            stage: "engine",
+            expected: "at least one output binding".into(),
+            got: "none".into(),
+        });
+    }
+    for (i, output) in outputs.iter().enumerate() {
+        if output.spec.shape.is_empty() {
+            return Err(Error::DomainMismatch {
+                stage: "engine",
+                expected: format!("static shape for output {i}"),
+                got: "dynamic/empty shape".into(),
+            });
+        }
+        if output.spec.dtype != edge_core::DType::F32 {
+            return Err(Error::DomainMismatch {
+                stage: "engine",
+                expected: format!("F32 output {i} (host-visible post-processing)"),
+                got: format!("{:?}", output.spec.dtype),
+            });
+        }
+    }
+    Ok(spec)
 }
 
 impl Pipeline {
@@ -164,9 +206,8 @@ impl Pipeline {
         // becomes ready. Video flows either way.
         let (engine, input_spec) = match platform.engine(&config.model)? {
             EngineState::Ready(mut engine) => {
-                let spec = engine.input_bindings().first().map(|t| t.spec.clone());
-                check_input_spec(spec.as_ref(), &config.model)?;
-                (EngineSlot::Ready(engine), spec)
+                let spec = check_engine_bindings(&mut *engine, &config.model)?;
+                (EngineSlot::Ready(engine), Some(spec))
             }
             EngineState::Warming(warmup) => (EngineSlot::Warming(warmup), None),
         };
@@ -399,6 +440,13 @@ impl Pipeline {
                                 if rx.is_closed_and_empty() {
                                     break;
                                 }
+                                if let Err(e) = encoder.poll(&mut |pkt| {
+                                    let _ = packet_tx_thread.send(pkt);
+                                }) {
+                                    failed_thread.store(true, Ordering::Relaxed);
+                                    result = Err(e);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -604,7 +652,11 @@ impl Pipeline {
             metrics.encode_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
         }
         if let Err(e) = encoder_result {
-            if last_err.is_none() {
+            // A `StageGone` from the hand-off is only a symptom; the
+            // encoder thread's own error (or panic) is the real one.
+            if last_err.is_none()
+                || matches!(&last_err, Some(Error::StageGone { stage: "encoder" }))
+            {
                 last_err = Some(e);
             }
         }
@@ -636,9 +688,8 @@ impl Pipeline {
         let Some(mut engine) = warmup.poll_ready()? else {
             return Ok(());
         };
-        let spec = engine.input_bindings().first().map(|t| t.spec.clone());
-        check_input_spec(spec.as_ref(), &self.config.model)?;
-        self.input_spec = spec;
+        let spec = check_engine_bindings(&mut *engine, &self.config.model)?;
+        self.input_spec = Some(spec);
         self.engine = EngineSlot::Ready(engine);
         Ok(())
     }
@@ -696,8 +747,13 @@ impl Pipeline {
                     )));
                 }
                 // Leaky one-deep hand-off: an evicted frame is
-                // returned to the capture pool here.
-                drop(tx.send(frame));
+                // returned to the capture pool here. A send error means
+                // the encoder thread is gone: stop the run instead of
+                // letting inference continue with no video output.
+                match tx.send(frame) {
+                    Ok(evicted) => drop(evicted),
+                    Err(_) => return Err(Error::StageGone { stage: "encoder" }),
+                }
             }
             None => drop(frame), // returns the buffer to the capture pool
         }
@@ -781,9 +837,13 @@ fn capture_loop(
                 pool_starved = false;
                 live.set_capture(captured, timeouts);
                 last_frame = Instant::now();
-                // Drop-oldest: an evicted frame returns its
-                // buffer to the capture pool here.
-                drop(tx.send(frame));
+                // Drop-oldest: an evicted frame returns its buffer
+                // to the capture pool here. `Err` means the processing
+                // side is gone, so capture must stop too.
+                match tx.send(frame) {
+                    Ok(evicted) => drop(evicted),
+                    Err(_) => break,
+                }
             }
             // A momentary shortage is not the end of anything:
             // keep capturing — unless no frame has been handed

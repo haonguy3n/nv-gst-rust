@@ -7,6 +7,12 @@
 
 #![forbid(unsafe_code)]
 
+// `cpu-debug` is a development-only escape hatch: release builds must
+// never contain a path that maps hardware pixels to the CPU. A feature
+// accidentally enabled by a dev-dependency fails this build.
+#[cfg(all(feature = "cpu-debug", not(debug_assertions)))]
+compile_error!("feature `cpu-debug` must never be enabled in a release build");
+
 pub mod config;
 pub mod detection;
 pub mod error;

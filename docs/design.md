@@ -25,7 +25,7 @@ be new `platform-*` crates without changes to the pipeline core.
 | YOLOv8/v11 and YOLOX decoders, NMS, zero-allocation steady state | Done | `crates/postproc`; unit tests, allocation gate, committed end-to-end fixture test |
 | Sinks: JSONL metadata, file video, fan-out, counting/null | Done | `crates/sinks`; unit tests |
 | Conformance suite every backend must pass | Done | `crates/conformance`; sim passes, broken stubs are caught |
-| Jetson: NVENC/NVJPG sysfs probe, launch strings, plan cache | Done (PC-testable) | `crates/platform-jetson`; unit tests with fake sysfs |
+| Jetson: NVENC/NVJPG sysfs probe, launch strings, plan cache | Done (PC-testable) | `crates/platform-jetson`; unit tests with fake sysfs, per-model plan namespaces, property-set file paths |
 | Jetson: GStreamer capture (`appsink`) | Partial | `platform-jetson --features gst`: dmabuf branch and a PC-only copy fallback; NVMM buffers are refused, never copied |
 | Jetson: Argus EOS is a fault, not a clean end | Done (PC-tested) | `gst_source.rs` returns `Err` for an `argus` source; once-per-boot recovery/exit 75 still M1 |
 | Jetson: NVMM/NvBufSurface access (`gst_buffer_map` → `NvBufSurface*`) | Not implemented | Needs `nvbuf-sys` and the L4T sysroot; see `docs/jetson-bringup.md` |
@@ -131,6 +131,9 @@ the TensorRT input binding.
   byte offsets, pitches, visible row bytes and rows for up to three
   planes inside one contiguous dmabuf. A padded or block-linear surface
   reports its real pitch; consumers never infer stride from width.
+  Until T2 reads `planeParams`, a block-linear NVMM frame's descriptor
+  is empty (tight geometry exists only for the pitch-linear host
+  fallback), so nothing can consume a guessed NVMM pitch.
 - **Same fd end to end.** `FrameMeta` is immutable after the source
   hands it out (private field behind accessors). The runner checks the
   meta fd against the buffer's fd before encode and returns a typed
@@ -169,6 +172,10 @@ products:
   policy in Rust);
 - encode (NX): `appsrc` → `nvv4l2h264enc`/`nvv4l2h265enc` → byte-stream
   `appsink`.
+- capture/gain details: exposure and gain are set on `camsrc` after the
+  pipeline reaches PLAYING, not in the launch string (Nano black-frame
+  regression). File paths are set as `filesrc location` properties, so
+  a path containing spaces or `!` cannot alter the pipeline.
 - encode (Nano, `zero_copy = "relaxed"`, `hardware = false`):
   `appsrc` → `nvvidconv` → I420 → `x264enc` → `h264parse` → byte-stream
   `appsink`. One VIC copy is the measured Nano product path; H.265 is
@@ -308,8 +315,10 @@ config.
   channel, so they stay visible while processing is stalled.
 - **Encoder thread**: video frames go through a one-deep leaky channel;
   drops are counted separately (`edge_encode_dropped_total`) and a slow
-  encoder cannot stall inference. `Encoder::finish` drains delayed
-  packets.
+  encoder cannot stall inference. A failed send means the encoder
+  worker is gone, so the run stops (the encoder's own error, not the
+  generic `StageGone`, is reported). `Encoder::finish` drains delayed
+  packets and resets the GStreamer encoder for a later run.
 - **Prometheus**: `--prometheus` prints a text exposition at exit and a
   live summary every 5 s to stderr. There is no HTTP endpoint yet;
   the sink/HTTP layer owns that.

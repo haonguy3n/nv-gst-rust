@@ -35,4 +35,5 @@ fn orin_nx_profile_is_strict_hardware_h264() {
     let cfg = profile("orin-nx-yolo.toml");
     assert_eq!(cfg.zero_copy, ZeroCopyMode::Strict);
     assert!(cfg.encoder.hardware);
+    assert_eq!(cfg.pipeline.max_idle_ms, 5000);
 }

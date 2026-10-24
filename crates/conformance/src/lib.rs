@@ -336,9 +336,10 @@ pub fn check_preprocess_and_inference(
     for round in 0..2 {
         {
             let inputs = engine.input_bindings();
-            assert!(
-                !inputs.is_empty(),
-                "{}: engine exposes no input bindings",
+            assert_eq!(
+                inputs.len(),
+                1,
+                "{}: engine must expose exactly one input binding",
                 platform.name()
             );
             let input = &mut inputs[0];
@@ -371,11 +372,25 @@ pub fn check_preprocess_and_inference(
         engine
             .infer(&stream)
             .unwrap_or_else(|e| panic!("{}: infer round {round}: {e}", platform.name()));
+        let outputs = engine.output_bindings();
         assert!(
-            !engine.output_bindings().is_empty(),
+            !outputs.is_empty(),
             "{}: engine exposes no output bindings after infer",
             platform.name()
         );
+        for (i, output) in outputs.iter().enumerate() {
+            assert!(
+                !output.spec.shape.is_empty(),
+                "{}: output {i} has no static shape",
+                platform.name()
+            );
+            assert_eq!(
+                output.spec.dtype,
+                edge_core::DType::F32,
+                "{}: output {i} must be host-visible F32",
+                platform.name()
+            );
+        }
     }
     source
         .stop()

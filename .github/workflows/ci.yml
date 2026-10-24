@@ -23,6 +23,14 @@ jobs:
       # The feature combination the app actually ships with.
       - run: cargo clippy -p edge-vision --features jetson,onnx --all-targets -- -D warnings
       - run: cargo build -p edge-vision --features jetson,onnx
+      # `cpu-debug` must stay out of the shipped feature graph; the
+      # core crate also has a release-only compile_error guard.
+      - run: |
+          if cargo tree -p edge-vision --features jetson,onnx -e features | grep -q 'cpu-debug'; then
+            echo "error: cpu-debug is enabled in the shipped feature set" >&2
+            exit 1
+          fi
+      - run: cargo check -p edge-vision --release --features jetson,onnx
       # Committed end-to-end detector test (ONNX fixture -> YOLO
       # decoder -> NMS -> sink), replacing the manual runs (P2-16).
       - run: cargo test -p edge-vision --features onnx

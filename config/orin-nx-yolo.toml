@@ -43,3 +43,4 @@ metadata_only = false
 
 [pipeline]
 queue_depth = 2 # live source: 4 frames is 133 ms at 30 fps, over the latency budget before any work
+max_idle_ms = 5000 # no first frame within 5 s is a capture fault, not a quiet sensor

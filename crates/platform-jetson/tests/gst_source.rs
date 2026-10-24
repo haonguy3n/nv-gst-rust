@@ -66,7 +66,7 @@ fn pulls_ordered_frames_from_a_launch_string() {
         assert!(frame.meta().pts >= last_pts, "pts must be monotonic");
         assert_eq!(frame.meta().dmabuf_fd, frame.buf.dmabuf_fd());
         assert!(frame.buf.dmabuf_fd() >= 0);
-        assert_eq!(frame.buf.memory(), FrameMemory::DmaBuf);
+        assert_eq!(frame.buf.memory(), FrameMemory::Other("shm-copy"));
         last_pts = frame.meta().pts;
     }
     source.stop().expect("stop");
@@ -129,18 +129,16 @@ fn runtime_pipeline_error_surfaces_instead_of_timing_out_forever() {
         eprintln!("skipping: filesrc/decodebin not in this GStreamer install");
         return;
     }
-    let launch = "filesrc location=/nonexistent/definitely-missing.mp4 \
+    let launch = "filesrc name=source \
         ! decodebin ! videoconvert ! video/x-raw,format=NV12,width=64,height=64 \
         ! appsink name=frames max-buffers=2 drop=true sync=false";
-    let mut source = match GstLaunchSource::new(
-        launch,
-        cfg("file"),
-        FrameMemory::DmaBuf,
-        Layout::PitchLinear,
-    ) {
-        Ok(s) => s,
-        Err(_) => return, // failing at construction is also honest
-    };
+    let mut file_cfg = cfg("file");
+    file_cfg.path = Some("/nonexistent/definitely-missing.mp4".into());
+    let mut source =
+        match GstLaunchSource::new(launch, file_cfg, FrameMemory::DmaBuf, Layout::PitchLinear) {
+            Ok(s) => s,
+            Err(_) => return, // failing at construction is also honest
+        };
     // Either start() or a bounded number of polls must produce the error.
     if source.start().is_err() {
         return;

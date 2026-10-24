@@ -41,9 +41,10 @@ nvarguscamerasrc → NV12 NVMM → appsink
   (Main) and derives the GOP from `encoder.gop_frames`. Derive and pin
   `iframeinterval` as well when the GOP is long.
 - `appsink` is bounded and dropping (`max-buffers=2 drop=true`);
-  `appsrc` is bounded/blocking (`block=true max-buffers=2`), and the
-  encode `appsink` is bounded too (`max-buffers=8 drop=false`). Freshness
-  belongs in the Rust drop-oldest channel, where drops are counted.
+  `appsrc` is bounded and non-blocking (`block=false max-buffers=2`),
+  and the encode `appsink` is bounded too (`max-buffers=8 drop=false`).
+  Freshness belongs in the Rust drop-oldest channel, where drops are
+  counted; a stalled encoder must return an error, never hang.
 - The encode output is asynchronous. `GstEncoder::encode` pushes a
   frame and drains samples non-blockingly; delayed packets are collected
   on later calls and `Encoder::finish` sends EOS and flushes. The runner
@@ -143,17 +144,19 @@ any stage drops the frame early.
   change. The camera streams without inference until the plan is ready.
   `EngineState::Warming` exists for this; the runner pushes empty
   detections until the engine is ready.
-- The current runner still runs `pre → infer → post → overlay → encode`
-  in series on one thread. Splitting the video path
-  (capture → encode → sink) from a one-deep leaky inference side path
-  that joins detections by `seq`/`pts` is M1 work before the NVENC
-  stage. Make `Overlay` optional and off on Jetson.
+- The runner encodes on its own `encode-cam` thread now, behind a
+  leaky one-deep frame hand-off. Pre/infer/post/overlay still share the
+  processing thread; splitting inference from the video path entirely
+  (a one-deep leaky inference side path joining detections by
+  `seq`/`pts`) is M1 work before the NVENC stage. Make `Overlay`
+  optional and off on Jetson.
 
 ### IMX296 on Argus
 
 - AE swings brightness: cap gain at 16 (`gainrange="1 16"`) and/or pin
-  exposure. `SourceConfig` has `exposure_us`, `gain_min`, `gain_max`,
-  rendered into the capture string.
+  exposure. `SourceConfig` has `exposure_us`, `gain_min`, `gain_max`;
+  `GstLaunchSource::start` applies them to `camsrc` after the pipeline
+  reaches PLAYING, never in the launch string (Nano black-frame fix).
 - White balance from the vendor NITO does nothing yet. Expect a green
   cast until the NITO lands; pin the golden-set mAP gate to the tuned
   image, not the first boot.
@@ -288,18 +291,72 @@ on any PC.
 | **T2** | `NvmmSurface::from_gst`: check `map.size() == size_of::<NvBufSurface>()`; read fd/layout/pitch/planes; hold the mapping; replace the NVMM refusal; `FrameMeta.planes` from the surface | Not started; device: `gst-capture` logs fd/layout/pitch, `copied_frames == 0` over 300 frames, stable fd |
 | **T3** | `trt-sys` skeleton: logger, version, load, io_infos, context, enqueue, synchronize; exceptions → `Result` | Not started; device: load a `trtexec` FP16 plan and enqueue once |
 | **T4** | CUDA buffers: `host_alloc`/`bind`; `MappedTensor`; `CudaStream` | Not started |
-| **T5** | `TrtEngine`: bind every I/O tensor to mapped memory, batch 1, refuse non-float I/O, `infer` = enqueue + synchronize; outputs with real specs | Not started; device: FP32 within 1e-3 / FP16 within 1e-2 of ONNX Runtime, identical boxes |
-| **T6** | Plan cache (done) + shim `build_plan` (builder + `nvonnxparser`, FP16, progress) | Cache half **done** (`plan_cache.rs`, key includes SoC/L4T/CUDA/GPU); shim half waits for T3/T5. INT8 stays out of caps until calibration is in the key |
+| **T5** | `TrtEngine`: bind every I/O tensor to mapped memory, batch 1, refuse non-float I/O, `infer` = enqueue + synchronize; outputs with real specs | Builder-side binding checks **done** (one static F32 NCHW input, at least one static F32 output); engine stage not started. Device: FP32 within 1e-3 / FP16 within 1e-2 of ONNX Runtime, identical boxes |
+| **T6** | Plan cache (done) + shim `build_plan` (builder + `nvonnxparser`, FP16, progress) | Cache half **done** (`plan_cache.rs`; key includes SoC/L4T/CUDA/GPU; plans live under `<cache>/<model_id>/`; exclusive temp files). Shim half waits for T3/T5. INT8 stays out of caps until calibration is in the key |
 | **T7** | Engine-warm thread under a process-wide lock; `engine()` returns Warming until the plan exists | Waits for T5/T6 |
 | **T8** | VIC preprocessor: pooled pitch-linear RGBA surfaces, `NvBufSurfTransform` letterbox, CPU planar write | Waits for T2/T4 |
 | **T9** | CUDA preprocessor: `NvBufSurfaceMapEglImage`, `cuGraphicsEGLRegisterImage`, kernel into the input binding | Waits for T8; output equals T8 within 1e-6 |
 | **T10** | CUDA graph after the first good inference; GPU time from events; fall back to `enqueueV3` once on capture failure | Waits for T5 |
 | **T11** | Conformance on the board + Nsight/`tegrastats` zero-copy gate | Waits for T5–T8; M1 inference exit gate |
-| **T12** | Packaging proposal: OE recipe, `DEPENDS`, systemd `CacheDirectory`, video group, camera-guard grants | Proposal only; do not change the image unasked |
+| **T12** | Packaging: OE recipe, `DEPENDS`, systemd `CacheDirectory`, video group, camera-guard grants | Recipe `nv-gst-rust` written in camera-viber and built for NX and Nano ([yocto.md](yocto.md)); unit, `CacheDirectory`, grants still proposals; not in any image |
 
 **Order:** T0 first, then T1→T2 and T3→T4→T5 in parallel until T8 joins
 them. T6/T7 follow T5; T9/T10 are optimisations. The first board
 session runs T2 and T3 before investing in T6–T10.
+
+### Reference: gst-nvmm-cpp
+
+[gst-nvmm-cpp](https://github.com/PavelGuzenfeld/gst-nvmm-cpp) (read at
+commit `060a8c0`, 2026-10-24) has NVMM-native GStreamer elements in C++14
+without DeepStream: an NvBufSurface allocator, VIC convert/composite, and
+TensorRT inference on NVMM. It is validated on Xavier NX (JP5.1) and Orin
+NX (JP6.2, CUDA 12.5, TRT 10.3) only. Nothing covers JP7, CUDA 13 or TRT
+10.16, and it has no Argus source, so it gives no guidance on the capture
+pool. Where it and camera-viber disagree, camera-viber wins: it runs on
+JP7.
+
+**Licence: LGPL-2.1-or-later.** Reimplement the API call sequences below
+from NVIDIA's headers and camera-viber. Never copy its code into this
+MIT/Apache workspace: not `preprocess.cpp`, `gstnvmminfer.cpp`,
+`trt_engine.cpp`, `nvbufsurface_mock.h`, the allocator and pool, or its
+docs' wording.
+
+**Adopt (patterns):**
+
+| Task | What the reference does (file:line under `gst/`) | Take for us |
+| --- | --- | --- |
+| T8, T9 | It never maps the capture surface into CUDA. VIC converts NV12 into a private pitch-linear RGBA surface at network size (`nvmminfer/preprocess.cpp:12-52`). That surface is mapped once: `NvBufSurfaceMapEglImage`, `cudaGraphicsEGLRegisterImage`. camera-viber's `NvmmGpuTensorWriter` does the same on JP7. | VIC into our own scratch surface, mapped once at configure; never the capture buffer per frame |
+| T2 | Pitch, offset and psize come from `surfaceList[0].planeParams` (`nvmmalloc/gstnvmmbufferpool.cpp:112-121`). Real pitch differed from GstVideoInfo's stride on Xavier. Block-linear is only de-tiled by VIC; its bytes are never read. | `FrameMeta.planes` from `planeParams` with layout as a field; tight NV12 only in the host fake; refuse block-linear outside VIC |
+| T9 | It branches on the mapped EGL frame type: pitch (`pPitch[0]`) or array (`cudaMemcpy2DFromArrayAsync`) (`preprocess.cpp:98-110`). | Handle both frame types; the array case is unverified on JP7 |
+| T4, T5 | One CUDA stream per element and one `cudaStreamSynchronize` per frame, before the buffer returns to the pool (`nvmminfer/gstnvmminfer.cpp:145, 406`). No `SyncForDevice` on the GPU path. | One stream per camera; one sync per frame before the buffer guard drops; `SyncForDevice` only after a CPU write (camera-viber's letterbox fill) |
+| T8 | Letterbox in one VIC call with `CROP_DST` and a destination rectangle; the padding is filled once and VIC never overwrites it (`preprocess.cpp:73-88`). | The same. Set the VIC session params on **every** call: they are per thread (camera-viber `NvmmFramePreprocessor`). The reference calls them process-global and rarely sets them |
+| T8, T9 | Float/planar conversion with NPP `_Ctx` calls on the stream (`preprocess.cpp:119-141`). | Our own small CUDA kernel (camera-viber's `CudaTensorKernels` pattern): NPP would be one more `-sys` crate, and its CUDA 13 status is unknown |
+| T5 | It rejects anything but one input and one output, FP32 I/O, static NCHW 1x3xHxW. An output whose shape does not match is rejected, so the decoder cannot over-read (`gstnvmminfer.cpp:167-196`). | The same checks as builder errors and tests. FP16 plans: kFP16 builder flag only, I/O stays FP32 |
+| T11 | A header-only, calloc-backed NvBufSurface mock lets the same sources build on x86 (`common/nvbufsurface_mock.h`). Its pitch is tight and its transform a stub, so it missed the real-pitch bug. | A Rust trait fake of a narrow HAL (create, map, transform, sync), with deliberately padded pitch (e.g. rounded to 256) and a block-linear flag that scrambles bytes. One contract suite runs against the fake and the board |
+
+**Avoid:**
+
+- Its TensorRT lifecycle (T6, T7, T10): engines prebuilt by `trtexec`,
+  with no cache, no warm-up and no build lock. It also copies the outputs
+  to the host and synchronizes every frame, about 23 ms per frame at 1080p
+  on Orin (its B5 design doc, phase 1). Follow camera-viber's
+  `docs/INFERENCE-ENGINE.md` instead: the engine-warm thread, plan and
+  timing cache, mapped host memory, and a CUDA graph after warm-up.
+- Its `dla-core` property: a no-op for prebuilt engines, and DLA is no
+  option with TRT 10.16 on JP7 (camera-viber `docs/INFERENCE-ENGINE.md`).
+
+**Pitfalls it documents (check each on JP7):**
+
+- `numFilled` is 0 after `NvBufSurfaceCreate`; Map and Transform then
+  reject index 0. Set it after every create (T1, T8).
+- `NvBufSurfaceCopy` does not de-tile block-linear; use
+  `NvBufSurfTransform`.
+- `NvBufSurfTransform` rejects some CUDA-memory destinations; use a
+  surface-array (`NVBUF_MEM_DEFAULT`) RGBA destination.
+- A resolution change needs the pool drained before it is recreated.
+- `tee` or `make_writable` on an NVMM buffer whose memory is no-share
+  copies it or fails. This touches the encoder hand-off (E5 below).
+- A frame whose inference was skipped must carry no stale detections.
 
 ## Safety rules for FFI
 
@@ -368,3 +425,64 @@ Still device-gated:
 | X3 DLA | Deferred; reserve the builder flag and `model.device` hook |
 | X4 two cameras | Blocked on the cam1 Argus timeout |
 | Nano measurement | Record `tegrastats`, process CPU, `edge_encode_dropped_total` and the x264 `threads=3` setting alongside the H.264 stream once the NVMM/VIC stages run on the board |
+
+## Findings from the 2026-10-24 reviews (rules and encoder)
+
+Two reviews after the N/X pass. The rules review checked the workspace
+against camera-viber's frame-path, inference-engine and embedded rules
+and this repo's zero-copy contract. The encoder review covers commit
+`489c4503` (the Nano CPU H.264 stage). Items the table above already
+tracks are not repeated.
+
+**Rules review: what follows the rules.** No CPU pixel path on the Jetson
+route; the only copy out of NVMM is the CPU-encoder branch. Caps are
+`memory:NVMM,NV12`, and a frame holds its `gst::Buffer` until the encoder
+releases it. The plan cache key and integrity check are complete for
+what exists. No `unsafe` anywhere; `#![forbid(unsafe_code)]` in every
+crate but platform-sim. State changes run on the capture thread. Vendor
+libraries stay in `platform-*`. Not yet written, so not reviewed: T2–T10.
+
+### Encoder stage (commit `489c4503`)
+
+| ID | Severity | Where | Finding | Fix |
+| --- | --- | --- | --- | --- |
+| E1 | blocker | `gst_encoder.rs` (bus never read), `launch.rs` `encode_launch` (`block=true max-buffers=2`) | When any element after the `appsrc` fails (caps not negotiating, likely on the first NVMM run), `push_buffer` queues two buffers and then blocks forever. Reproduced on the PC: three pushes OK, the fourth still blocked after 3 s, bus "Internal data stream error". The encoder thread hangs inside `encode()`, `encoder_failed` is never set, video stops silently, two NVMM buffers are held, and teardown's `join` hangs on SIGTERM. `finish()` waits 5 s and returns `Ok` on the same error. | Pop bus errors after each push and in `finish`; never block unbounded (`block=false` and count a full queue as a drop, or set the pipeline to `Null` from the stop path); add a test with `new_with_launch` and a downstream caps mismatch that must fail and join in bounded time |
+| E2 | major | `gst_encoder.rs` `finish` | After EOS the pipeline, `appsrc` and `appsink` stay set; a second `run()` pushes into an ended `appsrc` and fails with `Eos`, although the runner hands the encoder back "so the pipeline can run again". | End `finish` with `set_state(Null)` and clear the three fields; test two runs |
+| E3 | minor | `pipeline/src/lib.rs` (encoder thread) | `encode_total` now times `push_buffer` plus a non-blocking drain, not x264's work; on the Nano it will look tiny. | Rename (`encode_push`) or measure from appsink timestamps |
+| E4 | minor | `gst_encoder.rs` `drain` | Packets are drained only after a push; when the hand-off drops frames, finished packets wait for the next frame. | Also drain (non-blocking) in the `recv_timeout` `None` branch |
+| E5 | unverified (device) | `gst_encoder.rs` `encode` | The `appsrc` gets a second ref of the capture buffer; base source marks the first buffer DISCONT, which makes it writable, so it is copied. With no-share NVMM memory that is a deep copy or a failure (the gst-nvmm-cpp `tee` pitfall). | Log the memory flags and whether the first pushed buffer was copied on the first Nano run |
+| E6 | unverified (device) | encoder path | Up to four more capture buffers in flight (hand-off 1, `appsrc` queue 2, `nvvidconv` 1) on top of the capture and processing queues. | Count it in N11's budget against the Argus pool |
+| E7 | minor | `platform-jetson/src/lib.rs` `caps` | The `cpu_encode` comment says "only when the image actually has x264's GStreamer element"; the code is `cfg!(feature = "gst")` and the element check is in `encoder()`. | Fix the comment |
+| E8 | minor | `launch.rs`, `gst_encoder.rs` `required_elements` | The CPU H.265 launch string and the x265 row are unreachable now that `encoder()` refuses software H.265. | Remove, or mark as unused |
+
+Resolved by the same commit: video no longer stops silently when the
+encoder *returns* an error (the `encoder_failed` flag and the disconnected
+packet channel stop the run); E1 is the case where it hangs instead.
+
+### Rules review
+
+| ID | Severity | Where | Finding | Fix |
+| --- | --- | --- | --- | --- |
+| R1 | minor | `launch.rs` `capture_launch` (`exposuretimerange`, `gainrange`) | A profile that sets the ranges still writes them into the launch string at start, which gave black frames on the Nano; the Nano profile omits them, but the code allows it. | Set them on `camsrc` after PLAYING, as this doc's IMX296 section says |
+| R2 | minor | `plan_cache.rs` `prune_except` | Deletes every other `.plan` in the directory; two models or cameras evict each other's plans and rebuild for minutes. | Prune only plans of the same model (key prefix) |
+| R3 | minor | `plan_cache.rs` (temp file) | `.{key}.tmp-{pid}` opened with `truncate(true)`, not `create_new`; two builders in one process clash. | `create_new`, plus T7's lock |
+| R4 | minor | `pipeline/src/lib.rs` `check_input_spec` | Accepts F16 input, but no F16 writer exists and the mapped-host path is F32. | Accept F32 only until an F16 writer exists (T5) |
+| R5 | minor | `gst_source.rs` `GstFrameBuffer::Copied::memory()` | A CPU copy reports `DmaBuf`, claiming the zero-copy domain. Harmless on the Jetson. | Report an honest memory tag |
+| R6 | minor | `crates/core/Cargo.toml` `cpu-debug` | Nothing enforces "never in release"; feature unification could enable it for the shipped app through a dependency. | CI: `cargo tree -e features -p edge-vision` must not show `cpu-debug` |
+| R7 | minor | `launch.rs` `file_capture_launch` | `location=` is unquoted; a path with a space or `!` breaks or injects elements. | Set the property instead of formatting it |
+| R8 | minor | `config/orin-nx-yolo.toml` | No `max_idle_ms` (the Nano profile has 5000); a sensor that never delivers a first frame is caught only by the default. | Set it in the NX profile too |
+| R9 | minor | `tools/build-engine.sh` | Leaves `$engine.tmp` behind when `trtexec` fails under `set -e`. | `trap` to remove it |
+| R10 | minor | `apps/edge-vision/src/main.rs` | The unknown-platform error says "known: sim", though `jetson` exists. | List both |
+
+**Resolved in this pass:** R1–R10, E2, E4 and E7. R1 (ranges after
+PLAYING), R2/R3 (per-model cache namespaces and `create_new` temp),
+R4 (F32-only input), R5 (`Copied` reports `shm-copy`), R6 (release
+compile guard + CI feature check), R7 (file path set as a property),
+R8 (NX `max_idle_ms`), R9 (engine temp cleanup) and R10 (error text).
+E2 (encoder reusable after `finish`), E4 (idle packet drain) and E7
+(caps comment) are fixed; the encoder now also polls the GStreamer bus
+for errors. E8 is left as an unreachable-but-documented branch; E1's unbounded push is removed (non-blocking appsrc plus bus polling;
+the caps-mismatch test is bounded), but whether every negotiation
+failure becomes a hard error remains to verify on device, so E1 stays
+listed. E3, E5, E6 and the device findings remain open. The T5 binding checks (one static F32 NCHW input,
+static F32 outputs) are in the builder and conformance suite.

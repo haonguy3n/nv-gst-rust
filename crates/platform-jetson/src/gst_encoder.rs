@@ -153,6 +153,11 @@ impl GstEncoder {
             .by_name("enc")
             .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
             .ok_or_else(|| Error::Platform("encoder launch string has no appsink `enc`".into()))?;
+        // Defence in depth: even a hand-written launch string must
+        // never make push_buffer block forever (E1). A full queue is a
+        // surfaced FlowError, not a hung encoder thread.
+        appsrc.set_property("block", false);
+        appsrc.set_property("max-buffers", 2u64);
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| Error::Platform(format!("starting encoder pipeline: {e}")))?;
@@ -182,7 +187,32 @@ impl GstEncoder {
         Ok(())
     }
 
+    /// Surface a pipeline error from the bus. Without this, a caps
+    /// negotiation failure only shows up as a stalled appsrc.
+    fn poll_bus(&self) -> Result<()> {
+        let Some(pipeline) = &self.pipeline else {
+            return Ok(());
+        };
+        let Some(bus) = pipeline.bus() else {
+            return Ok(());
+        };
+        while let Some(msg) =
+            bus.timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error])
+        {
+            if let gst::MessageView::Error(e) = msg.view() {
+                return Err(Error::Platform(format!(
+                    "encoder pipeline error from {:?}: {} ({:?})",
+                    msg.src().map(|s| s.path_string()),
+                    e.error(),
+                    e.debug()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn drain(&mut self, out: &mut dyn FnMut(EncodedPacket), blocking: bool) -> Result<()> {
+        self.poll_bus()?;
         let timeout = if blocking {
             gst::ClockTime::from_mseconds(200)
         } else {
@@ -227,6 +257,13 @@ impl Encoder for GstEncoder {
         self.drain(out, false)
     }
 
+    fn poll(&mut self, out: &mut dyn FnMut(EncodedPacket)) -> Result<()> {
+        if self.pipeline.is_none() {
+            return Ok(());
+        }
+        self.drain(out, false)
+    }
+
     fn finish(&mut self, out: &mut dyn FnMut(EncodedPacket)) -> Result<()> {
         if self.pipeline.is_none() {
             return Ok(());
@@ -239,11 +276,19 @@ impl Encoder for GstEncoder {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             self.drain(out, true)?;
+            self.poll_bus()?;
             if self.appsink.as_ref().is_some_and(|s| s.is_eos()) {
                 break;
             }
         }
         self.drain(out, false)?;
+        // Leave the encoder reusable: the runner hands it back so the
+        // pipeline can run again. An ended appsrc cannot be pushed to.
+        if let Some(pipeline) = self.pipeline.take() {
+            let _ = pipeline.set_state(gst::State::Null);
+        }
+        self.appsrc = None;
+        self.appsink = None;
         Ok(())
     }
 }

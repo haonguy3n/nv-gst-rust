@@ -112,3 +112,71 @@ fn cpu_x264_encoder_emits_h264_packets() {
         "byte-stream output must carry an Annex-B start code"
     );
 }
+
+/// E2: the runner hands the encoder back after `finish` so a second
+/// `run()` can use it. An ended appsrc cannot be pushed to, so finish
+/// must tear the pipeline down.
+#[test]
+fn cpu_encoder_can_be_reused_after_finish() {
+    if !software_h264_available() {
+        eprintln!("skipping: x264enc is not installed here");
+        return;
+    }
+    let cfg = EncoderConfig {
+        enabled: true,
+        codec: Codec::H264,
+        hardware: false,
+        bitrate_kbps: 500,
+        gop_frames: 5,
+    };
+    let mut encoder = GstEncoder::new_with_launch(EncoderKind::Cpu, &cfg, W, H, test_launch())
+        .expect("build CPU encoder");
+    for round in 0..2 {
+        let mut packets = Vec::new();
+        for seq in 0..5 {
+            encoder
+                .encode(frame(seq), &mut |pkt| packets.push(pkt))
+                .unwrap_or_else(|e| panic!("round {round} encode: {e}"));
+        }
+        encoder
+            .finish(&mut |pkt| packets.push(pkt))
+            .unwrap_or_else(|e| panic!("round {round} finish: {e}"));
+        assert!(!packets.is_empty(), "round {round} emitted no packets");
+    }
+}
+
+/// E1: a downstream caps mismatch must not block the encoder thread
+/// forever. The appsrc is non-blocking and the encoder polls the bus;
+/// this test pins the bounded push path (a hard error is not required:
+/// a stalled pipeline may report no packets, but it must not hang).
+#[test]
+fn downstream_caps_mismatch_does_not_block_forever() {
+    if !software_h264_available() {
+        eprintln!("skipping: x264enc is not installed here");
+        return;
+    }
+    let cfg = EncoderConfig {
+        enabled: true,
+        codec: Codec::H264,
+        hardware: false,
+        bitrate_kbps: 500,
+        gop_frames: 5,
+    };
+    let launch = "appsrc name=framesrc is-live=true format=time block=false max-buffers=2 \
+         caps=video/x-raw,format=NV12,width=64,height=64,framerate=30/1 \
+         ! video/x-raw,format=I420 \
+         ! x264enc tune=zerolatency speed-preset=ultrafast \
+         ! h264parse config-interval=-1 \
+         ! video/x-h264,stream-format=byte-stream,alignment=au \
+         ! appsink name=enc max-buffers=8 drop=false sync=false";
+    let mut encoder =
+        GstEncoder::new_with_launch(EncoderKind::Cpu, &cfg, W, H, launch).expect("build encoder");
+    let started = std::time::Instant::now();
+    for seq in 0..10 {
+        let _ = encoder.encode(frame(seq), &mut |_| {});
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "push path blocked on a caps mismatch"
+        );
+    }
+}

@@ -28,6 +28,12 @@ pub enum Error {
     #[error("platform error: {0}")]
     Platform(String),
 
+    /// A stage's worker has exited (for example the encoder thread
+    /// after a fatal encoder error). The run must stop: inference and
+    /// metadata without their consumer are not a healthy pipeline.
+    #[error("stage `{stage}` is gone; the pipeline stopped")]
+    StageGone { stage: &'static str },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

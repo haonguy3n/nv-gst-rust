@@ -148,6 +148,9 @@ if [ -f "$engine" ]; then
 fi
 
 echo "build-engine: building $engine (this runs on-device and can take minutes)" >&2
+# A failed trtexec must not leave a partial plan behind for the next
+# cache check to trip over.
+trap 'rm -f "$engine.tmp"' EXIT
 build_args=(--onnx="$model" --saveEngine="$engine.tmp")
 [ "$has_precision" -eq 1 ] || build_args+=(--fp16)
 # On Orin, workspace is system RAM. The C++ product uses 256 MiB;

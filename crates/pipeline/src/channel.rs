@@ -57,9 +57,15 @@ pub struct Sender<T> {
 }
 
 impl<T> Sender<T> {
-    /// Never blocks. Drops (and returns) the oldest queued item when full.
-    pub fn send(&self, item: T) -> Option<T> {
+    /// Never blocks. Drops (and returns) the oldest queued item when
+    /// full. `Err(item)` means the receiver is gone: a consumer has
+    /// died, and the caller must stop instead of dropping the frame
+    /// silently.
+    pub fn send(&self, item: T) -> std::result::Result<Option<T>, T> {
         let mut state = self.shared.state.lock().expect("channel mutex poisoned");
+        if state.closed {
+            return Err(item);
+        }
         let evicted = if state.queue.len() >= self.shared.capacity {
             self.shared.dropped.fetch_add(1, Ordering::Relaxed);
             state.queue.pop_front()
@@ -74,7 +80,7 @@ impl<T> Sender<T> {
             .store(state.queue.len() as u64, Ordering::Relaxed);
         drop(state);
         self.shared.available.notify_one();
-        evicted
+        Ok(evicted)
     }
 }
 
@@ -90,6 +96,16 @@ impl<T> Drop for Sender<T> {
 
 pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.closed = true;
+            drop(state);
+            self.shared.available.notify_all();
+        }
+    }
 }
 
 impl<T> Receiver<T> {
@@ -163,12 +179,19 @@ mod tests {
     #[test]
     fn drop_oldest_returns_evicted_and_counts() {
         let (tx, rx, dropped) = channel::<u32>(2);
-        assert_eq!(tx.send(1), None);
-        assert_eq!(tx.send(2), None);
-        assert_eq!(tx.send(3), Some(1));
+        assert!(tx.send(1).unwrap().is_none());
+        assert!(tx.send(2).unwrap().is_none());
+        assert_eq!(tx.send(3).unwrap(), Some(1));
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(rx.recv_timeout(Duration::ZERO), Some(2));
         assert_eq!(rx.recv_timeout(Duration::ZERO), Some(3));
+    }
+
+    #[test]
+    fn send_fails_when_the_receiver_is_gone() {
+        let (tx, rx, _dropped) = channel::<u32>(2);
+        drop(rx);
+        assert_eq!(tx.send(7).unwrap_err(), 7);
     }
 
     #[test]
@@ -176,16 +199,16 @@ mod tests {
         let (tx, rx, _dropped) = channel::<u32>(3);
         let depth = rx.depth_handle();
         assert_eq!(depth.load(Ordering::Relaxed), 0);
-        tx.send(1);
-        tx.send(2);
+        assert!(tx.send(1).unwrap().is_none());
+        assert!(tx.send(2).unwrap().is_none());
         assert_eq!(depth.load(Ordering::Relaxed), 2);
         assert_eq!(rx.recv_timeout(Duration::ZERO), Some(1));
         assert_eq!(depth.load(Ordering::Relaxed), 1);
         // Drop-oldest keeps depth at capacity, not capacity + 1.
-        tx.send(3);
-        tx.send(4);
+        assert!(tx.send(3).unwrap().is_none());
+        assert!(tx.send(4).unwrap().is_none());
         assert_eq!(depth.load(Ordering::Relaxed), 3);
-        tx.send(5);
+        assert_eq!(tx.send(5).unwrap(), Some(2));
         assert_eq!(depth.load(Ordering::Relaxed), 3);
     }
 }

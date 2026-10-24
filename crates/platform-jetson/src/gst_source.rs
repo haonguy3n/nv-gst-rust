@@ -14,7 +14,7 @@
 
 use edge_core::{
     Error, FrameMemory, FrameMeta, FramePoll, FrameSource, HwBuffer, HwFrame, Layout, PixelFormat,
-    Result, SourceConfig, TimeoutReason,
+    PlaneLayout, Result, SourceConfig, TimeoutReason,
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -69,7 +69,9 @@ impl HwBuffer for GstFrameBuffer {
     fn memory(&self) -> FrameMemory {
         match self {
             Self::DmaBuf { memory, .. } => *memory,
-            Self::Copied { .. } => FrameMemory::DmaBuf,
+            // Honest tag: this is a CPU copy into shm, not a dmabuf
+            // and not zero-copy. It exists only for dev-PC pipelines.
+            Self::Copied { .. } => FrameMemory::Other("shm-copy"),
         }
     }
 
@@ -147,6 +149,16 @@ impl GstLaunchSource {
             .by_name("frames")
             .and_then(|el| el.downcast::<gst_app::AppSink>().ok())
             .ok_or_else(|| Error::Platform("launch string has no appsink named `frames`".into()))?;
+        if cfg.kind == "file" {
+            let path = cfg
+                .path
+                .as_ref()
+                .ok_or_else(|| Error::invalid("source.path", "required for file source"))?;
+            let filesrc = pipeline.by_name("source").ok_or_else(|| {
+                Error::Platform("file launch string has no filesrc named `source`".into())
+            })?;
+            filesrc.set_property("location", path.to_string_lossy().as_ref());
+        }
         let pool = if memory == FrameMemory::Nvmm {
             None
         } else {
@@ -287,12 +299,57 @@ impl GstLaunchSource {
     }
 }
 
+impl GstLaunchSource {
+    /// Apply exposure/gain to `nvarguscamerasrc` after the pipeline is
+    /// PLAYING. The launch string never carries these ranges (Nano
+    /// black-frame regression); a missing property is a configuration
+    /// error, not something to ignore.
+    fn apply_sensor_ranges(&self) -> Result<()> {
+        if self.cfg.kind != "argus" {
+            return Ok(());
+        }
+        let Some(camsrc) = self.pipeline.by_name("camsrc") else {
+            return Ok(());
+        };
+        let set = |name: &str, value: String| -> Result<()> {
+            if camsrc.find_property(name).is_none() {
+                return Err(Error::Platform(format!(
+                    "capture element does not expose `{name}`"
+                )));
+            }
+            camsrc.set_property_from_str(name, &value);
+            Ok(())
+        };
+        if let Some(us) = self.cfg.exposure_us {
+            let ns = u64::from(us) * 1000;
+            set("exposuretimerange", format!("{ns} {ns}"))?;
+        }
+        if self.cfg.gain_min.is_some() || self.cfg.gain_max.is_some() {
+            set(
+                "gainrange",
+                format!(
+                    "{:.1} {:.1}",
+                    self.cfg.gain_min.unwrap_or(1.0),
+                    self.cfg.gain_max.unwrap_or(16.0)
+                ),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 impl FrameSource for GstLaunchSource {
     fn start(&mut self) -> Result<()> {
         self.pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| Error::Platform(format!("starting capture pipeline: {e}")))?;
-        Ok(())
+        // Wait for PLAYING before touching the sensor properties: on
+        // the Nano, ranges set at parse time produced black frames.
+        self.pipeline
+            .state(gst::ClockTime::from_seconds(5))
+            .0
+            .map_err(|e| Error::Platform(format!("waiting for capture PLAYING: {e}")))?;
+        self.apply_sensor_ranges()
     }
 
     fn next_frame(&mut self, timeout: Duration) -> Result<FramePoll> {
@@ -343,7 +400,14 @@ impl FrameSource for GstLaunchSource {
             height: self.cfg.height,
             format: PixelFormat::Nv12,
             layout: self.layout,
-            planes: PixelFormat::Nv12.plane_layout(self.cfg.width, self.cfg.height),
+            // T2 fills this from NvBufSurface planeParams. Until then
+            // a block-linear surface must not claim a tight pitch:
+            // only the pitch-linear host fallback has a real layout.
+            planes: if self.layout == Layout::BlockLinear {
+                PlaneLayout::default()
+            } else {
+                PixelFormat::Nv12.plane_layout(self.cfg.width, self.cfg.height)
+            },
             camera_id: self.cfg.camera_id,
             dmabuf_fd: buf.dmabuf_fd(),
         };
@@ -376,5 +440,54 @@ impl FrameSource for GstLaunchSource {
 impl Drop for GstLaunchSource {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_cfg(path: PathBuf) -> SourceConfig {
+        SourceConfig {
+            kind: "file".into(),
+            path: Some(path),
+            camera_id: 0,
+            width: 64,
+            height: 64,
+            fps: 30,
+            exposure_us: None,
+            gain_min: None,
+            gain_max: None,
+            paced: true,
+            pool_size: 2,
+            frames: None,
+        }
+    }
+
+    /// R7: a path with spaces or `!` must be a property value, never
+    /// syntax in the launch string.
+    #[test]
+    fn file_source_sets_location_as_a_property() {
+        gst::init().expect("gst init");
+        if gst::ElementFactory::find("filesrc").is_none()
+            || gst::ElementFactory::find("decodebin").is_none()
+        {
+            eprintln!("skipping: filesrc/decodebin not available");
+            return;
+        }
+        let path = PathBuf::from("/tmp/clip with a space !.mp4");
+        let launch = "filesrc name=source ! decodebin ! videoconvert \
+            ! video/x-raw,format=NV12,width=64,height=64 \
+            ! appsink name=frames max-buffers=2 drop=true";
+        let source = GstLaunchSource::new(
+            launch,
+            file_cfg(path.clone()),
+            FrameMemory::DmaBuf,
+            Layout::PitchLinear,
+        )
+        .expect("parse launch");
+        let filesrc = source.pipeline.by_name("source").expect("named filesrc");
+        let location: String = filesrc.property("location");
+        assert_eq!(location, path.to_string_lossy());
     }
 }

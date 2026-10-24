@@ -95,9 +95,10 @@ impl Platform for JetsonPlatform {
             precisions: vec![Precision::Fp32, Precision::Fp16],
             devices: vec!["gpu".into()],
             has_hw_encoder: self.engines.nvenc,
-            // The CPU stage exists now, but only when the image
-            // actually has x264's GStreamer element. A strict profile
-            // still refuses it in the builder.
+            // The CPU stage is compiled in; element presence is
+            // checked in `encoder()`, so a missing x264 names its
+            // package instead of being hidden by caps. A strict
+            // profile still refuses it in the builder.
             cpu_encode: cpu_encode_available(),
         }
     }
@@ -108,11 +109,10 @@ impl Platform for JetsonPlatform {
             let launch = match cfg.kind.as_str() {
                 "argus" => launch::capture_launch(cfg),
                 "file" => {
-                    let path = cfg
-                        .path
-                        .as_deref()
-                        .ok_or_else(|| Error::invalid("source.path", "required for file source"))?;
-                    launch::file_capture_launch(cfg, &path.to_string_lossy())
+                    if cfg.path.is_none() {
+                        return Err(Error::invalid("source.path", "required for file source"));
+                    }
+                    launch::file_capture_launch(cfg)
                 }
                 other => {
                     return Err(Error::Unsupported(format!(

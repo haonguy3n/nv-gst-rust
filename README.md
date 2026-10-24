@@ -21,7 +21,7 @@ Everything below runs and is tested on x86:
   pitch, rows), declared memory domain/layout, and the stage traits.
 - TOML config with typed validation and `deny_unknown_fields`; the
   builder validates capabilities, precision/device, encoder choice and
-  the engine's input shape/dtype.
+  the engine's bindings (one static F32 NCHW input, static F32 outputs).
 - Runner: capture + processing (+ dedicated encoder) threads, bounded
   drop-oldest queues, explicit `FramePoll` timeout reasons, stop handle,
   idle limit, partial metrics on errors, live counters.
