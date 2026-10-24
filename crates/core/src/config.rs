@@ -265,8 +265,6 @@ pub struct StreamConfig {
     /// per frame). Useful for metadata-only profiles and debugging.
     #[serde(default)]
     pub meta_file: Option<PathBuf>,
-    #[serde(default = "default_rtsp_port")]
-    pub rtsp_port: u16,
 }
 
 impl Default for StreamConfig {
@@ -274,13 +272,8 @@ impl Default for StreamConfig {
         Self {
             metadata_only: true,
             meta_file: None,
-            rtsp_port: default_rtsp_port(),
         }
     }
-}
-
-fn default_rtsp_port() -> u16 {
-    8554
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

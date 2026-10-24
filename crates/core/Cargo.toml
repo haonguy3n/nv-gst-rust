@@ -8,7 +8,7 @@ description = "Platform-agnostic traits, frame/tensor handles and config for the
 
 [features]
 # Enables HwBuffer::map_cpu. Never enable in release product builds:
-# code that needs CPU pixels must not compile there (see design.md).
+# code that needs CPU pixels must not compile there (see docs/design.md).
 cpu-debug = []
 
 [dependencies]

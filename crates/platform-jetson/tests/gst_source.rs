@@ -157,3 +157,42 @@ fn runtime_pipeline_error_surfaces_instead_of_timing_out_forever() {
     }
     panic!("dead pipeline looped as Timeout without surfacing its bus error");
 }
+
+/// N8: from an Argus source, EOS is a capture fault, never a clean
+/// end of stream. A clean EOS used to make `run()` return `Ok(())`
+/// and the app exit 0, so systemd never restarted a dead camera.
+#[test]
+fn argus_eos_is_reported_as_a_capture_fault() {
+    if !element_exists("videotestsrc") || !element_exists("videoconvert") {
+        eprintln!("skipping: test-pattern elements not in this GStreamer install");
+        return;
+    }
+    let launch = "videotestsrc num-buffers=2 is-live=false \
+        ! videoconvert ! video/x-raw,format=NV12,width=64,height=64,framerate=30/1 \
+        ! appsink name=frames max-buffers=2 drop=true sync=false";
+    let mut source = GstLaunchSource::new(
+        launch,
+        cfg("argus"),
+        FrameMemory::DmaBuf,
+        Layout::PitchLinear,
+    )
+    .expect("build gst source");
+    source.start().expect("start");
+    for _ in 0..20 {
+        match source.next_frame(Duration::from_millis(200)) {
+            Err(e) => {
+                let text = e.to_string();
+                assert!(
+                    text.contains("Argus") && text.contains("fault"),
+                    "Argus EOS must be a named fault: {text}"
+                );
+                return;
+            }
+            Ok(FramePoll::Frame(_)) | Ok(FramePoll::Timeout(_)) => {}
+            Ok(FramePoll::EndOfStream) => {
+                panic!("Argus EOS must not be reported as clean EndOfStream")
+            }
+        }
+    }
+    panic!("finite Argus pipeline never surfaced EOS");
+}

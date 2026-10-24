@@ -67,15 +67,16 @@ fn check_input_spec(spec: Option<&TensorSpec>, model: &ModelConfig) -> Result<()
             got: format!("{:?}", spec.shape),
         });
     }
-    let expected_dtype = match model.precision {
-        edge_core::Precision::Fp32 => edge_core::DType::F32,
-        edge_core::Precision::Fp16 => edge_core::DType::F16,
-        edge_core::Precision::Int8 => edge_core::DType::I8,
-    };
-    if spec.dtype != expected_dtype {
+    // `model.precision` is a builder choice for layer execution, not
+    // the dtype of the I/O bindings: a TensorRT plan built with FP16
+    // (or INT8) still exposes FP32 input/output tensors, which is what
+    // the mapped-host design reads and writes. The engine's own spec is
+    // authoritative; only reject a non-float input that no
+    // preprocessor in this workspace can write.
+    if !matches!(spec.dtype, edge_core::DType::F32 | edge_core::DType::F16) {
         return Err(Error::DomainMismatch {
             stage: "engine",
-            expected: format!("input dtype {expected_dtype:?}"),
+            expected: "float input binding (F32 or F16)".into(),
             got: format!("{:?}", spec.dtype),
         });
     }
@@ -272,19 +273,33 @@ impl Pipeline {
 
     /// The per-frame buffer budget, printed at startup so a hidden
     /// extra buffer is visible in the log, not just in a trace.
+    /// Plane lines use the tight geometry implied by the config until
+    /// a backend can report its real surface pitch (the NVMM branch
+    /// fills this from `NvBufSurface` params on device).
     pub fn buffer_budget(&self) -> String {
         let s = &self.config.source;
         let m = &self.config.model;
-        let capture = PixelFormat::Nv12.frame_bytes(s.width, s.height);
+        let planes = PixelFormat::Nv12.plane_layout(s.width, s.height);
+        let capture = planes.byte_len();
         let (dtype, input) = match &self.input_spec {
             Some(spec) => (format!("{:?}", spec.dtype), spec.byte_len()),
             None => (
-                "FP16 (assumed)".to_string(),
-                (m.input_width as usize) * (m.input_height as usize) * 3 * 2,
+                "unknown (engine warming)".to_string(),
+                // Mapped-host bindings are F32 in the T5 design; this
+                // is only the startup estimate until the engine reports
+                // its real spec.
+                (m.input_width as usize) * (m.input_height as usize) * 3 * 4,
             ),
         };
+        let mut plane_lines = String::new();
+        for (i, p) in planes.planes().enumerate() {
+            plane_lines.push_str(&format!(
+                "\n    plane {i}: offset {} pitch {} row {} rows {}",
+                p.offset, p.pitch, p.row_bytes, p.rows
+            ));
+        }
         format!(
-            "buffer budget:\n  capture NV12 {}x{} {}: {} bytes x pool {}\n  \
+            "buffer budget:\n  capture NV12 {}x{} {}: {} bytes x pool {}{plane_lines}\n  \
              input tensor {} 3x{}x{}: {} bytes (engine binding, written once)\n  \
              output tensors: host-visible, read in place\n  \
              mode: {}",
@@ -322,12 +337,17 @@ impl Pipeline {
         // flag instead.
         let shutdown = Arc::new(AtomicBool::new(false));
         self.live_metrics.reset();
-        let mut metrics = PipelineMetrics::default();
+        let mut metrics = PipelineMetrics {
+            latency: self.live_metrics.latency_handle(),
+            ..Default::default()
+        };
         let limit = max_frames.or(self.config.source.frames);
         let max_idle = Duration::from_millis(self.config.pipeline.max_idle_ms);
 
         let (tx, rx, dropped) = channel::channel::<HwFrame>(self.config.pipeline.queue_depth);
         self.live_metrics.attach_dropped(Arc::clone(&dropped));
+        let queue_depth = rx.depth_handle();
+        self.live_metrics.attach_depth(Arc::clone(&queue_depth));
         let capture_stop = Arc::clone(&self.stop);
         let capture_shutdown = Arc::clone(&shutdown);
         let capture_live = Arc::clone(&self.live_metrics);
@@ -401,6 +421,9 @@ impl Pipeline {
         // joining, so an unbounded source cannot block shutdown.
         shutdown.store(true, Ordering::Relaxed);
         drop(rx);
+        // The receiver is gone: nothing is queued any more. Keep the
+        // peak for the report, reset the current gauge.
+        queue_depth.store(0, Ordering::Relaxed);
         let capture_result = match capture.join() {
             Ok((source, (captured, timeouts), result)) => {
                 // Restore the source before inspecting any result:
@@ -419,6 +442,9 @@ impl Pipeline {
             .set_capture(metrics.frames_captured, metrics.capture_timeouts);
         self.live_metrics
             .sync_processing(&metrics, metrics.frames_dropped);
+        let final_snapshot = self.live_metrics.snapshot();
+        metrics.queue_depth = final_snapshot.queue_depth;
+        metrics.queue_depth_max = final_snapshot.queue_depth_max;
 
         // Flush sinks on every path; an earlier error still wins.
         let finish_result = self.sink.finish();
@@ -452,6 +478,9 @@ impl Pipeline {
         detections: &mut Detections,
         metrics: &mut PipelineMetrics,
     ) -> Result<()> {
+        // Taken before the encoder consumes the frame: the age
+        // covers queueing plus every stage and the sink call.
+        let received_at = frame.received_at();
         self.poll_engine()?;
         match &mut self.engine {
             EngineSlot::Ready(engine) => {
@@ -511,6 +540,7 @@ impl Pipeline {
         metrics.encode_total += t.elapsed();
 
         self.sink.push_meta(detections)?;
+        metrics.latency.record(received_at.elapsed());
         metrics.frames_processed += 1;
         Ok(())
     }

@@ -45,8 +45,7 @@ fn make_pool(pool_size: usize, frame_bytes: usize) -> Result<FilePool> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .open(&path)?;
         let _ = std::fs::remove_file(&path);
         file.set_len(frame_bytes as u64)?;
@@ -119,8 +118,17 @@ pub struct GstLaunchSource {
     memory: FrameMemory,
     layout: Layout,
     seq: u64,
-    pool: FilePool,
+    /// PC-only fallback pool. `None` for an NVMM source: on the
+    /// device the copy fallback must never run, so creating ~19 MB of
+    /// `/dev/shm` files at startup would only waste RAM and can fail
+    /// under the sandbox.
+    pool: Option<FilePool>,
     copied_frames: Arc<AtomicU64>,
+    /// An Argus camera's EOS is ambiguous: the sensor may have
+    /// failed, or `nvargus-daemon` may have lost the session. Treat it
+    /// as a fault so systemd restarts the process, never as a clean
+    /// end of stream (which exits 0 and recovers nothing).
+    argus: bool,
 }
 
 impl GstLaunchSource {
@@ -139,10 +147,15 @@ impl GstLaunchSource {
             .by_name("frames")
             .and_then(|el| el.downcast::<gst_app::AppSink>().ok())
             .ok_or_else(|| Error::Platform("launch string has no appsink named `frames`".into()))?;
-        let pool = make_pool(
-            cfg.pool_size,
-            PixelFormat::Nv12.frame_bytes(cfg.width, cfg.height),
-        )?;
+        let pool = if memory == FrameMemory::Nvmm {
+            None
+        } else {
+            Some(make_pool(
+                cfg.pool_size,
+                PixelFormat::Nv12.frame_bytes(cfg.width, cfg.height),
+            )?)
+        };
+        let argus = cfg.kind == "argus";
         Ok(Self {
             pipeline,
             appsink,
@@ -152,6 +165,7 @@ impl GstLaunchSource {
             seq: 0,
             pool,
             copied_frames: Arc::new(AtomicU64::new(0)),
+            argus,
         })
     }
 
@@ -192,10 +206,18 @@ impl GstLaunchSource {
         // must be exactly one tight NV12 frame; anything else
         // (padding, block-linear) is not a frame we may claim.
         let expected = PixelFormat::Nv12.frame_bytes(self.cfg.width, self.cfg.height);
-        let Some(mut file) = self.pool.lock().expect("gst pool mutex poisoned").pop() else {
+        let Some(pool) = self.pool.as_ref() else {
+            return Err(Error::Platform(
+                "no copy-fallback pool for an NVMM source; refusing to copy".into(),
+            ));
+        };
+        let Some(mut file) = pool.lock().expect("gst pool mutex poisoned").pop() else {
             return Ok(None);
         };
-        {
+        // A failed copy must return the pooled file: leaking one per
+        // bad buffer would starve the fallback pool after `pool_size`
+        // format errors and turn a clear error into a stop.
+        let copied = (|| -> Result<()> {
             let map = buffer
                 .map_readable()
                 .map_err(|e| Error::Platform(format!("mapping gst buffer: {e}")))?;
@@ -211,11 +233,16 @@ impl GstLaunchSource {
             use std::io::Seek;
             file.seek(std::io::SeekFrom::Start(0))?;
             file.write_all(map.as_slice())?;
+            Ok(())
+        })();
+        if let Err(e) = copied {
+            pool.lock().expect("gst pool mutex poisoned").push(file);
+            return Err(e);
         }
         self.copied_frames.fetch_add(1, Ordering::Relaxed);
         Ok(Some(Arc::new(GstFrameBuffer::Copied {
             file: Some(file),
-            pool: Arc::clone(&self.pool),
+            pool: Arc::clone(pool),
         })))
     }
 
@@ -239,7 +266,20 @@ impl GstLaunchSource {
                         e.debug()
                     )));
                 }
-                gst::MessageView::Eos(_) => return Ok(Some(FramePoll::EndOfStream)),
+                gst::MessageView::Eos(_) => {
+                    return if self.argus {
+                        Err(Error::Platform(
+                            concat!(
+                                "capture ended: the Argus sensor or nvargus-daemon ",
+                                "session may be lost (bare EOS from an Argus source ",
+                                "is a fault, not end of stream)"
+                            )
+                            .into(),
+                        ))
+                    } else {
+                        Ok(Some(FramePoll::EndOfStream))
+                    };
+                }
                 _ => {}
             }
         }
@@ -269,7 +309,18 @@ impl FrameSource for GstLaunchSource {
                     return Ok(poll);
                 }
                 if self.appsink.is_eos() {
-                    return Ok(FramePoll::EndOfStream);
+                    return if self.argus {
+                        Err(Error::Platform(
+                            concat!(
+                                "capture ended: the Argus sensor or nvargus-daemon ",
+                                "session may be lost (bare EOS from an Argus source ",
+                                "is a fault, not end of stream)"
+                            )
+                            .into(),
+                        ))
+                    } else {
+                        Ok(FramePoll::EndOfStream)
+                    };
                 }
                 return Ok(FramePoll::Timeout(TimeoutReason::NoFrame));
             }
@@ -292,6 +343,7 @@ impl FrameSource for GstLaunchSource {
             height: self.cfg.height,
             format: PixelFormat::Nv12,
             layout: self.layout,
+            planes: PixelFormat::Nv12.plane_layout(self.cfg.width, self.cfg.height),
             camera_id: self.cfg.camera_id,
             dmabuf_fd: buf.dmabuf_fd(),
         };
@@ -315,7 +367,9 @@ impl FrameSource for GstLaunchSource {
     }
 
     fn pool_available(&self) -> Option<usize> {
-        self.pool.lock().ok().map(|pool| pool.len())
+        self.pool
+            .as_ref()
+            .and_then(|pool| pool.lock().ok().map(|pool| pool.len()))
     }
 }
 

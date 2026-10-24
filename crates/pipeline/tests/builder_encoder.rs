@@ -16,6 +16,9 @@ struct FakePlatform {
     cpu: bool,
     /// Declare an engine input that disagrees with the config.
     bad_input: bool,
+    /// Declare a normal F32 engine input (TensorRT FP16 plans still
+    /// expose F32 I/O bindings).
+    f32_input: bool,
 }
 
 struct StubBuffer;
@@ -132,6 +135,11 @@ impl Platform for FakePlatform {
                 TensorSpec::new("images", vec![1, 3, 999, 999], DType::F32),
                 Box::new(StubBuffer),
             )]
+        } else if self.f32_input {
+            vec![Tensor::new(
+                TensorSpec::new("images", vec![1, 3, 416, 416], DType::F32),
+                Box::new(StubBuffer),
+            )]
         } else {
             Vec::new()
         };
@@ -187,6 +195,7 @@ fn strict_nano_refuses_cpu_encode() {
         hw: false,
         cpu: true,
         bad_input: false,
+        f32_input: false,
     };
     // Config validation rejects strict + hardware=false first.
     assert!(Config::from_toml_str(
@@ -202,6 +211,7 @@ fn relaxed_nano_cpu_opt_in_builds() {
         hw: false,
         cpu: true,
         bad_input: false,
+        f32_input: false,
     };
     let p = build(&nano, config("relaxed", false)).expect("relaxed CPU opt-in must build");
     assert!(!p.metadata_only());
@@ -213,6 +223,7 @@ fn relaxed_without_cpu_path_refuses() {
         hw: false,
         cpu: false,
         bad_input: false,
+        f32_input: false,
     };
     match build(&bare, config("relaxed", false)) {
         Ok(_) => panic!("must refuse when the platform has no CPU encoder"),
@@ -226,12 +237,14 @@ fn nx_hardware_path_builds_and_nano_hardware_request_refuses() {
         hw: true,
         cpu: true,
         bad_input: false,
+        f32_input: false,
     };
     assert!(build(&nx, config("strict", true)).is_ok());
     let nano = FakePlatform {
         hw: false,
         cpu: true,
         bad_input: false,
+        f32_input: false,
     };
     match build(&nano, config("relaxed", true)) {
         Ok(_) => panic!("hardware=true on a Nano must refuse"),
@@ -247,6 +260,7 @@ fn builder_refuses_engine_input_shape_mismatch() {
         hw: true,
         cpu: false,
         bad_input: true,
+        f32_input: false,
     };
     match build(&platform, config("strict", true)) {
         Ok(_) => panic!("mismatched engine input must not build"),
@@ -255,4 +269,43 @@ fn builder_refuses_engine_input_shape_mismatch() {
             "error must name the stage: {e}"
         ),
     }
+}
+
+/// N6: `model.precision` chooses layer execution, not the I/O dtype.
+/// A plan built with FP16 still exposes F32 input/output bindings, so
+/// the builder must not demand `F16` for an FP16 config (it used to).
+#[test]
+fn fp16_config_accepts_an_f32_engine_input_binding() {
+    let platform = FakePlatform {
+        hw: true,
+        cpu: false,
+        bad_input: false,
+        f32_input: true,
+    };
+    let cfg = Config::from_toml_str(
+        r#"
+platform = "fake"
+zero_copy = "strict"
+[source]
+kind = "argus"
+width = 1440
+height = 1080
+fps = 30
+pool_size = 8
+[model]
+input_width = 416
+input_height = 416
+precision = "fp16"
+[encoder]
+enabled = true
+hardware = true
+[stream]
+metadata_only = false
+"#,
+    )
+    .expect("config");
+    assert!(
+        build(&platform, cfg).is_ok(),
+        "FP16 execution with F32 bindings must build"
+    );
 }

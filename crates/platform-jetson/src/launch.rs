@@ -70,7 +70,7 @@ pub fn encode_launch(kind: EncoderKind, cfg: &EncoderConfig, width: u32, height:
     // Bounded and blocking: if NVENC falls behind, the pipeline's
     // caller feels it here instead of memory growing without bound.
     let src = format!(
-        "appsrc name=framesrc is-live=true format=time block=true max-buffers=4 \
+        "appsrc name=framesrc is-live=true format=time block=true max-buffers=2 \
          caps={}",
         raw_caps("(memory:NVMM)", "NV12", width, height)
     );
@@ -80,7 +80,7 @@ pub fn encode_launch(kind: EncoderKind, cfg: &EncoderConfig, width: u32, height:
              idrinterval={} iframeinterval={} maxperf-enable=true \
              ! h264parse config-interval=-1 \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=enc sync=false",
+             ! appsink name=enc max-buffers=8 drop=false sync=false",
             cfg.gop_frames, cfg.gop_frames
         ),
         (EncoderKind::Nvenc, Codec::H265) => format!(
@@ -88,17 +88,17 @@ pub fn encode_launch(kind: EncoderKind, cfg: &EncoderConfig, width: u32, height:
              idrinterval={} iframeinterval={} maxperf-enable=true \
              ! h265parse config-interval=-1 \
              ! video/x-h265,stream-format=byte-stream,alignment=au \
-             ! appsink name=enc sync=false",
+             ! appsink name=enc max-buffers=8 drop=false sync=false",
             cfg.gop_frames, cfg.gop_frames
         ),
         // Opt-in only (zero_copy = "relaxed"): the one deliberate
         // copy out of NVMM, immediately before the CPU encoder.
         (EncoderKind::Cpu, Codec::H264) => format!(
             "{src} ! nvvidconv ! {} \
-             ! x264enc tune=zerolatency key-int-max={} bitrate={} speed-preset=ultrafast \
+             ! x264enc tune=zerolatency key-int-max={} bitrate={} speed-preset=ultrafast threads=3 sliced-threads=true \
              ! h264parse config-interval=-1 \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
-             ! appsink name=enc sync=false",
+             ! appsink name=enc max-buffers=8 drop=false sync=false",
             raw_caps("", "I420", width, height),
             cfg.gop_frames,
             cfg.bitrate_kbps,
@@ -108,7 +108,7 @@ pub fn encode_launch(kind: EncoderKind, cfg: &EncoderConfig, width: u32, height:
              ! x265enc tune=zerolatency key-int-max={} bitrate={} speed-preset=ultrafast \
              ! h265parse config-interval=-1 \
              ! video/x-h265,stream-format=byte-stream,alignment=au \
-             ! appsink name=enc sync=false",
+             ! appsink name=enc max-buffers=8 drop=false sync=false",
             raw_caps("", "I420", width, height),
             cfg.gop_frames,
             cfg.bitrate_kbps,
@@ -157,7 +157,7 @@ mod tests {
         let launch = encode_launch(EncoderKind::Nvenc, &cfg, 1440, 1080);
         assert!(launch.contains("nvv4l2h265enc bitrate=8000000"), "{launch}");
         assert!(
-            launch.contains("block=true max-buffers=4"),
+            launch.contains("block=true max-buffers=2"),
             "appsrc must be bounded: {launch}"
         );
         assert!(
@@ -168,6 +168,10 @@ mod tests {
             !launch.contains("nvvidconv"),
             "HW path must not copy: {launch}"
         );
+        assert!(
+            launch.contains("appsink name=enc max-buffers=8 drop=false"),
+            "encode appsink must be bounded: {launch}"
+        );
     }
 
     #[test]
@@ -177,5 +181,13 @@ mod tests {
         assert_eq!(launch.matches("nvvidconv").count(), 1, "{launch}");
         assert!(launch.contains("x264enc"), "{launch}");
         assert!(launch.contains("format=I420"), "{launch}");
+        assert!(
+            launch.contains("threads=3 sliced-threads=true"),
+            "x264 must not spawn one thread per core on the Nano: {launch}"
+        );
+        assert!(
+            launch.contains("appsink name=enc max-buffers=8 drop=false"),
+            "encode appsink must be bounded: {launch}"
+        );
     }
 }

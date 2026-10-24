@@ -39,6 +39,7 @@ impl FrameSource for StubSource {
                 height: 64,
                 format: PixelFormat::Nv12,
                 layout: Layout::PitchLinear,
+                planes: PixelFormat::Nv12.plane_layout(64, 64),
                 camera_id: 0,
                 dmabuf_fd: 0,
             },

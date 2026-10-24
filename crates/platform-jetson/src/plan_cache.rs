@@ -37,6 +37,16 @@ pub struct PlanKeyInputs<'a> {
     pub precision: Precision,
     /// GPU compute capability, e.g. (8, 7) for Orin.
     pub sm: (u32, u32),
+    /// Module identity from `/proc/device-tree/compatible`
+    /// (e.g. `nvidia,p3767-0000`). NX and Nano share an SM count but
+    /// not clocks or memory bandwidth.
+    pub soc: &'a str,
+    /// `/etc/nv_tegra_release` (BSP).
+    pub l4t: &'a str,
+    /// CUDA runtime version (`cudaRuntimeGetVersion`).
+    pub cuda: u32,
+    /// GPU name from `cudaGetDeviceProperties` (`Orin`, ...).
+    pub gpu_name: &'a str,
     /// Serialised builder flags (workspace, DLA core, ...).
     pub builder_flags: &'a str,
 }
@@ -54,6 +64,14 @@ pub fn plan_key(inputs: &PlanKeyInputs<'_>) -> String {
     hasher.update(inputs.sm.0.to_le_bytes());
     hasher.update(b".");
     hasher.update(inputs.sm.1.to_le_bytes());
+    hasher.update(b"|soc=");
+    hasher.update(inputs.soc);
+    hasher.update(b"|l4t=");
+    hasher.update(inputs.l4t);
+    hasher.update(b"|cuda=");
+    hasher.update(inputs.cuda.to_le_bytes());
+    hasher.update(b"|gpu=");
+    hasher.update(inputs.gpu_name);
     hasher.update(b"|flags=");
     hasher.update(inputs.builder_flags);
     hex(&hasher.finalize())
@@ -168,6 +186,10 @@ mod tests {
             trt_version: 10016,
             precision: Precision::Fp16,
             sm: (8, 7),
+            soc: "nvidia,p3767-0000",
+            l4t: "R39.2.1",
+            cuda: 13020,
+            gpu_name: "Orin",
             builder_flags: "ws=1024",
         }
     }
@@ -185,6 +207,15 @@ mod tests {
         assert_ne!(base, plan_key(&other));
         let mut other = inputs(b"model-a");
         other.sm = (8, 9);
+        assert_ne!(base, plan_key(&other));
+        let mut other = inputs(b"model-a");
+        other.soc = "nvidia,p3767-0003";
+        assert_ne!(base, plan_key(&other));
+        let mut other = inputs(b"model-a");
+        other.cuda = 13021;
+        assert_ne!(base, plan_key(&other));
+        let mut other = inputs(b"model-a");
+        other.gpu_name = "Orin Nano";
         assert_ne!(base, plan_key(&other));
         let mut other = inputs(b"model-a");
         other.builder_flags = "ws=2048";

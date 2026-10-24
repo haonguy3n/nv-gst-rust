@@ -2,8 +2,131 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Fixed-size ring of end-to-end ages (~9 minutes at 30 fps).
+/// Preallocated: recording a frame never allocates, and a process
+/// that runs for days keeps a bounded, recent window instead of
+/// growing until it is OOM-killed.
+pub const LATENCY_WINDOW: usize = 16_384;
+
+#[derive(Debug)]
+struct LatencyRing {
+    samples: Box<[u32]>,
+    len: usize,
+    next: usize,
+}
+
+impl LatencyRing {
+    fn new() -> Self {
+        Self {
+            samples: vec![0u32; LATENCY_WINDOW].into_boxed_slice(),
+            len: 0,
+            next: 0,
+        }
+    }
+
+    fn record(&mut self, us: u32) {
+        if self.len < LATENCY_WINDOW {
+            self.samples[self.len] = us;
+            self.len += 1;
+        } else {
+            self.samples[self.next] = us;
+            self.next = (self.next + 1) % LATENCY_WINDOW;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.next = 0;
+    }
+}
+
+/// Bounded, allocation-free reservoir of end-to-end frame ages
+/// (source hand-off to sink accept, in microseconds). Shared with
+/// [`LiveMetrics`] so a supervisor can read percentiles during a run
+/// without waiting for `run()` to return.
+#[derive(Debug, Clone)]
+pub struct LatencySamples {
+    ring: Arc<Mutex<LatencyRing>>,
+}
+
+impl Default for LatencySamples {
+    fn default() -> Self {
+        Self {
+            ring: Arc::new(Mutex::new(LatencyRing::new())),
+        }
+    }
+}
+
+impl LatencySamples {
+    pub fn record(&self, age: Duration) {
+        let us = age.as_micros().min(u128::from(u32::MAX)) as u32;
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.record(us);
+        }
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut ring) = self.ring.lock() {
+            ring.clear();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.ring.lock().map(|ring| ring.len).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Sorted copy, allocated only when a percentile is rendered.
+    fn sorted(&self) -> Vec<u32> {
+        let mut samples = match self.ring.lock() {
+            Ok(ring) => ring.samples[..ring.len].to_vec(),
+            Err(_) => Vec::new(),
+        };
+        samples.sort_unstable();
+        samples
+    }
+
+    /// Nearest-rank percentile (`q` in `0.0..=1.0`), computed on a
+    /// sorted copy so the hot path stays a single push.
+    pub fn percentile(&self, q: f32) -> Option<Duration> {
+        if !(0.0..=1.0).contains(&q) {
+            return None;
+        }
+        let samples = self.sorted();
+        if samples.is_empty() {
+            return None;
+        }
+        let rank = (q * samples.len() as f32).ceil() as usize;
+        let index = rank.saturating_sub(1).min(samples.len() - 1);
+        Some(Duration::from_micros(u64::from(samples[index])))
+    }
+
+    pub fn p50(&self) -> Option<Duration> {
+        self.percentile(0.50)
+    }
+
+    pub fn p95(&self) -> Option<Duration> {
+        self.percentile(0.95)
+    }
+
+    pub fn p99(&self) -> Option<Duration> {
+        self.percentile(0.99)
+    }
+
+    pub fn max(&self) -> Option<Duration> {
+        let max = self
+            .ring
+            .lock()
+            .map(|ring| ring.samples[..ring.len].iter().copied().max())
+            .unwrap_or(None)?;
+        Some(Duration::from_micros(u64::from(max)))
+    }
+}
+
 /// Counters and per-stage timings, measured from day one.
-/// Exported as logs now; a Prometheus exporter reads the same struct.
 #[derive(Debug, Default, Clone)]
 pub struct PipelineMetrics {
     pub frames_captured: u64,
@@ -21,6 +144,12 @@ pub struct PipelineMetrics {
     pub post_total: Duration,
     pub overlay_total: Duration,
     pub encode_total: Duration,
+    /// End-to-end age samples: source hand-off to sink accept.
+    pub latency: LatencySamples,
+    /// Frames queued between capture and processing right now.
+    pub queue_depth: u64,
+    /// Peak queue depth observed during the run.
+    pub queue_depth_max: u64,
 }
 
 impl PipelineMetrics {
@@ -39,6 +168,11 @@ impl PipelineMetrics {
         let counter = |out: &mut String, name: &str, help: &str, value: u64| {
             out.push_str(&format!(
                 "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+            ));
+        };
+        let gauge = |out: &mut String, name: &str, help: &str, value: String| {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
             ));
         };
         counter(
@@ -71,6 +205,40 @@ impl PipelineMetrics {
             "Detections emitted",
             self.detections,
         );
+        gauge(
+            &mut out,
+            "edge_queue_depth",
+            "Frames queued between capture and processing",
+            self.queue_depth.to_string(),
+        );
+        gauge(
+            &mut out,
+            "edge_queue_depth_max",
+            "Peak queue depth during the run",
+            self.queue_depth_max.to_string(),
+        );
+        out.push_str(
+            "# HELP edge_latency_seconds End-to-end frame age (source hand-off to sink accept)\n\
+             # TYPE edge_latency_seconds gauge\n",
+        );
+        for (quantile, value) in [
+            ("0.5", self.latency.p50()),
+            ("0.95", self.latency.p95()),
+            ("0.99", self.latency.p99()),
+        ] {
+            if let Some(duration) = value {
+                out.push_str(&format!(
+                    "edge_latency_seconds{{quantile=\"{quantile}\"}} {:.6}\n",
+                    duration.as_secs_f64()
+                ));
+            }
+        }
+        if let Some(max) = self.latency.max() {
+            out.push_str(&format!(
+                "edge_latency_max_seconds {:.6}\n",
+                max.as_secs_f64()
+            ));
+        }
         out.push_str(
             "# HELP edge_stage_seconds_total Cumulative stage time\n\
              # TYPE edge_stage_seconds_total counter\n",
@@ -91,14 +259,23 @@ impl PipelineMetrics {
     }
 
     pub fn summary(&self) -> String {
+        let p = |value: Option<Duration>| match value {
+            Some(d) => format!("{d:?}"),
+            None => "n/a".to_string(),
+        };
         format!(
             "captured={} dropped={} timeouts={} processed={} detections={} \
+             qmax={} p50={} p95={} p99={} \
              avg pre={:?} infer={:?} post={:?} overlay={:?} encode={:?}",
             self.frames_captured,
             self.frames_dropped,
             self.capture_timeouts,
             self.frames_processed,
             self.detections,
+            self.queue_depth_max,
+            p(self.latency.p50()),
+            p(self.latency.p95()),
+            p(self.latency.p99()),
             self.avg(self.pre_total),
             self.avg(self.infer_total),
             self.avg(self.post_total),
@@ -125,18 +302,34 @@ pub struct LiveMetrics {
     /// directly so drops stay visible even while processing is
     /// stalled (when nothing calls `sync_processing`).
     dropped_source: Mutex<Option<Arc<AtomicU64>>>,
+    /// The channel's own depth counter, for the same reason.
+    depth_source: Mutex<Option<Arc<AtomicU64>>>,
     capture_timeouts: AtomicU64,
     frames_processed: AtomicU64,
     detections: AtomicU64,
+    queue_depth: AtomicU64,
+    queue_depth_max: AtomicU64,
     pre_ns: AtomicU64,
     infer_ns: AtomicU64,
     post_ns: AtomicU64,
     overlay_ns: AtomicU64,
     encode_ns: AtomicU64,
+    latency: LatencySamples,
 }
 
 impl LiveMetrics {
-    /// Point-in-time copy of every counter.
+    fn attached_depth(&self) -> u64 {
+        self.depth_source
+            .lock()
+            .expect("live metrics mutex poisoned")
+            .as_ref()
+            .map_or_else(
+                || self.queue_depth.load(Ordering::Relaxed),
+                |source| source.load(Ordering::Relaxed),
+            )
+    }
+
+    /// Point-in-time copy of every counter and percentile input.
     pub fn snapshot(&self) -> PipelineMetrics {
         PipelineMetrics {
             frames_captured: self.frames_captured.load(Ordering::Relaxed),
@@ -157,6 +350,9 @@ impl LiveMetrics {
             post_total: Duration::from_nanos(self.post_ns.load(Ordering::Relaxed)),
             overlay_total: Duration::from_nanos(self.overlay_ns.load(Ordering::Relaxed)),
             encode_total: Duration::from_nanos(self.encode_ns.load(Ordering::Relaxed)),
+            latency: self.latency.clone(),
+            queue_depth: self.attached_depth(),
+            queue_depth_max: self.queue_depth_max.load(Ordering::Relaxed),
         }
     }
 
@@ -167,6 +363,8 @@ impl LiveMetrics {
             &self.capture_timeouts,
             &self.frames_processed,
             &self.detections,
+            &self.queue_depth,
+            &self.queue_depth_max,
             &self.pre_ns,
             &self.infer_ns,
             &self.post_ns,
@@ -175,6 +373,7 @@ impl LiveMetrics {
         ] {
             counter.store(0, Ordering::Relaxed);
         }
+        self.latency.clear();
     }
 
     /// Read drops straight from the current run's channel counter.
@@ -185,18 +384,35 @@ impl LiveMetrics {
             .expect("live metrics mutex poisoned") = Some(source);
     }
 
+    /// Read queue depth straight from the current run's channel.
+    pub(crate) fn attach_depth(&self, source: Arc<AtomicU64>) {
+        *self
+            .depth_source
+            .lock()
+            .expect("live metrics mutex poisoned") = Some(source);
+    }
+
+    /// The shared latency reservoir, so the returned
+    /// [`PipelineMetrics`] and live snapshots see the same samples.
+    pub(crate) fn latency_handle(&self) -> LatencySamples {
+        self.latency.clone()
+    }
+
     pub(crate) fn set_capture(&self, captured: u64, timeouts: u64) {
         self.frames_captured.store(captured, Ordering::Relaxed);
         self.capture_timeouts.store(timeouts, Ordering::Relaxed);
     }
 
-    /// Publish the processing thread's counters (and the channel
-    /// drop count it can see) after each frame.
+    /// Publish the processing thread's counters after each frame,
+    /// including the queue depth the channel reports right now.
     pub(crate) fn sync_processing(&self, metrics: &PipelineMetrics, dropped: u64) {
         self.frames_processed
             .store(metrics.frames_processed, Ordering::Relaxed);
         self.detections.store(metrics.detections, Ordering::Relaxed);
         self.frames_dropped.store(dropped, Ordering::Relaxed);
+        let depth = self.attached_depth();
+        self.queue_depth.store(depth, Ordering::Relaxed);
+        self.queue_depth_max.fetch_max(depth, Ordering::Relaxed);
         self.pre_ns
             .store(metrics.pre_total.as_nanos() as u64, Ordering::Relaxed);
         self.infer_ns
@@ -226,19 +442,54 @@ mod tests {
     }
 
     #[test]
-    fn prometheus_output_has_each_counter_once() {
+    fn live_queue_depth_is_visible_without_processing_sync() {
+        let live = LiveMetrics::default();
+        let depth = Arc::new(AtomicU64::new(0));
+        live.attach_depth(Arc::clone(&depth));
+        depth.store(3, Ordering::Relaxed);
+        assert_eq!(live.snapshot().queue_depth, 3);
+    }
+
+    #[test]
+    fn latency_percentiles_are_nearest_rank() {
+        let samples = LatencySamples::default();
+        assert_eq!(samples.p50(), None);
+        for ms in 1..=100 {
+            samples.record(Duration::from_millis(ms));
+        }
+        assert_eq!(samples.p50(), Some(Duration::from_millis(50)));
+        assert_eq!(samples.p95(), Some(Duration::from_millis(95)));
+        assert_eq!(samples.p99(), Some(Duration::from_millis(99)));
+        assert_eq!(samples.max(), Some(Duration::from_millis(100)));
+        assert_eq!(samples.len(), 100);
+    }
+
+    #[test]
+    fn prometheus_output_has_each_metric_once() {
+        let samples = LatencySamples::default();
+        samples.record(Duration::from_millis(20));
+        samples.record(Duration::from_millis(30));
         let m = PipelineMetrics {
             frames_captured: 30,
             frames_dropped: 2,
             frames_processed: 28,
             detections: 28,
             infer_total: Duration::from_millis(1500),
+            latency: samples,
+            queue_depth: 1,
+            queue_depth_max: 4,
             ..Default::default()
         };
         let text = m.render_prometheus();
         assert!(text.contains("edge_frames_captured_total 30\n"));
         assert!(text.contains("edge_frames_dropped_total 2\n"));
-        assert!(text.contains("edge_stage_seconds_total{stage=\"infer\"} 1.500000\n"));
+        assert!(text.contains("edge_queue_depth 1\n"));
+        assert!(text.contains("edge_queue_depth_max 4\n"));
+        assert!(text.contains("edge_latency_seconds{quantile=\"0.5\"} 0.020000\n"));
+        assert!(
+            text.contains("edge_stage_seconds_total{stage=\"infer\"} 1.500000\n"),
+            "{text}"
+        );
         assert_eq!(
             text.matches("# HELP edge_stage_seconds_total").count(),
             1,

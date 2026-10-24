@@ -80,7 +80,10 @@ impl Platform for JetsonPlatform {
             } else {
                 Vec::new()
             },
-            precisions: vec![Precision::Fp32, Precision::Fp16, Precision::Int8],
+            // INT8 is not advertised until a calibration cache is part
+            // of the plan key and an accuracy gate exists; `--int8`
+            // without calibration silently uses dummy scales.
+            precisions: vec![Precision::Fp32, Precision::Fp16],
             devices: vec!["gpu".into()],
             has_hw_encoder: self.engines.nvenc,
             // The launch strings for the VIC + x264/x265 path exist,
@@ -167,6 +170,7 @@ mod tests {
         });
         assert!(nx.caps().has_hw_encoder);
         assert_eq!(nx.caps().codecs.len(), 2);
+        assert!(!nx.caps().precisions.contains(&Precision::Int8));
 
         let nano = JetsonPlatform::with_engines(MediaEngines::default());
         assert!(!nano.caps().has_hw_encoder);

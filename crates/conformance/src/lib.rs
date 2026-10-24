@@ -1,5 +1,5 @@
 //! Conformance suite: trait-level checks every `platform-*` backend
-//! must pass before it counts as a port (see design.md, "Porting
+//! must pass before it counts as a port (see docs/design.md, "Porting
 //! guide"). A backend runs it from its own test target:
 //!
 //! ```ignore
@@ -89,6 +89,56 @@ pub fn check_caps_are_honest(platform: &dyn Platform, source_cfg: &SourceConfig)
     }
 }
 
+/// A frame's plane descriptor must be internally coherent and must
+/// describe the same visible size as the meta: this is the contract
+/// that replaced "assume pitch-linear and guess the stride".
+fn assert_plane_geometry(platform: &dyn Platform, frame: &HwFrame) {
+    let meta = frame.meta();
+    let planes: Vec<_> = meta.planes.planes().copied().collect();
+    assert!(
+        !planes.is_empty(),
+        "{}: frame has no plane descriptor",
+        platform.name()
+    );
+    let mut previous_end = 0usize;
+    for (i, plane) in planes.iter().enumerate() {
+        assert!(
+            plane.row_bytes > 0 && plane.rows > 0,
+            "{}: plane {i} is empty ({plane:?})",
+            platform.name()
+        );
+        assert!(
+            plane.pitch >= plane.row_bytes,
+            "{}: plane {i} pitch {} is smaller than its visible row {}",
+            platform.name(),
+            plane.pitch,
+            plane.row_bytes
+        );
+        // Planes are byte ranges inside one contiguous allocation.
+        assert!(
+            plane.offset >= previous_end,
+            "{}: plane {i} starts at {} inside the previous plane (end {})",
+            platform.name(),
+            plane.offset,
+            previous_end
+        );
+        previous_end = plane.offset + plane.pitch * plane.rows as usize;
+    }
+    // The first plane is the visible luma plane for NV12.
+    assert_eq!(
+        planes[0].row_bytes,
+        meta.width as usize,
+        "{}: luma row bytes must equal the frame width",
+        platform.name()
+    );
+    assert_eq!(
+        planes[0].rows,
+        meta.height,
+        "{}: luma rows must equal the frame height",
+        platform.name()
+    );
+}
+
 pub fn check_frame_order_and_timestamps(platform: &dyn Platform, cfg: &SourceConfig) {
     let caps = platform.caps();
     let mut cfg = cfg.clone();
@@ -146,6 +196,13 @@ pub fn check_frame_order_and_timestamps(platform: &dyn Platform, cfg: &SourceCon
             "{}: produced frame's memory domain must match the declared source domain",
             platform.name()
         );
+        assert_eq!(
+            frame.meta().layout,
+            source.layout(),
+            "{}: frame layout must match the layout the source declared",
+            platform.name()
+        );
+        assert_plane_geometry(platform, &frame);
         if let Some(prev) = last_seq {
             assert!(
                 frame.meta().seq > prev,

@@ -207,6 +207,7 @@ mod tests {
             height: 64,
             format: edge_core::PixelFormat::Nv12,
             layout: edge_core::Layout::PitchLinear,
+            planes: edge_core::PixelFormat::Nv12.plane_layout(64, 64),
             camera_id: 2,
             dmabuf_fd: -1,
         });

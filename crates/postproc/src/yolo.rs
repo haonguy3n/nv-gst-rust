@@ -179,6 +179,7 @@ mod tests {
             height,
             format: PixelFormat::Nv12,
             layout: Layout::PitchLinear,
+            planes: PixelFormat::Nv12.plane_layout(width, height),
             camera_id: 0,
             dmabuf_fd: -1,
         }

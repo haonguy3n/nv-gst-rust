@@ -23,6 +23,9 @@ jobs:
       # The feature combination the app actually ships with.
       - run: cargo clippy -p edge-vision --features jetson,onnx --all-targets -- -D warnings
       - run: cargo build -p edge-vision --features jetson,onnx
+      # Committed end-to-end detector test (ONNX fixture -> YOLO
+      # decoder -> NMS -> sink), replacing the manual runs (P2-16).
+      - run: cargo test -p edge-vision --features onnx
       # Every feature combination must at least type-check
       # (round 1's U-1 build break was a feature-gated path).
       - uses: taiki-e/install-action@cargo-hack

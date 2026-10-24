@@ -211,6 +211,7 @@ impl FrameSource for SimSource {
             height: self.cfg.height,
             format: PixelFormat::Nv12,
             layout: Layout::PitchLinear,
+            planes: PixelFormat::Nv12.plane_layout(self.cfg.width, self.cfg.height),
             camera_id: self.cfg.camera_id,
             dmabuf_fd: fd,
         };

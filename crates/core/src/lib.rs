@@ -2,8 +2,8 @@
 //!
 //! The pipeline only knows the traits in [`stage`] and the opaque
 //! [`HwFrame`] handle. Vendor code lives in `platform-*` crates.
-//! See `design.md` at the workspace root for the zero-copy contract
-//! these types are written to enforce.
+//! See `docs/design.md` for the zero-copy contract these types are
+//! written to enforce.
 
 #![forbid(unsafe_code)]
 
@@ -21,7 +21,9 @@ pub use config::{
 };
 pub use detection::{Detection, Detections};
 pub use error::{Error, Result};
-pub use frame::{FrameMemory, FrameMeta, HwBuffer, HwFrame, Layout, PixelFormat};
+pub use frame::{
+    FrameMemory, FrameMeta, HwBuffer, HwFrame, Layout, PixelFormat, PlaneDesc, PlaneLayout,
+};
 pub use letterbox::{normalize_factor, order_channels, Letterbox};
 pub use stage::{
     EncodedPacket, Encoder, EngineState, EngineWarmup, FramePoll, FrameSource, GpuStream,

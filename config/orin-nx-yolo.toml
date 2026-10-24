@@ -10,14 +10,14 @@ kind = "argus" # M1: nvarguscamerasrc into NVMM (see crates/platform-jetson laun
 width = 1440 # IMX296 native
 height = 1080
 fps = 30
-pool_size = 8 # sim semantics; on device the Argus pool is fixed — see the in-flight budget in design.md (round 3, L2)
+pool_size = 8 # sim semantics; on device the Argus pool is fixed — see the in-flight budget in docs/jetson-bringup.md
 gain_max = 16.0 # cap AE brightness swings (reference product's value)
 
 [model]
 # YOLOX (Apache-2.0) is the device default; Ultralytics YOLOv8
 # weights are AGPL-3.0 and stay sim/test-only (round 3, L9).
 # Provenance: Megvii YOLOX-tiny via the reference model importer.
-path = "models/yolox-tiny.onnx" # .engine is built on-device and cached
+path = "/data/models/yolox-tiny.onnx" # absolute: the service has no useful cwd; the image installs the model here
 decoder = "yolox"
 precision = "fp16"
 device = "gpu"
@@ -37,7 +37,9 @@ gop_frames = 30
 
 [stream]
 metadata_only = false
-rtsp_port = 8555 # 8554 belongs to camera-streamer on the same image
+# Video output (RTSP on port 8555; 8554 belongs to camera-streamer)
+# lands with the M1 encoder/sink stage. Until then only the sim can
+# run this profile, and it has no encoder.
 
 [pipeline]
 queue_depth = 2 # live source: 4 frames is 133 ms at 30 fps, over the latency budget before any work

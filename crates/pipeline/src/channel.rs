@@ -25,10 +25,14 @@ struct Shared<T> {
     available: Condvar,
     capacity: usize,
     dropped: Arc<AtomicU64>,
+    /// Current queue depth, updated under the lock and readable
+    /// from the metrics thread at any time.
+    depth: Arc<AtomicU64>,
 }
 
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>, Arc<AtomicU64>) {
     let dropped = Arc::new(AtomicU64::new(0));
+    let depth = Arc::new(AtomicU64::new(0));
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             queue: VecDeque::with_capacity(capacity),
@@ -37,6 +41,7 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>, Arc<AtomicU64>) {
         available: Condvar::new(),
         capacity: capacity.max(1),
         dropped: Arc::clone(&dropped),
+        depth: Arc::clone(&depth),
     });
     (
         Sender {
@@ -62,6 +67,11 @@ impl<T> Sender<T> {
             None
         };
         state.queue.push_back(item);
+        // Published under the lock: the metrics reader can only
+        // ever observe a depth that existed.
+        self.shared
+            .depth
+            .store(state.queue.len() as u64, Ordering::Relaxed);
         drop(state);
         self.shared.available.notify_one();
         evicted
@@ -83,6 +93,11 @@ pub struct Receiver<T> {
 }
 
 impl<T> Receiver<T> {
+    /// Live queue depth, for the metrics exporter.
+    pub fn depth_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.depth)
+    }
+
     /// Blocks up to `timeout`. `None` on timeout, or when the sender
     /// is gone and the queue is drained.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<T> {
@@ -92,6 +107,9 @@ impl<T> Receiver<T> {
         let mut state = self.shared.state.lock().expect("channel mutex poisoned");
         loop {
             if let Some(item) = state.queue.pop_front() {
+                self.shared
+                    .depth
+                    .store(state.queue.len() as u64, Ordering::Relaxed);
                 return Some(item);
             }
             if state.closed {
@@ -151,5 +169,23 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(rx.recv_timeout(Duration::ZERO), Some(2));
         assert_eq!(rx.recv_timeout(Duration::ZERO), Some(3));
+    }
+
+    #[test]
+    fn depth_handle_tracks_the_queue() {
+        let (tx, rx, _dropped) = channel::<u32>(3);
+        let depth = rx.depth_handle();
+        assert_eq!(depth.load(Ordering::Relaxed), 0);
+        tx.send(1);
+        tx.send(2);
+        assert_eq!(depth.load(Ordering::Relaxed), 2);
+        assert_eq!(rx.recv_timeout(Duration::ZERO), Some(1));
+        assert_eq!(depth.load(Ordering::Relaxed), 1);
+        // Drop-oldest keeps depth at capacity, not capacity + 1.
+        tx.send(3);
+        tx.send(4);
+        assert_eq!(depth.load(Ordering::Relaxed), 3);
+        tx.send(5);
+        assert_eq!(depth.load(Ordering::Relaxed), 3);
     }
 }
