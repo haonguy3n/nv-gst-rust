@@ -34,6 +34,7 @@ pub mod gst_encoder;
 #[cfg(feature = "gst")]
 pub mod gst_source;
 pub mod launch;
+pub mod mapped;
 pub mod plan_cache;
 #[cfg(feature = "trt")]
 pub mod preprocess;

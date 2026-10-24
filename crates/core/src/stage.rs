@@ -145,6 +145,12 @@ pub trait InferenceEngine: Send {
     /// Host-visible small tensors, read in place by post-processing.
     fn output_bindings(&self) -> &[Tensor];
     fn infer(&mut self, stream: &GpuStream) -> Result<()>;
+    /// GPU time of the last `infer`, when the backend measures it (CUDA
+    /// events around the enqueue). Wall time of `infer` also holds the
+    /// launch and the synchronize.
+    fn last_gpu_time(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// An engine still being prepared (TensorRT plan build on first

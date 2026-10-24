@@ -823,6 +823,10 @@ impl Pipeline {
                 let t = Instant::now();
                 engine.infer(&self.stream)?;
                 metrics.infer_total += t.elapsed();
+                if let Some(gpu) = engine.last_gpu_time() {
+                    metrics.gpu_total += gpu;
+                    metrics.frames_gpu_timed += 1;
+                }
 
                 let t = Instant::now();
                 self.postprocessor

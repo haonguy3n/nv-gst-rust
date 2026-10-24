@@ -339,6 +339,50 @@ impl Drop for Stream {
     }
 }
 
+/// A CUDA event with timing. Created once and recorded again and again, so
+/// GPU timing allocates nothing per frame.
+pub struct Event {
+    raw: NonNull<c_void>,
+}
+
+// SAFETY: a cudaEvent_t may be used from any thread.
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+
+impl Event {
+    pub fn new() -> Result<Self> {
+        set_device_for_thread()?;
+        // SAFETY: no arguments; null is handled.
+        let raw = NonNull::new(unsafe { ffi::trt_event_create() }).ok_or_else(last_error)?;
+        Ok(Self { raw })
+    }
+
+    /// Queues the event on the stream: it completes after the work queued
+    /// before it.
+    pub fn record(&self, stream: &Stream) -> Result<()> {
+        // SAFETY: live event and stream.
+        status(unsafe { ffi::trt_event_record(self.raw.as_ptr(), stream.raw.as_ptr()) })
+    }
+
+    /// Milliseconds from `start` to this event. Both must have been
+    /// recorded, and the stream synchronized past this one.
+    pub fn elapsed_ms_since(&self, start: &Event) -> Result<f32> {
+        let mut ms = 0f32;
+        // SAFETY: live events; `ms` is a live local.
+        status(unsafe {
+            ffi::trt_event_elapsed_ms(start.raw.as_ptr(), self.raw.as_ptr(), &mut ms)
+        })?;
+        Ok(ms)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // SAFETY: `raw` is live.
+        unsafe { ffi::trt_event_destroy(self.raw.as_ptr()) }
+    }
+}
+
 /// Zeroed `f32` memory the CPU and the GPU both see (integrated memory:
 /// `cudaHostAlloc(mapped)`). The allocation never moves, so binding its
 /// device address once stays valid while the buffer lives.
