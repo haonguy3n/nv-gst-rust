@@ -6,10 +6,20 @@ license.workspace = true
 rust-version.workspace = true
 description = "Platform-neutral outputs: JSONL metadata, file video, fan-out and counting sinks"
 
+[features]
+# RTSP video sink (gst-rtsp-server). Needs the GStreamer RTSP server dev
+# package at build time; the device image already carries the runtime.
+rtsp = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-rtsp-server"]
+
 [dependencies]
 edge-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true
+# WebSocket handshake only (no TLS, no async runtime).
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-rtsp-server = { version = "0.25", optional = true }
 
 [lints]
 workspace = true

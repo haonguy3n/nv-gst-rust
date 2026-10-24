@@ -13,6 +13,9 @@ description = "Edge vision pipeline binary: parse config, pick platform, run"
 jetson = ["dep:platform-jetson", "platform-jetson/gst"]
 # Real ONNX models in the sim backend (model.path in config).
 onnx = ["platform-sim/onnx"]
+# RTSP video sink (stream.rtsp_port). Needs the GStreamer RTSP server
+# dev package at build time.
+rtsp = ["edge-sinks/rtsp"]
 
 [dependencies]
 edge-core = { path = "../../crates/core" }

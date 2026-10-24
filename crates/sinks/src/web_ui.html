@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>edge-vision</title>
+<style>
+  :root { color-scheme: light dark; --box: #19c37d; }
+  body { margin: 0; padding: 8px; font: 14px/1.4 system-ui, sans-serif; }
+  #view { position: relative; width: 100%; max-width: 960px; margin: 0 auto; background: #0006; }
+  #view canvas { display: block; width: 100%; height: auto; }
+  #over { position: absolute; left: 0; top: 0; pointer-events: none; }
+  #msg { max-width: 960px; margin: 8px auto; padding: 8px; border: 1px solid #c80; border-radius: 6px; display: none; }
+  #stats { max-width: 960px; margin: 8px auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; }
+  #stats div { padding: 6px; border: 1px solid #8884; border-radius: 6px; }
+  #stats b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+  #stats span { opacity: .7; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="view"><canvas id="video" width="1440" height="1080"></canvas><canvas id="over" width="1440" height="1080"></canvas></div>
+<div id="msg"></div>
+<div id="stats"></div>
+<script>
+"use strict";
+const MAX_DETS = 90;       // detections kept to match against frame times
+const MAX_AGE_US = 150000; // a frame uses a detection at most this far from its pts
+const video = document.getElementById("video");
+const over = document.getElementById("over");
+const vctx = video.getContext("2d");
+const octx = over.getContext("2d");
+const msgEl = document.getElementById("msg");
+const statsEl = document.getElementById("stats");
+let decoder = null, decoderCodec = "", needKey = true;
+let dets = [], shownFrames = 0, shownAt = performance.now(), fps = 0, lastItems = [];
+
+function say(text) {
+  msgEl.style.display = text ? "block" : "none";
+  msgEl.textContent = text || "";
+}
+
+// avc1.PPCCLL from the first SPS (NAL type 7) of an Annex-B access unit.
+function codecFromSps(data) {
+  for (let i = 0; i + 6 < data.length; i++) {
+    if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1 && (data[i + 3] & 0x1f) === 7) {
+      const hex = (b) => b.toString(16).padStart(2, "0");
+      return "avc1." + hex(data[i + 4]) + hex(data[i + 5]) + hex(data[i + 6]);
+    }
+  }
+  return null;
+}
+
+function nearestDets(ts) {
+  let best = null, bestDiff = MAX_AGE_US;
+  for (const d of dets) {
+    const diff = Math.abs(d.pts_us - ts);
+    if (diff <= bestDiff) { best = d; bestDiff = diff; }
+  }
+  return best ? best.items : null;
+}
+
+function hue(id) { return (id * 67) % 360; }
+
+function drawBoxes(items) {
+  octx.clearRect(0, 0, over.width, over.height);
+  octx.lineWidth = Math.max(2, over.width / 400);
+  octx.font = Math.round(over.width / 50) + "px system-ui, sans-serif";
+  for (const d of items) {
+    const color = "hsl(" + hue(d.class_id) + ",80%,55%)";
+    const x = d.x * over.width, y = d.y * over.height;
+    octx.strokeStyle = color;
+    octx.strokeRect(x, y, d.width * over.width, d.height * over.height);
+    const label = d.class_id + " " + d.score.toFixed(2);
+    octx.fillStyle = color;
+    octx.fillText(label, x + 3, Math.max(y - 4, parseInt(octx.font, 10)));
+  }
+}
+
+function onFrame(frame) {
+  if (video.width !== frame.displayWidth || video.height !== frame.displayHeight) {
+    video.width = over.width = frame.displayWidth;
+    video.height = over.height = frame.displayHeight;
+  }
+  vctx.drawImage(frame, 0, 0);
+  const items = nearestDets(frame.timestamp);
+  lastItems = items || [];
+  drawBoxes(lastItems);
+  frame.close();
+  shownFrames++;
+  const now = performance.now();
+  if (now - shownAt >= 1000) {
+    fps = shownFrames * 1000 / (now - shownAt);
+    shownFrames = 0; shownAt = now;
+  }
+}
+
+function ensureDecoder(codec) {
+  if (decoder && decoder.state !== "closed" && codec === decoderCodec) return true;
+  if (decoder && decoder.state !== "closed") decoder.close();
+  decoder = new VideoDecoder({
+    output: onFrame,
+    error: (e) => { say("Video decoder error: " + e.message); needKey = true; decoderCodec = ""; },
+  });
+  try {
+    decoder.configure({ codec: codec, optimizeForLatency: true });
+  } catch (e) {
+    say("Cannot configure the decoder for " + codec + ": " + e.message);
+    return false;
+  }
+  decoderCodec = codec;
+  return true;
+}
+
+function onVideo(buf) {
+  const view = new DataView(buf);
+  const key = (view.getUint8(0) & 1) !== 0;
+  const pts = Number(view.getBigUint64(1));
+  const data = new Uint8Array(buf, 9);
+  if (!window.VideoDecoder) return;
+  if (key) {
+    const codec = codecFromSps(data);
+    if (!codec || !ensureDecoder(codec)) return;
+    needKey = false;
+  }
+  if (needKey || !decoder || decoder.state !== "configured") return;
+  if (decoder.decodeQueueSize > 10 && !key) return; // behind: skip until the next keyframe
+  decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: pts, data: data }));
+}
+
+function onText(text) {
+  const m = JSON.parse(text);
+  if (m.type === "det") {
+    dets.push(m);
+    if (dets.length > MAX_DETS) dets.shift();
+    if (!window.VideoDecoder) { lastItems = m.items; drawBoxes(m.items); }
+  } else if (m.type === "stats") {
+    showStats(m);
+  } else if (m.type === "error") {
+    say(m.message);
+  }
+}
+
+function showStats(m) {
+  const rows = [["view fps", fps.toFixed(1)], ["boxes now", lastItems.length]];
+  for (const k of Object.keys(m)) if (k !== "type") rows.push([k, m[k] === null ? "n/a" : m[k]]);
+  statsEl.replaceChildren(...rows.map(([k, v]) => {
+    const d = document.createElement("div");
+    const b = document.createElement("b"); b.textContent = v;
+    const s = document.createElement("span"); s.textContent = k;
+    d.append(b, s);
+    return d;
+  }));
+}
+
+function connect() {
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (ev) => (typeof ev.data === "string" ? onText(ev.data) : onVideo(ev.data));
+  ws.onclose = () => { needKey = true; setTimeout(connect, 2000); };
+}
+
+if (!window.VideoDecoder) {
+  say("This browser has no WebCodecs VideoDecoder here, so there is no video (boxes and counters still work). " +
+      "WebCodecs needs a secure context: http://localhost, or https. For a camera on plain http, either " +
+      "open an SSH tunnel (ssh -L 8080:localhost:8080 <user>@<camera>) and browse http://localhost:8080, " +
+      "or start Chrome with --unsafely-treat-insecure-origin-as-secure=http://<camera>:8080 " +
+      "(and --user-data-dir=/tmp/chrome-cam).");
+}
+connect();
+</script>
+</body>
+</html>

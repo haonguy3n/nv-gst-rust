@@ -1,0 +1,13 @@
+// Proposal only: allow the edge-vision service user (edge-vision only) to
+// queue the one recovery restart without running as root.
+//
+// Install as /etc/polkit-1/rules.d/50-edge-vision-nvargus.rules and
+// verify on the camera image; a narrower root helper is the fallback.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "nvargus-daemon.service" &&
+        action.lookup("verb") == "restart" &&
+        subject.user == "edge-vision") {
+        return polkit.Result.YES;
+    }
+});

@@ -8,6 +8,11 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "rtsp")]
+pub mod rtsp;
+pub mod web_ui;
+pub use web_ui::{WebUi, WebUiSink};
+
 use edge_core::{Detections, EncodedPacket, Error, Result, Sink};
 use std::io::Write;
 use std::path::Path;
@@ -94,6 +99,117 @@ impl Sink for FileVideoSink {
         self.writer.flush()?;
         Ok(())
     }
+}
+
+// ------------------------------------------------------------------ tcp
+
+/// Raw Annex-B H.264 over TCP, one viewer at a time
+/// (`ffplay -f h264 tcp://<cam>:8555`). A client problem is never a
+/// run error: the client is dropped with one log line. A new client
+/// starts at the next keyframe (x264 repeats SPS/PPS in every IDR).
+pub struct TcpH264Sink {
+    listener: std::net::TcpListener,
+    client: Option<std::net::TcpStream>,
+    synced: bool,
+}
+
+impl TcpH264Sink {
+    /// Writes to a stalled viewer give up after this long.
+    const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+    /// Total time one packet may take; the timeout above is per syscall,
+    /// so a viewer trickling bytes would otherwise hold the writer for
+    /// minutes.
+    const PACKET_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    pub fn bind(addr: std::net::SocketAddr) -> Result<Self> {
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            client: None,
+            synced: false,
+        })
+    }
+
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
+    /// Takes a pending connection; a newer viewer replaces the old one.
+    fn accept_pending(&mut self) {
+        loop {
+            match self.listener.accept() {
+                Ok((stream, peer)) => {
+                    let ready = stream
+                        .set_nonblocking(false)
+                        .and_then(|()| stream.set_write_timeout(Some(Self::WRITE_TIMEOUT)))
+                        .and_then(|()| stream.set_nodelay(true));
+                    if let Err(e) = ready {
+                        eprintln!("video_tcp: dropping {peer}: socket setup: {e}");
+                        continue;
+                    }
+                    eprintln!("video_tcp: viewer {peer} connected; waiting for a keyframe");
+                    self.client = Some(stream);
+                    self.synced = false;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(e) => {
+                    eprintln!("video_tcp: accept failed: {e}");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Sink for TcpH264Sink {
+    fn push_video(&mut self, pkt: EncodedPacket) -> Result<()> {
+        self.accept_pending();
+        if self.client.is_none() || (!self.synced && !pkt.keyframe) {
+            return Ok(());
+        }
+        self.synced = true;
+        if let Some(client) = &mut self.client {
+            if let Err(e) = write_within(client, &pkt.data, Self::PACKET_DEADLINE) {
+                eprintln!("video_tcp: viewer dropped: {e}");
+                self.client = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(client) = self.client.take() {
+            // Unblocks a viewer-side stall; the peer sees a clean close.
+            let _ = client.shutdown(std::net::Shutdown::Both);
+        }
+        Ok(())
+    }
+}
+
+/// `write_all` with one total deadline for the whole buffer.
+pub(crate) fn write_within(
+    out: &mut impl Write,
+    mut data: &[u8],
+    deadline: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    let start = std::time::Instant::now();
+    while !data.is_empty() {
+        match out.write(data) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => data = &data[n..],
+            Err(e) if matches!(e.kind(), ErrorKind::Interrupted) => {}
+            Err(e) if !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(e);
+            }
+            Err(_) => {}
+        }
+        if !data.is_empty() && start.elapsed() >= deadline {
+            return Err(ErrorKind::TimedOut.into());
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ fan-out
@@ -222,6 +338,81 @@ mod tests {
         d
     }
 
+    fn packet(keyframe: bool, tag: u8) -> EncodedPacket {
+        EncodedPacket::new(Duration::ZERO, keyframe, vec![tag; 4])
+    }
+
+    fn read_until_closed(mut client: std::net::TcpStream) -> Vec<u8> {
+        use std::io::Read;
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut got = Vec::new();
+        let _ = client.read_to_end(&mut got);
+        got
+    }
+
+    /// Pushes until the listener has accepted the client (the connect
+    /// completes asynchronously); returns once a keyframe was written.
+    fn push_until_served(sink: &mut TcpH264Sink) {
+        for _ in 0..200 {
+            sink.push_video(packet(false, 1)).unwrap();
+            if sink.client.is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("client was never accepted");
+    }
+
+    #[test]
+    fn tcp_sink_waits_for_a_keyframe_per_client() {
+        let mut sink = TcpH264Sink::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let client = std::net::TcpStream::connect(sink.local_addr().unwrap()).unwrap();
+        push_until_served(&mut sink);
+        sink.push_video(packet(false, 2)).unwrap();
+        sink.push_video(packet(true, 3)).unwrap();
+        sink.push_video(packet(false, 4)).unwrap();
+        sink.finish().unwrap();
+        drop(sink);
+        assert_eq!(read_until_closed(client), [3, 3, 3, 3, 4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn tcp_sink_survives_a_dead_client_and_serves_the_next() {
+        let mut sink = TcpH264Sink::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = sink.local_addr().unwrap();
+        let first = std::net::TcpStream::connect(addr).unwrap();
+        push_until_served(&mut sink);
+        drop(first);
+        // Writes to a closed peer fail after the RST arrives; never an Err.
+        for _ in 0..50 {
+            sink.push_video(packet(true, 5)).unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(sink.client.is_none(), "dead client must be dropped");
+        let second = std::net::TcpStream::connect(addr).unwrap();
+        push_until_served(&mut sink);
+        sink.push_video(packet(true, 6)).unwrap();
+        drop(sink);
+        assert_eq!(read_until_closed(second), [6, 6, 6, 6]);
+    }
+
+    #[test]
+    fn tcp_sink_drops_a_viewer_that_stalls_inside_one_packet() {
+        let mut sink = TcpH264Sink::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        // Connected but never reading: a packet larger than the socket
+        // buffers cannot be written.
+        let _stalled = std::net::TcpStream::connect(sink.local_addr().unwrap()).unwrap();
+        push_until_served(&mut sink);
+        let start = std::time::Instant::now();
+        sink.push_video(EncodedPacket::new(Duration::ZERO, true, vec![7; 64 << 20]))
+            .unwrap();
+        assert!(start.elapsed() < Duration::from_millis(1900), "bounded");
+        assert!(sink.client.is_none(), "stalled viewer must be dropped");
+        sink.finish().unwrap();
+    }
+
     #[test]
     fn jsonl_sink_writes_one_valid_json_object_per_line() {
         let mut sink = JsonlMetaSink::new(Vec::new());
@@ -321,12 +512,50 @@ mod tests {
 /// Moves a sink's blocking writes onto a bounded writer thread.
 ///
 /// The processing thread only queues a packet/metadata frame; file
-/// flushes and slow disks happen on `sink-writer`. Backpressure is
-/// explicit: when the queue is full, `push_*` blocks rather than
-/// growing memory without bound.
+/// flushes and slow disks happen on `sink-writer`. The processing
+/// thread holds capture buffers, so `push_*` never blocks: when the
+/// queue is full the packet/frame is dropped and counted in
+/// [`AsyncDrops`]. After a dropped video packet, video is held back
+/// until the next keyframe so a viewer never decodes a torn GOP.
+/// Only `finish` waits (for room to queue the stop request).
 pub struct AsyncSink {
     tx: Option<std::sync::mpsc::SyncSender<Command>>,
     handle: Option<std::thread::JoinHandle<Result<()>>>,
+    drops: Arc<AsyncDrops>,
+    failure: Arc<Failure>,
+    await_keyframe: bool,
+}
+
+/// The inner sink's first error, visible to the pushing side.
+#[derive(Default)]
+struct Failure {
+    failed: std::sync::atomic::AtomicBool,
+    message: Mutex<String>,
+}
+
+impl Failure {
+    fn record(&self, e: &Error) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        if !self.failed.load(Acquire) {
+            *self.message.lock().expect("failure mutex poisoned") = e.to_string();
+            self.failed.store(true, Release);
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            let msg = self.message.lock().expect("failure mutex poisoned");
+            return Err(Error::Platform(format!("sink-writer failed: {msg}")));
+        }
+        Ok(())
+    }
+}
+
+/// Packets dropped by an [`AsyncSink`] because its queue was full.
+#[derive(Debug, Default)]
+pub struct AsyncDrops {
+    pub video: std::sync::atomic::AtomicU64,
+    pub meta: std::sync::atomic::AtomicU64,
 }
 
 enum Command {
@@ -338,10 +567,13 @@ enum Command {
 impl AsyncSink {
     pub fn new(mut inner: Box<dyn Sink>, capacity: usize) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Command>(capacity.max(1));
+        let failure = Arc::new(Failure::default());
+        let writer_failure = Arc::clone(&failure);
         let handle = std::thread::Builder::new()
             .name("sink-writer".into())
             .spawn(move || -> Result<()> {
                 let mut first: Option<Error> = None;
+                let mut finished = false;
                 while let Ok(cmd) = rx.recv() {
                     let is_finish = matches!(cmd, Command::Finish);
                     let result = match cmd {
@@ -350,18 +582,22 @@ impl AsyncSink {
                         Command::Finish => inner.finish(),
                     };
                     if let Err(e) = result {
+                        writer_failure.record(&e);
                         if first.is_none() {
                             first = Some(e);
                         }
                     }
                     if is_finish {
+                        finished = true;
                         break;
                     }
                 }
                 // Channel closed without an explicit Finish (Drop path).
-                if first.is_none() {
+                if !finished {
                     if let Err(e) = inner.finish() {
-                        first = Some(e);
+                        if first.is_none() {
+                            first = Some(e);
+                        }
                     }
                 }
                 first.map_or(Ok(()), Err)
@@ -370,32 +606,69 @@ impl AsyncSink {
         Self {
             tx: Some(tx),
             handle: Some(handle),
+            drops: Arc::new(AsyncDrops::default()),
+            failure,
+            await_keyframe: false,
         }
     }
 
-    fn send(&mut self, cmd: Command) -> Result<()> {
+    /// Shared drop counters; stay readable after the sink is boxed.
+    pub fn drops(&self) -> Arc<AsyncDrops> {
+        Arc::clone(&self.drops)
+    }
+
+    /// Queues without blocking. `Ok(false)` means the queue was full.
+    fn try_queue(&self, cmd: Command) -> Result<bool> {
+        use std::sync::mpsc::TrySendError;
+        self.failure.check()?;
         let tx = self
             .tx
             .as_ref()
             .ok_or_else(|| Error::Platform("async sink is already finished".into()))?;
-        tx.send(cmd)
-            .map_err(|_| Error::Platform("sink-writer thread is gone".into()))
+        match tx.try_send(cmd) {
+            Ok(()) => Ok(true),
+            Err(TrySendError::Full(_)) => Ok(false),
+            Err(TrySendError::Disconnected(_)) => {
+                Err(Error::Platform("sink-writer thread is gone".into()))
+            }
+        }
     }
 }
 
 impl Sink for AsyncSink {
     fn push_video(&mut self, pkt: EncodedPacket) -> Result<()> {
-        self.send(Command::Video(pkt))
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.await_keyframe && !pkt.keyframe {
+            self.drops.video.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        let keyframe = pkt.keyframe;
+        if self.try_queue(Command::Video(pkt))? {
+            if keyframe {
+                self.await_keyframe = false;
+            }
+        } else {
+            self.await_keyframe = true;
+            self.drops.video.fetch_add(1, Relaxed);
+        }
+        Ok(())
     }
 
     fn push_meta(&mut self, det: &edge_core::Detections) -> Result<()> {
-        self.send(Command::Meta(det.clone()))
+        if !self.try_queue(Command::Meta(det.clone()))? {
+            self.drops
+                .meta
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<()> {
         if self.tx.is_some() {
-            let _ = self.send(Command::Finish);
-            self.tx = None;
+            // Blocking is fine here: shutdown, and the join waits anyway.
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(Command::Finish);
+            }
         }
         let Some(handle) = self.handle.take() else {
             return Ok(());
@@ -449,7 +722,7 @@ mod async_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("meta.jsonl");
         let inner: Box<dyn Sink> = Box::new(JsonlMetaSink::create(&path).unwrap());
-        let mut sink = AsyncSink::new(inner, 4);
+        let mut sink = AsyncSink::new(inner, 8);
         for seq in 0..5 {
             sink.push_meta(&detections(seq)).unwrap();
         }
@@ -466,5 +739,122 @@ mod async_tests {
         let mut sink = AsyncSink::new(inner, 1);
         sink.finish().unwrap();
         assert!(sink.push_meta(&detections(1)).is_err());
+    }
+
+    struct Gate {
+        release: std::sync::mpsc::Receiver<()>,
+        seen: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl Sink for Gate {
+        fn push_video(&mut self, pkt: EncodedPacket) -> Result<()> {
+            let _ = self.release.recv();
+            self.seen.lock().unwrap().push(pkt.keyframe);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn async_sink_never_blocks_and_counts_drops_until_a_keyframe() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let inner: Box<dyn Sink> = Box::new(Gate {
+            release: release_rx,
+            seen: Arc::clone(&seen),
+        });
+        let mut sink = AsyncSink::new(inner, 2);
+        let drops = sink.drops();
+        let pkt = |key| EncodedPacket::new(Duration::ZERO, key, vec![0]);
+        // The writer is stuck on the first packet; two more fill the queue.
+        for _ in 0..20 {
+            sink.push_video(pkt(true)).unwrap();
+        }
+        assert!(drops.video.load(Relaxed) >= 17, "full queue must drop");
+        // Non-keyframes are held back after a drop, even with room.
+        let before = drops.video.load(Relaxed);
+        sink.push_video(pkt(false)).unwrap();
+        assert_eq!(drops.video.load(Relaxed), before + 1);
+        sink.push_meta(&detections(1)).unwrap();
+        sink.push_meta(&detections(2)).unwrap();
+        sink.push_meta(&detections(3)).unwrap();
+        // The queue is still full (the writer is stuck): all three drop.
+        assert_eq!(drops.meta.load(Relaxed), 3);
+        for _ in 0..30 {
+            let _ = release_tx.send(());
+        }
+        // Room again: a keyframe re-opens the gate, then deltas flow.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            sink.push_video(pkt(true)).unwrap();
+            if !sink.await_keyframe {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "gate never reopened");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = drops.video.load(Relaxed);
+        for _ in 0..3 {
+            sink.push_video(pkt(false)).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(drops.video.load(Relaxed), before, "video flows again");
+        sink.finish().unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().filter(|&&k| !k).count() >= 1, "deltas arrived");
+    }
+
+    struct Failing {
+        finishes: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Sink for Failing {
+        fn push_video(&mut self, _pkt: EncodedPacket) -> Result<()> {
+            Err(Error::Platform("disk full".into()))
+        }
+
+        fn finish(&mut self) -> Result<()> {
+            self.finishes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn async_sink_surfaces_an_inner_error_on_a_later_push() {
+        let finishes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let inner: Box<dyn Sink> = Box::new(Failing {
+            finishes: Arc::clone(&finishes),
+        });
+        let mut sink = AsyncSink::new(inner, 4);
+        let pkt = || EncodedPacket::new(Duration::ZERO, true, vec![0]);
+        sink.push_video(pkt()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let err = loop {
+            match sink.push_video(pkt()) {
+                Err(e) => break e,
+                Ok(()) => {
+                    assert!(std::time::Instant::now() < deadline, "error never surfaced");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        assert!(err.to_string().contains("disk full"), "{err}");
+        assert!(sink.push_meta(&detections(1)).is_err());
+        // finish keeps first-error semantics.
+        let fin = sink.finish().unwrap_err();
+        assert!(fin.to_string().contains("disk full"), "{fin}");
+    }
+
+    #[test]
+    fn async_sink_finishes_the_inner_sink_exactly_once() {
+        let finishes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let inner: Box<dyn Sink> = Box::new(Failing {
+            finishes: Arc::clone(&finishes),
+        });
+        let mut sink = AsyncSink::new(inner, 4);
+        sink.finish().unwrap();
+        drop(sink);
+        assert_eq!(finishes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

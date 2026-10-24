@@ -11,7 +11,7 @@ width = 1440 # IMX296 native
 height = 1080
 fps = 30
 pool_size = 8 # sim semantics; on device the Argus pool is fixed — see the in-flight budget in docs/jetson-bringup.md
-# argus_pool = 12 # set from the board; enables in-flight budget validation
+# argus_pool = 6 # set from the board; enables in-flight budget validation
 gain_max = 16.0 # cap AE brightness swings (reference product's value)
 
 [model]
@@ -43,5 +43,5 @@ metadata_only = false
 # run this profile, and it has no encoder.
 
 [pipeline]
-queue_depth = 2 # live source: 4 frames is 133 ms at 30 fps, over the latency budget before any work
+queue_depth = 1 # live source: keep the in-flight surface budget below the Argus pool
 max_idle_ms = 5000 # no first frame within 5 s is a capture fault, not a quiet sensor

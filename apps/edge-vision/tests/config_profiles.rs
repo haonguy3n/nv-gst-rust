@@ -37,3 +37,13 @@ fn orin_nx_profile_is_strict_hardware_h264() {
     assert!(cfg.encoder.hardware);
     assert_eq!(cfg.pipeline.max_idle_ms, 5000);
 }
+
+#[test]
+fn orin_nano_view_profile_is_video_only_over_tcp() {
+    let cfg = profile("orin-nano-view.toml");
+    assert!(!cfg.model.enabled);
+    assert!(cfg.encoder.enabled && !cfg.encoder.hardware);
+    assert!(!cfg.stream.metadata_only);
+    assert_eq!(cfg.stream.video_tcp.map(|a| a.port()), Some(8555));
+    assert_eq!(cfg.pipeline.queue_depth, 1);
+}

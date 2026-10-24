@@ -40,6 +40,39 @@ impl Sink for StdoutSink {
     }
 }
 
+/// The web UI's counters, from the same numbers as the `[live]` line.
+fn stats_json(m: &edge_pipeline::PipelineMetrics, drops: &edge_sinks::AsyncDrops) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ms = |d: Option<std::time::Duration>| {
+        d.map_or_else(
+            || "null".to_string(),
+            |d| format!("{:.1}", d.as_secs_f64() * 1000.0),
+        )
+    };
+    let encode_push_ms = if m.frames_processed == 0 {
+        0.0
+    } else {
+        m.encode_push_total.as_secs_f64() * 1000.0 / m.frames_processed as f64
+    };
+    format!(
+        "{{\"type\":\"stats\",\"captured\":{},\"processed\":{},\"dropped\":{},\
+         \"enc_dropped\":{},\"timeouts\":{},\"detections\":{},\"p50_ms\":{},\"p95_ms\":{},\
+         \"p99_ms\":{},\"encode_push_ms\":{:.2},\"sink_drop_video\":{},\"sink_drop_meta\":{}}}",
+        m.frames_captured,
+        m.frames_processed,
+        m.frames_dropped,
+        m.encode_dropped,
+        m.capture_timeouts,
+        m.detections,
+        ms(m.latency.p50()),
+        ms(m.latency.p95()),
+        ms(m.latency.p99()),
+        encode_push_ms,
+        drops.video.load(Relaxed),
+        drops.meta.load(Relaxed),
+    )
+}
+
 fn parse_args() -> Result<(PathBuf, Option<u64>, bool)> {
     let mut config = PathBuf::from("config/x86-dev.toml");
     let mut frames: Option<u64> = None;
@@ -126,16 +159,51 @@ fn main() -> Result<()> {
             Box::new(SimPostProcessor::new(config.model.score_threshold))
         }
     };
-    let inner: Box<dyn Sink> = match &config.stream.meta_file {
-        Some(path) => Box::new(edge_sinks::MultiSink::new(vec![
-            Box::new(StdoutSink { verbose_frames: 3 }) as Box<dyn Sink>,
-            Box::new(edge_sinks::JsonlMetaSink::create(path)?) as Box<dyn Sink>,
-        ])),
-        None => Box::new(StdoutSink { verbose_frames: 3 }),
+    let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(StdoutSink { verbose_frames: 3 })];
+    if let Some(path) = &config.stream.meta_file {
+        sinks.push(Box::new(edge_sinks::JsonlMetaSink::create(path)?));
+    }
+    if let Some(addr) = config.stream.video_tcp {
+        sinks
+            .push(Box::new(edge_sinks::TcpH264Sink::bind(addr).with_context(
+                || format!("binding stream.video_tcp {addr}"),
+            )?));
+        println!("video: raw H.264 on tcp://{addr}");
+    }
+    let web_ui = match config.stream.web_ui {
+        Some(addr) => {
+            let ui = edge_sinks::WebUi::bind(addr)
+                .with_context(|| format!("binding stream.web_ui {addr}"))?;
+            sinks.push(Box::new(ui.sink()));
+            println!("video: web UI at http://{}/", ui.local_addr());
+            Some(std::sync::Arc::new(ui))
+        }
+        None => None,
+    };
+    if let Some(port) = config.stream.rtsp_port {
+        #[cfg(feature = "rtsp")]
+        {
+            let rtsp = edge_sinks::rtsp::RtspSink::new(port, config.encoder.codec)
+                .with_context(|| format!("starting RTSP on port {port}"))?;
+            println!("video: RTSP at {}", rtsp.url());
+            sinks.push(Box::new(rtsp));
+        }
+        #[cfg(not(feature = "rtsp"))]
+        {
+            let _ = port;
+            bail!("stream.rtsp_port needs a build with --features rtsp");
+        }
+    }
+    let inner: Box<dyn Sink> = if sinks.len() == 1 {
+        sinks.remove(0)
+    } else {
+        Box::new(edge_sinks::MultiSink::new(sinks))
     };
     // Disk/terminal writes happen on a bounded writer thread, never on
     // the frame-processing thread (N20).
-    let sink: Box<dyn Sink> = Box::new(edge_sinks::AsyncSink::new(inner, 64));
+    let async_sink = edge_sinks::AsyncSink::new(inner, 64);
+    let drops = async_sink.drops();
+    let sink: Box<dyn Sink> = Box::new(async_sink);
     let mut pipeline = Pipeline::build(&*platform, config, postprocessor, sink)?;
 
     println!("platform: {}", platform.name());
@@ -151,23 +219,30 @@ fn main() -> Result<()> {
         }
     })
     .context("installing signal handler")?;
-    // With --prometheus, also serve the counters while the run is
-    // in progress (stderr, so stdout keeps the final exposition).
-    let reporter = if prometheus {
+    // With --prometheus, also print the counters while the run is in
+    // progress (stderr, so stdout keeps the final exposition); the web
+    // UI gets them about once per second.
+    let reporter = if prometheus || web_ui.is_some() {
         let live = pipeline.live_metrics();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done_flag = std::sync::Arc::clone(&done);
+        let ui = web_ui.clone();
+        let drops = drops.clone();
         let handle = std::thread::Builder::new()
             .name("metrics-reporter".into())
             .spawn(move || {
                 // Sleep in slices so shutdown is not delayed by
                 // up to a whole reporting interval.
-                let mut slept = std::time::Duration::ZERO;
+                let mut ticks = 0u32;
                 while !done_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::sleep(std::time::Duration::from_millis(100));
-                    slept += std::time::Duration::from_millis(100);
-                    if slept >= std::time::Duration::from_secs(5) {
-                        slept = std::time::Duration::ZERO;
+                    ticks += 1;
+                    if ticks.is_multiple_of(10) {
+                        if let Some(ui) = &ui {
+                            ui.publish_stats(&stats_json(&live.snapshot(), &drops));
+                        }
+                    }
+                    if prometheus && ticks.is_multiple_of(50) {
                         eprintln!("[live] {}", live.snapshot().summary());
                     }
                 }
@@ -183,6 +258,14 @@ fn main() -> Result<()> {
         let _ = handle.join();
     }
     println!("done: {}", metrics.summary());
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        println!(
+            "sink drops: video={} meta={}",
+            drops.video.load(Relaxed),
+            drops.meta.load(Relaxed)
+        );
+    }
     if prometheus {
         print!("{}", metrics.render_prometheus());
     }

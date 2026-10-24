@@ -12,7 +12,7 @@ width = 1440 # IMX296 native
 height = 1080
 fps = 30
 pool_size = 8 # sim semantics; the Argus pool is fixed (see docs/jetson-bringup.md)
-# argus_pool = 12 # set from the board; enables in-flight budget validation
+argus_pool = 6 # measured on the Nano; at queue_depth=1 the static worst case is 8 (queue_depth + 7) against this pool of 6: the app warns instead of refusing
 # No gain/exposure ranges here: at-start ranges gave black frames on
 # the Nano. Apply them after PLAYING once brightness is checked.
 
@@ -43,5 +43,5 @@ metadata_only = false
 # sink/tests exercise the encoder stage.
 
 [pipeline]
-queue_depth = 2 # live source: small queues keep the in-flight budget under Argus
+queue_depth = 1 # live source: small queues keep the in-flight budget under Argus
 max_idle_ms = 5000
