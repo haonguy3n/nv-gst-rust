@@ -12,7 +12,17 @@
 //!   CUDA include directory, `lib64` then `lib`).
 //! - `SYSROOT` or `PKG_CONFIG_SYSROOT_DIR`: the target sysroot.
 //! - `TRT_SYS_SKIP_SHIM=1`: type-check the Rust side on a PC without the
-//!   headers; the result cannot link.
+//!   headers; the result cannot link (this also skips the CUDA kernel).
+//!
+//! With the `cuda-preprocess` feature `shim/preprocess_kernels.cu` is also
+//! compiled by nvcc (it needs the EGL headers: `cuda_egl_interop.h`):
+//! - `TRT_SYS_NVCC`, else `NVCC`, else `CUDACXX` (Yocto's `cuda` class), else
+//!   `nvcc` from PATH.
+//! - `CUDAHOSTCXX` (the `cuda` class): the host compiler, passed as `-ccbin`.
+//! - `TRT_SYS_NVCC_FLAGS`, else `CUDAFLAGS` (the `cuda` class: architecture,
+//!   include and sysroot flags): extra nvcc flags, split on spaces.
+//! - `TRT_SYS_CUDA_ARCH`: the `-arch` value (default `sm_87`, the Orin); not
+//!   added when the flags above already name an architecture.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -23,6 +33,13 @@ const ENV_VARS: &[&str] = &[
     "TRT_SYS_LIB",
     "TRT_SYS_CUDA_LIB",
     "TRT_SYS_SKIP_SHIM",
+    "TRT_SYS_NVCC",
+    "NVCC",
+    "CUDACXX",
+    "CUDAHOSTCXX",
+    "TRT_SYS_NVCC_FLAGS",
+    "CUDAFLAGS",
+    "TRT_SYS_CUDA_ARCH",
     "SYSROOT",
     "PKG_CONFIG_SYSROOT_DIR",
 ];
@@ -31,6 +48,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=shim/trt_shim.cpp");
     println!("cargo:rerun-if-changed=shim/trt_shim.h");
+    println!("cargo:rerun-if-changed=shim/preprocess_kernels.cu");
+    println!("cargo:rerun-if-changed=shim/preprocess_shim.h");
     for var in ENV_VARS {
         println!("cargo:rerun-if-env-changed={var}");
     }
@@ -48,6 +67,9 @@ fn main() {
     let trt_include = find_trt_include(sysroot.as_deref());
     let cuda_include = find_cuda_include(sysroot.as_deref());
     compile(trt_include.as_deref(), &cuda_include);
+    if env::var_os("CARGO_FEATURE_CUDA_PREPROCESS").is_some() {
+        compile_cuda_kernels(&cuda_include);
+    }
     link(sysroot.as_deref(), &cuda_include);
 }
 
@@ -156,6 +178,43 @@ fn compile(trt_include: Option<&Path>, cuda_include: &Path) {
         build.flag("-isystem").flag(dir.to_string_lossy().as_ref());
     }
     build.compile("trt_shim");
+}
+
+/// nvcc, `-c`, into `OUT_DIR`; the object joins a static library for the linker.
+fn compile_cuda_kernels(cuda_include: &Path) {
+    let var = |name: &str| env::var(name).ok().filter(|v| !v.trim().is_empty());
+    let nvcc = var("TRT_SYS_NVCC")
+        .or_else(|| var("NVCC"))
+        .or_else(|| var("CUDACXX"))
+        .unwrap_or_else(|| "nvcc".into());
+    let flags = var("TRT_SYS_NVCC_FLAGS")
+        .or_else(|| var("CUDAFLAGS"))
+        .unwrap_or_default();
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let object = out_dir.join("preprocess_kernels.o");
+    let mut cmd = std::process::Command::new(&nvcc);
+    cmd.args(["-c", "-O2", "-std=c++17", "-Xcompiler", "-fPIC", "-Ishim"])
+        .arg(format!("-I{}", cuda_include.display()))
+        .args(flags.split_whitespace());
+    if let Some(host) = var("CUDAHOSTCXX") {
+        cmd.args(["-ccbin", &host]);
+    }
+    if !flags.contains("-arch") && !flags.contains("-gencode") {
+        let arch = var("TRT_SYS_CUDA_ARCH").unwrap_or_else(|| "sm_87".into());
+        cmd.arg(format!("-arch={arch}"));
+    }
+    cmd.arg("-o").arg(&object).arg("shim/preprocess_kernels.cu");
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => fail(&format!("{nvcc} failed ({status}): {cmd:?}")),
+        Err(e) => fail(&format!(
+            "cannot run nvcc ({nvcc}: {e}). The `cuda-preprocess` feature needs it: set \
+             TRT_SYS_NVCC (or NVCC), or put nvcc on PATH"
+        )),
+    }
+    cc::Build::new()
+        .object(&object)
+        .compile("trt_cuda_preprocess");
 }
 
 fn link(sysroot: Option<&Path>, cuda_include: &Path) {

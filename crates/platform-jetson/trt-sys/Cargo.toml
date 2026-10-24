@@ -11,9 +11,14 @@ description = "TensorRT + CUDA runtime behind a C++ shim with a C ABI (all unsaf
 # libraries: the Yocto sysroot on the camera image). Off on the PC, where
 # the crate is only the pure types.
 shim = []
+# Also compile the CUDA kernel that writes the input tensor from the VIC's RGBA
+# surface (shim/preprocess_kernels.cu; needs nvcc and the EGL headers). Implies
+# `shim`; registers the surface's EGL image with CUDA through `nvbuf-sys`.
+cuda-preprocess = ["shim", "dep:nvbuf-sys", "nvbuf-sys/link"]
 
 [dependencies]
 log.workspace = true
+nvbuf-sys = { path = "../nvbuf-sys", optional = true }
 
 [build-dependencies]
 cc = "1"

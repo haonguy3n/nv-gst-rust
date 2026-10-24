@@ -326,6 +326,12 @@ impl Stream {
         Ok(Self { raw })
     }
 
+    /// For the other modules of this crate that queue work on the stream.
+    #[cfg(feature = "cuda-preprocess")]
+    pub(crate) fn as_raw(&self) -> *mut c_void {
+        self.raw.as_ptr()
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         // SAFETY: live stream.
         status(unsafe { ffi::trt_stream_synchronize(self.raw.as_ptr()) })

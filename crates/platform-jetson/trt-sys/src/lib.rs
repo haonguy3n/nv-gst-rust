@@ -24,10 +24,14 @@ pub use types::{
     Result,
 };
 
+#[cfg(feature = "cuda-preprocess")]
+mod cuda_preprocess;
 #[cfg(feature = "shim")]
 mod ffi;
 #[cfg(feature = "shim")]
 mod shim;
+#[cfg(feature = "cuda-preprocess")]
+pub use cuda_preprocess::RgbaTensorWriter;
 #[cfg(feature = "shim")]
 pub use shim::{
     build_plan, device_info, set_device_for_thread, version, Context, Engine, Event, Graph,

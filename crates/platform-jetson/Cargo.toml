@@ -22,6 +22,11 @@ gst = [
 # CUDA 13.2); see trt-sys/build.rs for the environment variables.
 trt = ["gst", "trt-sys/shim", "nvbuf-sys/link"]
 
+# The CUDA preprocessor (T9): a kernel writes the input tensor from the VIC's
+# RGBA surface instead of the CPU. Needs nvcc and the EGL headers (build.rs of
+# trt-sys); falls back to the CPU writer at run time if CUDA cannot map the surface.
+cuda-preprocess = ["trt", "trt-sys/cuda-preprocess"]
+
 [[example]]
 name = "gst-capture"
 path = "examples/gst_capture.rs"

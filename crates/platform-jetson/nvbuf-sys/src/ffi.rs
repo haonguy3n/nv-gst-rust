@@ -179,6 +179,8 @@ extern "C" {
     pub(crate) fn NvBufSurfaceSyncForCpu(surf: *mut NvBufSurface, index: i32, plane: i32) -> i32;
     pub(crate) fn NvBufSurfaceSyncForDevice(surf: *mut NvBufSurface, index: i32, plane: i32)
         -> i32;
+    pub(crate) fn NvBufSurfaceMapEglImage(surf: *mut NvBufSurface, index: i32) -> i32;
+    pub(crate) fn NvBufSurfaceUnMapEglImage(surf: *mut NvBufSurface, index: i32) -> i32;
     pub(crate) fn NvBufSurfaceMemSet(
         surf: *mut NvBufSurface,
         index: i32,

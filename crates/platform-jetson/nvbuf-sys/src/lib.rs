@@ -30,7 +30,7 @@ mod surface;
 pub use error::NvbufError;
 pub use ffi::{ColorFormat, Filter, Rect};
 #[cfg(feature = "link")]
-pub use surface::{transform_letterbox, MappedPlane, OwnedSurface, SurfaceRef};
+pub use surface::{transform_letterbox, EglImage, MappedPlane, OwnedSurface, SurfaceRef};
 
 use std::ffi::c_void;
 use std::fmt;
