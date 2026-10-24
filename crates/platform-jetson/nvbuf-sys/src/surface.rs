@@ -4,8 +4,10 @@
 
 use crate::ffi::{self, ColorFormat, Filter, Rect};
 use crate::{surface_from_bytes, NvBufSurface, NvbufError, SurfaceInfo, SurfaceLayout};
+use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
+use std::sync::{Arc, Mutex, PoisonError};
 
 fn check(func: &'static str, code: i32) -> Result<(), NvbufError> {
     if code == 0 {
@@ -15,18 +17,92 @@ fn check(func: &'static str, code: i32) -> Result<(), NvbufError> {
     }
 }
 
-/// A surface we created (pitch-linear, `NVBUF_MEM_DEFAULT`), mapped for
-/// the CPU for its whole life. Destroyed on drop.
-pub struct OwnedSurface {
+/// The driver surface and its optional EGL mapping. Shared by the
+/// `OwnedSurface` and every `EglImage` made from it, so the last holder
+/// destroys the surface and no drop order can leave a mapping dangling.
+struct Inner {
     ptr: NonNull<NvBufSurface>,
+    egl: Mutex<Option<NonNull<c_void>>>,
+}
+
+// SAFETY: the surface is plain driver memory with no thread affinity; the
+// Rust side only reads the pointer, and the one mutable piece (the EGL
+// mapping) is behind a mutex.
+unsafe impl Send for Inner {}
+unsafe impl Sync for Inner {}
+
+impl Inner {
+    fn map_egl(&self) -> Result<NonNull<c_void>, NvbufError> {
+        let mut slot = self.egl.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(image) = *slot {
+            return Ok(image);
+        }
+        // SAFETY: valid surface, batch index 0.
+        check("NvBufSurfaceMapEglImage", unsafe {
+            ffi::NvBufSurfaceMapEglImage(self.ptr.as_ptr(), 0)
+        })?;
+        // SAFETY: surfaceList has one entry after a batch-1 create.
+        let params = unsafe { &*(*self.ptr.as_ptr()).surface_list };
+        let image = NonNull::new(params.mapped_addr.egl_image).ok_or_else(|| {
+            NvbufError::Geometry("NvBufSurfaceMapEglImage left the EGL image null".into())
+        })?;
+        *slot = Some(image);
+        Ok(image)
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let mapped = self
+            .egl
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        // SAFETY: we own the surface; unmap of an unmapped surface only
+        // returns an error code, which is ignored here.
+        unsafe {
+            if mapped {
+                ffi::NvBufSurfaceUnMapEglImage(self.ptr.as_ptr(), 0);
+            }
+            ffi::NvBufSurfaceUnMap(self.ptr.as_ptr(), 0, 0);
+            ffi::NvBufSurfaceDestroy(self.ptr.as_ptr());
+        }
+    }
+}
+
+/// The EGL image of an `OwnedSurface`, for CUDA to register. It keeps the
+/// surface and its mapping alive while it exists.
+pub struct EglImage {
+    inner: Arc<Inner>,
+    image: NonNull<c_void>,
+}
+
+// SAFETY: an EGLImageKHR is an opaque handle with no thread affinity.
+unsafe impl Send for EglImage {}
+unsafe impl Sync for EglImage {}
+
+impl EglImage {
+    /// The `EGLImageKHR`, valid while `self` lives.
+    pub fn as_ptr(&self) -> *mut c_void {
+        self.image.as_ptr()
+    }
+
+    /// The surface's width and height in pixels, as the driver reports them.
+    pub fn size(&self) -> (u32, u32) {
+        // SAFETY: surfaceList has one entry after a batch-1 create.
+        let params = unsafe { &*(*self.inner.ptr.as_ptr()).surface_list };
+        (params.width, params.height)
+    }
+}
+
+/// A surface we created (pitch-linear, `NVBUF_MEM_DEFAULT`), mapped for
+/// the CPU for its whole life. Destroyed with its last `EglImage`.
+pub struct OwnedSurface {
+    inner: Arc<Inner>,
     width: u32,
     height: u32,
     format: ColorFormat,
 }
-
-// SAFETY: the surface is plain driver memory with no thread affinity;
-// all access goes through `&self`/`&mut self` of one owner at a time.
-unsafe impl Send for OwnedSurface {}
 
 impl OwnedSurface {
     /// Create one surface, set `numFilled = 1` (the driver leaves it 0)
@@ -52,16 +128,19 @@ impl OwnedSurface {
         let ptr = NonNull::new(raw)
             .ok_or_else(|| NvbufError::Geometry("NvBufSurfaceCreate returned null".into()))?;
         let surface = Self {
-            ptr,
+            inner: Arc::new(Inner {
+                ptr,
+                egl: Mutex::new(None),
+            }),
             width,
             height,
             format,
         };
         // SAFETY: just created, exclusively ours.
-        unsafe { (*surface.ptr.as_ptr()).num_filled = 1 };
+        unsafe { (*surface.inner.ptr.as_ptr()).num_filled = 1 };
         // SAFETY: valid surface; on error `surface` drops and destroys it.
         check("NvBufSurfaceMap", unsafe {
-            ffi::NvBufSurfaceMap(surface.ptr.as_ptr(), 0, 0, ffi::NVBUF_MAP_READ)
+            ffi::NvBufSurfaceMap(surface.inner.ptr.as_ptr(), 0, 0, ffi::NVBUF_MAP_READ)
         })?;
         Ok(surface)
     }
@@ -79,11 +158,11 @@ impl OwnedSurface {
     pub fn fill(&self, value: u8) -> Result<(), NvbufError> {
         // SAFETY: valid mapped surface.
         check("NvBufSurfaceMemSet", unsafe {
-            ffi::NvBufSurfaceMemSet(self.ptr.as_ptr(), 0, 0, value)
+            ffi::NvBufSurfaceMemSet(self.inner.ptr.as_ptr(), 0, 0, value)
         })?;
         // SAFETY: as above.
         check("NvBufSurfaceSyncForDevice", unsafe {
-            ffi::NvBufSurfaceSyncForDevice(self.ptr.as_ptr(), 0, 0)
+            ffi::NvBufSurfaceSyncForDevice(self.inner.ptr.as_ptr(), 0, 0)
         })
     }
 
@@ -92,10 +171,10 @@ impl OwnedSurface {
     pub fn map_read(&self) -> Result<MappedPlane<'_>, NvbufError> {
         // SAFETY: valid mapped surface.
         check("NvBufSurfaceSyncForCpu", unsafe {
-            ffi::NvBufSurfaceSyncForCpu(self.ptr.as_ptr(), 0, 0)
+            ffi::NvBufSurfaceSyncForCpu(self.inner.ptr.as_ptr(), 0, 0)
         })?;
         // SAFETY: surfaceList has one entry after a batch-1 create.
-        let params = unsafe { &*(*self.ptr.as_ptr()).surface_list };
+        let params = unsafe { &*(*self.inner.ptr.as_ptr()).surface_list };
         let addr = params.mapped_addr.addr[0].cast::<u8>();
         let pitch = params.plane_params.pitch[0] as usize;
         let min = pitch * self.height as usize;
@@ -120,19 +199,18 @@ impl OwnedSurface {
         })
     }
 
-    fn as_ptr(&self) -> *mut NvBufSurface {
-        self.ptr.as_ptr()
+    /// Map the surface as an EGL image (once; later calls share it) for
+    /// `cudaGraphicsEGLRegisterImage`.
+    pub fn map_egl_image(&self) -> Result<EglImage, NvbufError> {
+        let image = self.inner.map_egl()?;
+        Ok(EglImage {
+            inner: Arc::clone(&self.inner),
+            image,
+        })
     }
-}
 
-impl Drop for OwnedSurface {
-    fn drop(&mut self) {
-        // SAFETY: we own the surface; unmap of an unmapped surface only
-        // returns an error code, which is ignored here.
-        unsafe {
-            ffi::NvBufSurfaceUnMap(self.ptr.as_ptr(), 0, 0);
-            ffi::NvBufSurfaceDestroy(self.ptr.as_ptr());
-        }
+    fn as_ptr(&self) -> *mut NvBufSurface {
+        self.inner.ptr.as_ptr()
     }
 }
 

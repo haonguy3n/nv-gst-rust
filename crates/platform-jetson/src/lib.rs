@@ -28,6 +28,8 @@
 pub mod build_progress;
 #[cfg(feature = "trt")]
 pub mod cuda;
+#[cfg(feature = "cuda-preprocess")]
+pub mod cuda_preprocess;
 pub mod engine_job;
 #[cfg(feature = "gst")]
 pub mod gst_encoder;

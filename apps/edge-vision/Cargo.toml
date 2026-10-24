@@ -13,6 +13,9 @@ description = "Edge vision pipeline binary: parse config, pick platform, run"
 jetson = ["dep:platform-jetson", "platform-jetson/gst"]
 # TensorRT inference on the Jetson (needs the Jetson sysroot at build time).
 trt = ["jetson", "platform-jetson/trt"]
+# The CUDA kernel writes the TensorRT input tensor from the VIC's surface
+# (needs nvcc and the EGL headers at build time); the CPU writer stays the fallback.
+cuda-preprocess = ["trt", "platform-jetson/cuda-preprocess"]
 # Real ONNX models in the sim backend (model.path in config).
 onnx = ["platform-sim/onnx"]
 # RTSP video sink (stream.rtsp_port). Needs the GStreamer RTSP server

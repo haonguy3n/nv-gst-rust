@@ -74,7 +74,7 @@ setup (X4).
 ```
 nvarguscamerasrc → NV12 NVMM → appsink
       → HwFrame (same gst::Buffer / NvBufSurface)
-      → [pre → infer → post] (T9 CUDA preprocessor: not written)
+      → [pre → infer → post] (T9 CUDA preprocessor: feature `cuda-preprocess`, device-unverified)
       → encode thread (leaky one-deep hand-off)
       → NX:  appsrc → nvv4l2h26xenc → byte-stream appsink
       → Nano: appsrc → nvvidconv → I420 → x264enc → h264parse → appsink
