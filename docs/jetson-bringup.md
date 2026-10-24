@@ -255,7 +255,7 @@ needs nvcc; without `trt`, the crate builds on any PC.
 | **Device tests** | `#[ignore]` checks for T3–T10 on the Orin (`tests/device_trt.rs`, written, not yet run; `EDGE_TEST_ONNX`, `EDGE_TEST_CACHE`)                       | `cargo test -p platform-jetson --features trt -- --ignored` passes on the Orin      |
 | **T9**  | CUDA preprocessor (optional optimisation): `NvBufSurfaceMapEglImage`, `cuGraphicsEGLRegisterImage`, kernel into the input binding; pre is 2.7 ms on the VIC path | output equals T8 within 1e-6                                                        |
 | **T10** | GPU time from CUDA events (`GpuTimer`, `InferenceEngine::last_gpu_time`, `edge_infer_gpu_seconds_total`, `gpu=` in the live line; not yet run on the board) | GPU time reported from events on the board                                          |
-| **T11** | Conformance on the board + Nsight/`tegrastats` zero-copy gate; FP16 vs ONNX Runtime numeric check (within 1e-2) not done; golden-set mAP not done        | M1 inference exit gate                                                              |
+| **T11** | Conformance on the board + Nsight/`tegrastats` zero-copy gate; FP16 vs ONNX Runtime numeric check (within 1e-2) and golden-set mAP: tooling in `tools/golden/README.md`, not yet run on the board | M1 inference exit gate                                                              |
 | **T12** | Install the systemd units and grants on the image (`tools/systemd/`): edge-vision runs from `/opt/edge-vision` via `tools/systemd/edge-vision-dev.service` as root; `CacheDirectory`, video group, camera-guard grants | image-owner work; the recipe builds the binary only                                 |
 
 **Order:** T11 is the M1 inference exit gate, with the device `#[ignore]`

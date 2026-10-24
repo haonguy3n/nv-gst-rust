@@ -27,6 +27,11 @@ name = "gst-capture"
 path = "examples/gst_capture.rs"
 required-features = ["gst"]
 
+[[example]]
+name = "trt-golden"
+path = "examples/trt-golden.rs"
+required-features = ["trt"]
+
 [dependencies]
 log.workspace = true
 edge-core = { path = "../core" }
