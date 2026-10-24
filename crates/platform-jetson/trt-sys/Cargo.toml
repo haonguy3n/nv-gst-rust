@@ -1,0 +1,22 @@
+[package]
+name = "trt-sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "TensorRT + CUDA runtime behind a C++ shim with a C ABI (all unsafe FFI of the Jetson inference path)"
+
+[features]
+# Compile and link the C++ shim (needs the TensorRT and CUDA headers and
+# libraries: the Yocto sysroot on the camera image). Off on the PC, where
+# the crate is only the pure types.
+shim = []
+
+[dependencies]
+log.workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

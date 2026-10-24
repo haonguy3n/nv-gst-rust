@@ -17,6 +17,11 @@ gst = [
     "dep:nvbuf-sys",
 ]
 
+# TensorRT inference (T3-T10): the C++ shim of `trt-sys`, the NvBufSurface
+# link lines and GStreamer. Needs the Jetson sysroot (TensorRT 10.16,
+# CUDA 13.2); see trt-sys/build.rs for the environment variables.
+trt = ["gst", "trt-sys/shim", "nvbuf-sys/link"]
+
 [[example]]
 name = "gst-capture"
 path = "examples/gst_capture.rs"
@@ -26,6 +31,9 @@ required-features = ["gst"]
 log.workspace = true
 edge-core = { path = "../core" }
 nvbuf-sys = { path = "nvbuf-sys", optional = true }
+# Plain types without the `trt` feature (the shim is compiled only with it),
+# so the TensorRT decisions are tested on a PC.
+trt-sys = { path = "trt-sys" }
 sha2.workspace = true
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }

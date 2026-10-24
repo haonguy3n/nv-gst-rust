@@ -13,6 +13,11 @@
 //! stage factories return `Unsupported` until then, so nothing
 //! silently pretends to run.
 //!
+//! The `trt` feature adds inference: `trt-sys` (the C++ shim),
+//! `TrtEngine`, the plan warm-up thread and the CUDA stream. Their
+//! decisions (`trt_logic`, `build_progress`, `engine_job`) are plain
+//! Rust and build everywhere.
+//!
 //! Reference material (read, not copied): the owner's
 //! `orin-nx-camera-viber` (frame path, media-engine probe, launch
 //! strings) and `gst-nvmm-cpp` (LGPL NVMM GStreamer elements;
@@ -20,13 +25,26 @@
 
 #![forbid(unsafe_code)]
 
+pub mod build_progress;
+#[cfg(feature = "trt")]
+pub mod cuda;
+pub mod engine_job;
 #[cfg(feature = "gst")]
 pub mod gst_encoder;
 #[cfg(feature = "gst")]
 pub mod gst_source;
 pub mod launch;
 pub mod plan_cache;
+#[cfg(feature = "trt")]
+pub mod preprocess;
 pub mod probe;
+#[cfg(feature = "trt")]
+pub mod trt;
+pub mod trt_logic;
+#[cfg(feature = "trt")]
+pub mod vic;
+#[cfg(feature = "trt")]
+pub mod warmup;
 
 pub use probe::{
     choose_encoder, dla_cores, probe_media_engines, probe_module_identity, EncoderChoice,
@@ -80,6 +98,23 @@ impl JetsonPlatform {
     }
 }
 
+/// Draws nothing: the boxes leave as metadata (the clean-video decision),
+/// so the Jetson overlay stage is a no-op until a CUDA draw is wanted.
+#[cfg(feature = "trt")]
+struct NoopOverlay;
+
+#[cfg(feature = "trt")]
+impl Overlay for NoopOverlay {
+    fn draw(
+        &mut self,
+        _frame: &edge_core::HwFrame,
+        _det: &edge_core::Detections,
+        _stream: &GpuStream,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
 const M1_PENDING: &str = "platform-jetson device runtime lands in M1 \
     (GStreamer pipelines on the Orin; see launch.rs for the pinned strings)";
 
@@ -114,7 +149,11 @@ impl Platform for JetsonPlatform {
             precisions: vec![Precision::Fp32, Precision::Fp16],
             devices: {
                 let mut devices = vec!["gpu".into()];
-                devices.extend(dla_cores(&self.root));
+                // DLA is no option with TensorRT 10.16 on JetPack 7, so a
+                // TensorRT build names the GPU only.
+                if !cfg!(feature = "trt") {
+                    devices.extend(dla_cores(&self.root));
+                }
                 devices
             },
             has_hw_encoder: self.engines.nvenc,
@@ -162,22 +201,52 @@ impl Platform for JetsonPlatform {
         }
     }
 
-    fn preprocessor(&self, _cfg: &PreConfig) -> Result<Box<dyn Preprocessor>> {
-        Err(Error::Unsupported(M1_PENDING.into()))
+    fn preprocessor(&self, cfg: &PreConfig) -> Result<Box<dyn Preprocessor>> {
+        #[cfg(feature = "trt")]
+        {
+            Ok(Box::new(preprocess::JetsonPreprocessor::new(cfg)?))
+        }
+        #[cfg(not(feature = "trt"))]
+        {
+            let _ = cfg;
+            Err(Error::Unsupported(M1_PENDING.into()))
+        }
     }
 
-    fn engine(&self, _cfg: &ModelConfig) -> Result<EngineState> {
-        Err(Error::Unsupported(M1_PENDING.into()))
+    fn engine(&self, cfg: &ModelConfig) -> Result<EngineState> {
+        #[cfg(feature = "trt")]
+        {
+            self.trt_engine(cfg)
+        }
+        #[cfg(not(feature = "trt"))]
+        {
+            let _ = cfg;
+            Err(Error::Unsupported(M1_PENDING.into()))
+        }
     }
 
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
-        Err(Error::Unsupported(M1_PENDING.into()))
+        #[cfg(feature = "trt")]
+        {
+            Ok(Box::new(NoopOverlay))
+        }
+        #[cfg(not(feature = "trt"))]
+        {
+            Err(Error::Unsupported(M1_PENDING.into()))
+        }
     }
 
     fn stream(&self, _camera_id: u8) -> Result<GpuStream> {
-        // Until T4 lands the real CudaStream, Jetson stages do not
-        // run at all (M1_PENDING), so a no-op stream is honest.
-        Ok(GpuStream::noop())
+        #[cfg(feature = "trt")]
+        {
+            cuda::new_gpu_stream()
+        }
+        // Without `trt` no Jetson stage runs (M1_PENDING), so a no-op
+        // stream is honest.
+        #[cfg(not(feature = "trt"))]
+        {
+            Ok(GpuStream::noop())
+        }
     }
 
     fn encoder(

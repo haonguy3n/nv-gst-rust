@@ -1,0 +1,48 @@
+# Orin Nano 8 GB, full pipeline: Argus capture -> VIC letterbox -> TensorRT YOLOX-S (FP16) ->
+# detections, and the same frames -> x264 -> TCP / RTSP / web UI. The Nano has no NVENC, so video
+# is the explicit relaxed-mode CPU encode (one VIC copy NVMM -> I420 before x264).
+#
+# Model: YOLOX-S (Apache-2.0, Megvii, COCO 80 classes) with the box decode in the graph
+# (outputs boxes / objectness / scores), the package camera-viber's `tools/cam model import-yolox
+# yolox_s` makes. Install model.onnx at model.path; the first start builds the TensorRT plan in the
+# background (minutes on the Nano) and caches it in /var/cache/edge-vision; video streams meanwhile.
+platform = "jetson"
+zero_copy = "relaxed"
+
+[source]
+kind = "argus"
+width = 1440 # IMX296 native
+height = 1080
+fps = 30
+pool_size = 8 # sim semantics; the Argus pool is fixed (see docs/jetson-bringup.md)
+argus_pool = 6 # measured on the Nano; the static worst case is above it, the app warns
+
+[model]
+enabled = true
+path = "/opt/edge-vision/models/yolox-s.onnx"
+decoder = "yolox"
+precision = "fp16" # FP16 layers, FP32 I/O
+device = "gpu"
+input_width = 640
+input_height = 640
+input_color = "bgr"
+input_normalize = "none"
+num_classes = 80
+score_threshold = 0.3
+
+[encoder]
+enabled = true
+codec = "H264"
+hardware = false # explicit opt-in; strict mode refuses this
+bitrate_kbps = 8000
+gop_frames = 30
+
+[stream]
+metadata_only = false
+video_tcp = "0.0.0.0:8555" # raw Annex-B H.264; 8554 is camera-streamer's
+web_ui = "0.0.0.0:8080"    # live video, detection boxes, counters
+rtsp_port = 8556           # rtsp://<cam>:8556/stream (needs the rtsp feature)
+
+[pipeline]
+queue_depth = 1
+max_idle_ms = 5000

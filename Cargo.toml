@@ -8,6 +8,7 @@ members = [
     "crates/sinks",
     "crates/platform-jetson",
     "crates/platform-jetson/nvbuf-sys",
+    "crates/platform-jetson/trt-sys",
     "crates/platform-sim",
     "apps/edge-vision",
 ]
