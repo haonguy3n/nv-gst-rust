@@ -8,3 +8,8 @@ description = "Read-only view of NVIDIA NvBufSurface memory (no link-time depend
 
 [lints]
 workspace = true
+
+[features]
+# Link libnvbufsurface / libnvbufsurftransform and compile the
+# create/map/transform API. Off on the PC (the libraries are not there).
+link = []

@@ -7,12 +7,30 @@
 //! headers (the field order and padding are checked by tests); they do
 //! not link against `libnvbufsurface`.
 //!
-//! Nothing here reads plane pixels. It extracts the dmabuf fd, layout,
+//! The `surface`, `ffi` externs and `OwnedSurface` half (create, map,
+//! VIC transform) calls `libnvbufsurface`/`libnvbufsurftransform`; it
+//! exists only with the `link` feature (device builds). The pure
+//! half (layouts, constants, `planar`) always builds and is tested
+//! on the PC.
+//!
+//! Reading a camera frame's surface below this line: nothing reads
+//! plane pixels of the capture frame. It extracts the dmabuf fd, layout,
 //! and plane pitch/offset/psize, which is what `FrameMeta::planes`
 //! needs. Block-linear bytes are left for VIC; the CPU must never map
 //! or copy them.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+
+mod error;
+mod ffi;
+pub mod planar;
+#[cfg(feature = "link")]
+mod surface;
+
+pub use error::NvbufError;
+pub use ffi::{ColorFormat, Filter, Rect};
+#[cfg(feature = "link")]
+pub use surface::{transform_letterbox, MappedPlane, OwnedSurface, SurfaceRef};
 
 use std::ffi::c_void;
 use std::fmt;
