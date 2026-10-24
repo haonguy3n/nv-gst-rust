@@ -652,6 +652,46 @@ int32_t trt_stream_synchronize(void* stream)
     });
 }
 
+void* trt_event_create(void)
+{
+    return Guarded<void*>(nullptr, [&]() -> void* {
+        cudaEvent_t event = nullptr;
+        if (cudaError_t const error = cudaEventCreate(&event); error != cudaSuccess)
+        {
+            CudaFail("cudaEventCreate", error);
+            return nullptr;
+        }
+        return event;
+    });
+}
+
+void trt_event_destroy(void* event)
+{
+    Guarded(0, [&] {
+        if (event != nullptr)
+        {
+            cudaEventDestroy(static_cast<cudaEvent_t>(event));
+        }
+        return 0;
+    });
+}
+
+int32_t trt_event_record(void* event, void* stream)
+{
+    return Guarded(-1, [&]() -> int32_t {
+        cudaError_t const error = cudaEventRecord(static_cast<cudaEvent_t>(event), static_cast<cudaStream_t>(stream));
+        return error == cudaSuccess ? 0 : CudaFail("cudaEventRecord", error);
+    });
+}
+
+int32_t trt_event_elapsed_ms(void* start, void* end, float* ms)
+{
+    return Guarded(-1, [&]() -> int32_t {
+        cudaError_t const error = cudaEventElapsedTime(ms, static_cast<cudaEvent_t>(start), static_cast<cudaEvent_t>(end));
+        return error == cudaSuccess ? 0 : CudaFail("cudaEventElapsedTime", error);
+    });
+}
+
 int32_t trt_host_alloc_mapped(size_t bytes, void** host, void** device)
 {
     return Guarded(-1, [&]() -> int32_t {

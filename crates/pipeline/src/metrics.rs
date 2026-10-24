@@ -147,6 +147,10 @@ pub struct PipelineMetrics {
     pub detections: u64,
     pub pre_total: Duration,
     pub infer_total: Duration,
+    /// GPU time of `infer` from CUDA events, summed over the
+    /// `frames_gpu_timed` frames whose engine reported it.
+    pub gpu_total: Duration,
+    pub frames_gpu_timed: u64,
     pub post_total: Duration,
     pub overlay_total: Duration,
     pub encode_push_total: Duration,
@@ -170,6 +174,11 @@ impl PipelineMetrics {
     /// Average of a stage that only runs on inferred frames.
     fn avg(&self, total: Duration) -> Duration {
         Self::avg_over(self.frames_inferred, total)
+    }
+
+    /// Average GPU time per timed frame; `None` when the engine reports none.
+    fn avg_gpu(&self) -> Option<Duration> {
+        (self.frames_gpu_timed > 0).then(|| Self::avg_over(self.frames_gpu_timed, self.gpu_total))
     }
 
     /// Average of a stage that runs on every processed frame.
@@ -283,6 +292,18 @@ impl PipelineMetrics {
                 total.as_secs_f64()
             ));
         }
+        counter(
+            &mut out,
+            "edge_infer_gpu_frames_total",
+            "Inferred frames with a GPU time from CUDA events",
+            self.frames_gpu_timed,
+        );
+        out.push_str(&format!(
+            "# HELP edge_infer_gpu_seconds_total Cumulative GPU time of inference (CUDA events)\n\
+             # TYPE edge_infer_gpu_seconds_total counter\n\
+             edge_infer_gpu_seconds_total {:.6}\n",
+            self.gpu_total.as_secs_f64()
+        ));
         out
     }
 
@@ -294,7 +315,7 @@ impl PipelineMetrics {
         format!(
             "captured={} dropped={} enc_dropped={} timeouts={} processed={} inferred={} detections={} \
              qmax={} p50={} p95={} p99={} \
-             avg pre={:?} infer={:?} post={:?} overlay={:?} encode_push={:?}",
+             avg pre={:?} infer={:?}{} post={:?} overlay={:?} encode_push={:?}",
             self.frames_captured,
             self.frames_dropped,
             self.encode_dropped,
@@ -308,6 +329,7 @@ impl PipelineMetrics {
             p(self.latency.p99()),
             self.avg(self.pre_total),
             self.avg(self.infer_total),
+            self.avg_gpu().map_or_else(String::new, |d| format!(" gpu={d:?}")),
             self.avg(self.post_total),
             self.avg(self.overlay_total),
             self.avg_processed(self.encode_push_total),
@@ -343,6 +365,8 @@ pub struct LiveMetrics {
     queue_depth_max: AtomicU64,
     pre_ns: AtomicU64,
     infer_ns: AtomicU64,
+    gpu_ns: AtomicU64,
+    frames_gpu_timed: AtomicU64,
     post_ns: AtomicU64,
     overlay_ns: AtomicU64,
     encode_push_ns: AtomicU64,
@@ -381,6 +405,8 @@ impl LiveMetrics {
             detections: self.detections.load(Ordering::Relaxed),
             pre_total: Duration::from_nanos(self.pre_ns.load(Ordering::Relaxed)),
             infer_total: Duration::from_nanos(self.infer_ns.load(Ordering::Relaxed)),
+            gpu_total: Duration::from_nanos(self.gpu_ns.load(Ordering::Relaxed)),
+            frames_gpu_timed: self.frames_gpu_timed.load(Ordering::Relaxed),
             post_total: Duration::from_nanos(self.post_ns.load(Ordering::Relaxed)),
             overlay_total: Duration::from_nanos(self.overlay_ns.load(Ordering::Relaxed)),
             encode_push_total: Duration::from_nanos(self.encode_push_ns.load(Ordering::Relaxed)),
@@ -403,6 +429,8 @@ impl LiveMetrics {
             &self.queue_depth_max,
             &self.pre_ns,
             &self.infer_ns,
+            &self.gpu_ns,
+            &self.frames_gpu_timed,
             &self.post_ns,
             &self.overlay_ns,
             &self.encode_push_ns,
@@ -457,6 +485,10 @@ impl LiveMetrics {
             .store(metrics.pre_total.as_nanos() as u64, Ordering::Relaxed);
         self.infer_ns
             .store(metrics.infer_total.as_nanos() as u64, Ordering::Relaxed);
+        self.gpu_ns
+            .store(metrics.gpu_total.as_nanos() as u64, Ordering::Relaxed);
+        self.frames_gpu_timed
+            .store(metrics.frames_gpu_timed, Ordering::Relaxed);
         self.post_ns
             .store(metrics.post_total.as_nanos() as u64, Ordering::Relaxed);
         self.overlay_ns
@@ -538,6 +570,25 @@ mod tests {
             text.matches("# HELP edge_stage_seconds_total").count(),
             1,
             "HELP must appear once per metric:\n{text}"
+        );
+    }
+
+    #[test]
+    fn gpu_time_shows_only_when_reported() {
+        let mut m = PipelineMetrics {
+            frames_inferred: 4,
+            infer_total: Duration::from_millis(20),
+            ..Default::default()
+        };
+        assert!(!m.summary().contains("gpu="), "{}", m.summary());
+        m.gpu_total = Duration::from_millis(8);
+        m.frames_gpu_timed = 4;
+        assert!(m.summary().contains("infer=5ms gpu=2ms"), "{}", m.summary());
+        let text = m.render_prometheus();
+        assert!(text.contains("edge_infer_gpu_frames_total 4\n"), "{text}");
+        assert!(
+            text.contains("edge_infer_gpu_seconds_total 0.008000\n"),
+            "{text}"
         );
     }
 

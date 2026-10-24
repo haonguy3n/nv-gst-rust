@@ -84,6 +84,11 @@ extern "C" {
     pub fn trt_stream_destroy(stream: *mut c_void);
     pub fn trt_stream_synchronize(stream: *mut c_void) -> i32;
 
+    pub fn trt_event_create() -> *mut c_void;
+    pub fn trt_event_destroy(event: *mut c_void);
+    pub fn trt_event_record(event: *mut c_void, stream: *mut c_void) -> i32;
+    pub fn trt_event_elapsed_ms(start: *mut c_void, end: *mut c_void, ms: *mut f32) -> i32;
+
     pub fn trt_host_alloc_mapped(
         bytes: usize,
         host: *mut *mut c_void,

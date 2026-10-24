@@ -72,6 +72,13 @@ void* trt_stream_create(void);
 void trt_stream_destroy(void* stream);
 int32_t trt_stream_synchronize(void* stream);
 
+/* CUDA events with timing, for GPU time. record queues on the stream;
+ * elapsed_ms is valid once the stream has synchronized past @p end. */
+void* trt_event_create(void);
+void trt_event_destroy(void* event);
+int32_t trt_event_record(void* event, void* stream);
+int32_t trt_event_elapsed_ms(void* start, void* end, float* ms);
+
 /* cudaHostAlloc(mapped), zeroed; the device pointer is the GPU's view. */
 int32_t trt_host_alloc_mapped(size_t bytes, void** host, void** device);
 void trt_host_free(void* host);

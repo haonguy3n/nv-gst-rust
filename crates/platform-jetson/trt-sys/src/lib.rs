@@ -30,6 +30,6 @@ mod ffi;
 mod shim;
 #[cfg(feature = "shim")]
 pub use shim::{
-    build_plan, device_info, set_device_for_thread, version, Context, Engine, Graph, MappedBuffer,
-    Plan, Runtime, Stream,
+    build_plan, device_info, set_device_for_thread, version, Context, Engine, Event, Graph,
+    MappedBuffer, Plan, Runtime, Stream,
 };

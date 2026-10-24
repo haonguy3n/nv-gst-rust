@@ -11,10 +11,11 @@
 //! are sticky): every later `infer` returns `Err`, so the runner stops
 //! instead of reading stale outputs.
 
-use crate::cuda::{platform_err, CudaStream, MappedTensor};
+use crate::cuda::{platform_err, CudaStream, GpuTimer, MappedTensor};
 use crate::trt_logic::{check_io_set, input_shape_fix, tensor_spec, GraphPolicy, InferAction};
 use edge_core::{Error, GpuStream, InferenceEngine, Result, Tensor};
 use std::sync::Arc;
+use std::time::Duration;
 use trt_sys::{Context, Graph, IoDesc, IoMode, MappedBuffer, Runtime, Stream};
 
 pub struct TrtEngine {
@@ -28,6 +29,9 @@ pub struct TrtEngine {
     policy: GraphPolicy,
     /// Used when the caller passes a stream that is not ours (tests).
     fallback: Option<Stream>,
+    /// Events around the enqueue; `None` when they could not be created.
+    timer: Option<GpuTimer>,
+    gpu_time: Option<Duration>,
     broken: Option<String>,
 }
 
@@ -60,6 +64,8 @@ impl TrtEngine {
             outputs,
             policy: GraphPolicy::new(use_graph),
             fallback: None,
+            timer: create_timer(),
+            gpu_time: None,
             broken: None,
         })
     }
@@ -68,6 +74,10 @@ impl TrtEngine {
         trt_sys::set_device_for_thread().map_err(platform_err)?;
         let stream = pick_stream(stream, &mut self.fallback)?;
         let action = self.policy.action();
+        let timer = self.timer.as_ref();
+        self.gpu_time = None;
+        // A failed event record only loses this frame's GPU time.
+        let timed = timer.is_some_and(|t| t.begin(stream).is_ok());
         match (action, &self.graph) {
             (InferAction::Replay, Some(graph)) => graph.launch(stream),
             (InferAction::Replay, None) => {
@@ -76,13 +86,28 @@ impl TrtEngine {
             _ => self.context.enqueue(stream),
         }
         .map_err(platform_err)?;
+        let timed = timed && timer.is_some_and(|t| t.finish(stream).is_ok());
         stream.synchronize().map_err(platform_err)?;
+        if let (true, Some(timer)) = (timed, timer) {
+            self.gpu_time = timer.elapsed().ok();
+        }
         if action == InferAction::EnqueueThenCapture {
             // The warm-up pass has finished: its outputs stay in the buffers.
             self.graph = capture_graph(&mut self.context, stream);
             self.policy = self.policy.capture_done(self.graph.is_some());
         }
         Ok(())
+    }
+}
+
+/// `None` (GPU time off, with a warning) when the events cannot be created.
+fn create_timer() -> Option<GpuTimer> {
+    match GpuTimer::new() {
+        Ok(timer) => Some(timer),
+        Err(e) => {
+            log::warn!("tensorrt: GPU timing off, cannot create CUDA events: {e}");
+            None
+        }
     }
 }
 
@@ -142,5 +167,9 @@ impl InferenceEngine for TrtEngine {
             self.broken = Some(e.to_string());
         }
         result
+    }
+
+    fn last_gpu_time(&self) -> Option<Duration> {
+        self.gpu_time
     }
 }
