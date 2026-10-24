@@ -1,10 +1,10 @@
 # Edge Vision Pipeline — Design
 
 **Status:** M0/M1 groundwork. Everything CPU-side is implemented and
-tested on x86, including the read-only NVMM surface view; Jetson device
-stages (CUDA/VIC pre-processing, TensorRT, NVENC, RTSP) are not
-implemented yet. The tables below are deliberately explicit about which
-side of that line each claim sits on.
+tested on x86, including the read-only NVMM surface view and the
+optional RTSP sink; Jetson device stages (CUDA/VIC pre-processing,
+TensorRT, NVENC) are not implemented yet. The tables below are
+deliberately explicit about which side of that line each claim sits on.
 
 The project builds one Rust binary that captures camera frames, runs a
 neural network on them and streams the result, keeping pixels in
@@ -28,18 +28,19 @@ be new `platform-*` crates without changes to the pipeline core.
 | Jetson: NVENC/NVJPG sysfs probe, launch strings, plan cache | Done (PC-testable) | `crates/platform-jetson`; unit tests with fake sysfs, per-model plan namespaces, property-set file paths |
 | Jetson: GStreamer capture (`appsink`) | Done on PC (device run pending) | `platform-jetson --features gst`: dmabuf branch, NVMM `NvBufSurface` branch (T2) and a PC-only honest `shm-copy` fallback |
 | Jetson: Argus EOS is a fault, not a clean end | Done (PC-tested) | `gst_source.rs` returns `CaptureServiceLost`; teardown is skipped and the app applies the once-per-boot exit-75 policy |
-| Jetson: NVMM/NvBufSurface access (`gst_buffer_map` → `NvBufSurface*`) | Done on PC (device run pending) | `nvbuf-sys` read-only `repr(C)` view, exact map-size check, fd/layout/planes from `planeParams`; see `docs/jetson-bringup.md` T2 |
+| Jetson: NVMM/NvBufSurface access (`gst_buffer_map` → `NvBufSurface*`) | Done; verified on the Orin Nano 2026-10-24 (300 frames, `copied=0`) | `nvbuf-sys` read-only `repr(C)` view, exact map-size check, fd/layout/planes from `planeParams`; measured values in `docs/jetson-bringup.md`, "Measured on the board" |
 | Jetson: CPU H.264 encode (Orin Nano) | Done (PC-tested) | `GstEncoder` (`appsrc → nvvidconv → x264enc → h264parse → appsink`), element check, Nano profile; device run still needs the VIC/TensorRT stages |
 | Jetson: encode on its own thread | Done (PC-tested) | runner `encode-cam` thread, leaky one-deep frame hand-off, dropped-frame counter |
-| Jetson: VIC/CUDA pre-process, TensorRT engine, overlay, NVENC encode, RTSP | Not implemented | Device bring-up; launch strings are the contract. DLA device nodes are probed for `model.device` validation only |
+| Jetson: VIC/CUDA pre-process, TensorRT engine, overlay, NVENC encode | Not implemented | Device bring-up; launch strings are the contract. DLA device nodes are probed for `model.device` validation only |
+| RTSP output | Done on PC (device playback pending) | `edge-sinks --features rtsp` (`RtspSink`), `stream.rtsp_port`; GStreamer RTSP server; app feature `rtsp` |
 | Jetson: Argus loss recovery | Done on PC (device run pending) | Typed `CaptureServiceLost`, skipped teardown after Argus EOS, once-per-boot marker + daemon restart + exit 75 |
 | Sinks: bounded async writer | Done | `sinks::AsyncSink`; used by the app for disk/terminal writes |
 | Device zero-copy proof (`copied_frames == 0`, Nsight, EMC) | Not verified | M1 exit gate on the flashed board |
 | Multi-camera orchestration | Not implemented | One process per camera is the default for Argus fault isolation |
 
-`RTSP` is intentionally absent from the config until the sink exists:
-the old `stream.rtsp_port` field never had a reader and was removed
-rather than left as a false promise. Port 8555 is reserved for it.
+`stream.rtsp_port` is live only in a build with `--features rtsp`; the
+PC sink is implemented, while device playback is still to verify. Port
+8555 is reserved for it.
 
 ## Goals and non-goals
 
@@ -75,7 +76,7 @@ M1 (INT8 after a calibration set and its own accuracy gate).
 | Metric | Target | Qualification |
 | --- | --- | --- |
 | Throughput | 30 FPS per camera, 2 cameras | One process per camera. Cam1 currently stops after 13–15 s under Argus in the reference product; the 2-camera target is blocked on that hardware cause |
-| Glass-to-network latency | < 100 ms p95 | The in-process part (source hand-off → sink accept) is now measured as p50/p95/p99; network/RTP is added with the RTSP sink. Live configs use `queue_depth = 2` |
+| Glass-to-network latency | < 100 ms p95 | The in-process part (source hand-off → sink accept) is now measured as p50/p95/p99; network/RTP is added with the RTSP sink. Live configs use `queue_depth = 1` |
 | CPU load | < 25 % of one core per stream | Strict (no-CPU-copy) profiles only. The relaxed CPU-encode profile is exempt: ≈1.1 NX cores for H.264/1080p30 in the reference product, more on a Nano's slower cores |
 | Steady-state allocations | 0 in the hot loop | Decoders are gated by a counting allocator. Capture/engine/encode allocation behaviour is backend-specific and must be measured on the device; the sim allocates one handle per frame by design |
 
@@ -241,8 +242,8 @@ pool starvation is counted as a capture timeout; ordinary sensor
 pacing is not. An `argus` source treats EOS as a capture fault (the
 sensor or `nvargus-daemon` may be gone) and returns an error, so a dead
 camera cannot end the run with exit 0. Once-per-boot daemon recovery
-and exit code 75 are still M1 device work; see
-`docs/jetson-bringup.md`.
+and exit code 75 exist on the PC; running them as a non-root service is
+open (`docs/jetson-bringup.md`, N9b).
 
 ## Configuration
 
@@ -262,6 +263,7 @@ pool_size = 8             # sim pool; must be >= queue_depth + 3
 frames = 30               # stop after N captured frames (optional)
 
 [model]
+# enabled = false         # no inference (video only); needs metadata_only = false
 input_width = 320
 input_height = 320
 num_classes = 80
@@ -280,6 +282,8 @@ gop_frames = 30
 [stream]
 metadata_only = true      # video requires an enabled encoder
 # meta_file = "out/detections.jsonl"
+# video_tcp = "0.0.0.0:8555"   # raw Annex-B H.264, one viewer (ffplay -f h264 tcp://<cam>:8555)
+# web_ui = "0.0.0.0:8080"      # browser page: video (WebSocket + WebCodecs), boxes, counters; max 4 viewers; H.264 only
 
 [pipeline]
 queue_depth = 4
@@ -397,9 +401,9 @@ trait suite.
   aarch64 cross-check needs an arm64 sysroot and is left to the device
   sysroot work.
 
-Not tested anywhere yet: NVMM/NvBufSurface access, NVENC dmabuf import,
-TensorRT inference, camera/Argus behaviour, RTSP output, and zero-copy
-on hardware. Those are device gates below.
+Not tested anywhere yet: NVMM/NvBufSurface access on the board, NVENC
+dmabuf import, TensorRT inference, camera/Argus behaviour, RTSP
+playback, and zero-copy on hardware. Those are device gates below.
 
 ## Milestones and exit gates
 

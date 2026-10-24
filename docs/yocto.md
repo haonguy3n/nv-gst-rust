@@ -67,6 +67,9 @@ image is an image-scope decision for camera-viber.
 The encoder plugin comes from the image per machine: `nvv4l2h264enc` /
 `nvv4l2h265enc` on the NX, `x264enc` on the Nano (no NVENC). The recipe
 itself pulls in the `app`, `nvarguscamerasrc` and `nvvidconv` plugins.
+The optional RTSP sink needs `gstreamer1.0-rtsp-server` (dev at build,
+runtime on the image) and `--features rtsp` in the recipe. The raw TCP
+profile (`orin-nano-view.toml`) does not need it.
 
 ## When `Cargo.lock` changes
 
@@ -91,9 +94,8 @@ The image does not ship `trtexec`, and the service sandbox will not let
 the app run a shell. The product path is to build the plan in-process
 through `trt-sys` and cache it under `/var/cache/edge-vision` (the
 systemd unit needs `CacheDirectory=edge-vision`). `tools/build-engine.sh`
-is a bring-up tool for a development image only; see
-[jetson-bringup.md](jetson-bringup.md) for its limits (256 MiB
-workspace, build lock, memory check, `EDGE_VISION_CACHE`).
+is a bring-up tool for a development image only (256 MiB workspace,
+build lock, memory check, `EDGE_VISION_CACHE`; see the script's header).
 
 The recipe currently installs the binary and the two configs, not the
 model. `config/orin-nx-yolo.toml` expects

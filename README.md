@@ -34,7 +34,8 @@ Everything below runs and is tested on x86:
   zero-allocation steady-state gate. A committed end-to-end test runs
   the ONNX fixture through ONNX Runtime, the YOLO decoder, NMS and a
   sink.
-- Sinks: JSONL metadata, raw file video, fan-out, counting/null.
+- Sinks: JSONL metadata, raw file video, raw TCP H.264, RTSP
+  (`--features rtsp`), fan-out, counting/null, bounded async writer.
 - Jetson CPU H.264 encode (Orin Nano path) with `x264enc`, running on
   its own thread, plus a relaxed-mode `config/orin-nano-yolo.toml`;
   device streaming still awaits the NVMM capture branch and the
@@ -51,13 +52,13 @@ Everything below runs and is tested on x86:
 
 Not implemented yet (device work, tracked in the docs):
 
-- CUDA/VIC pre-processing, TensorRT execution, NVENC encode, RTSP
-  output and the overlay stage on Jetson (NVMM surface access is
-  implemented and awaits a device run).
+- CUDA/VIC pre-processing, TensorRT execution, NVENC encode and the
+  overlay stage on Jetson (NVMM surface access is implemented and awaits
+  a device run).
+- RTSP playback on the board; the sink and `stream.rtsp_port` exist
+  behind `--features rtsp`.
 - The device zero-copy proof (`copied_frames == 0`, Nsight, EMC load).
 - Multi-camera orchestration (one process per camera is the default).
-- The `rtsp_port` config field was removed until the sink exists; it had
-  no reader.
 
 ## Run it (no hardware needed)
 
@@ -67,6 +68,7 @@ cargo test --workspace
 cargo test -p platform-sim --features onnx
 cargo test -p platform-jetson --features gst   # needs GStreamer dev libs
 cargo test -p edge-vision --features onnx      # end-to-end YOLO fixture
+cargo test -p edge-sinks --features rtsp       # RTSP sink (GStreamer RTSP server)
 ```
 
 For the Yocto image, see [docs/yocto.md](docs/yocto.md).
@@ -83,6 +85,29 @@ The sim backend has no encoder, so it streams detections only.
 time; on a platform that offers a CPU path, video without NVENC is the
 explicit opt-in `zero_copy = "relaxed"` + `encoder.hardware = false`,
 and the builder enforces exactly that matrix.
+
+## Web UI
+
+With `stream.web_ui = "0.0.0.0:8080"` (set in `config/orin-nano-view.toml`)
+open `http://<camera>:8080` in a browser: live video, detection boxes
+drawn over it and live counters (captured, processed, dropped, latency
+percentiles, sink drops). The camera does not re-encode: each H.264
+access unit goes over a WebSocket (`/ws`) and the page decodes it with
+WebCodecs. At most 4 viewers; a viewer that stops reading is dropped.
+The sim backend has no encoder, so this needs the Jetson profile.
+
+WebCodecs (`VideoDecoder`) exists only in a *secure context*: `https`
+or `http://localhost`. A plain `http://192.168.55.1:8080` page therefore
+has no decoder in Chrome (boxes and counters still work, and the page
+says so). Either tunnel and browse localhost:
+
+```sh
+ssh -L 8080:localhost:8080 <user>@<camera>   # then http://localhost:8080
+```
+
+or start Chrome with
+`--unsafely-treat-insecure-origin-as-secure=http://192.168.55.1:8080`
+(with a throwaway `--user-data-dir`). There is no TLS in the service.
 
 ## Layout
 
