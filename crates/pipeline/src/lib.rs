@@ -215,8 +215,8 @@ impl Pipeline {
             if let Some(pool) = config.source.argus_pool {
                 let in_flight = in_flight_surfaces(config.pipeline.queue_depth);
                 if in_flight >= pool {
-                    eprintln!(
-                        "warning: in-flight budget is {in_flight} surfaces (static worst case) \
+                    log::warn!(
+                        "in-flight budget is {in_flight} surfaces (static worst case) \
                          but the Argus pool has {pool}; watch capture timeouts"
                     );
                 }
@@ -327,7 +327,7 @@ impl Pipeline {
         Box<dyn Overlay>,
     )> {
         if !config.model.enabled {
-            eprintln!("inference: off (model.enabled = false)");
+            log::info!("inference: off (model.enabled = false)");
             return Ok((
                 Box::new(NoopStage),
                 EngineSlot::Disabled,

@@ -293,7 +293,7 @@ impl Encoder for GstEncoder {
                 buffer.flags(),
                 buffer.is_writable()
             );
-            eprintln!(
+            log::info!(
                 "encoder: first buffer flags={:?} writable={}",
                 buffer.flags(),
                 buffer.is_writable()

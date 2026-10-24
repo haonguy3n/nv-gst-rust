@@ -12,6 +12,7 @@ description = "Platform-neutral outputs: JSONL metadata, file video, fan-out and
 rtsp = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-rtsp-server"]
 
 [dependencies]
+log.workspace = true
 edge-core = { path = "../core" }
 serde.workspace = true
 serde_json.workspace = true

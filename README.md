@@ -79,6 +79,9 @@ product builds TensorRT plans in-process and caches them under
 `--frames N` limits frames *captured*; under load the drop-oldest queue
 may process fewer (the metrics line reports both). Add `--prometheus`
 for a Prometheus text exposition and a live summary every 5 seconds.
+Diagnostics go to stderr with the source file and line; `--log-level
+<error|warn|info|debug|trace>` sets the level (default info), and under
+systemd `journalctl -u edge-vision -p warning` shows warnings and errors.
 
 The sim backend has no encoder, so it streams detections only.
 `zero_copy = "strict"` (the default) refuses CPU-encode profiles at load

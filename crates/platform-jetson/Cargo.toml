@@ -23,6 +23,7 @@ path = "examples/gst_capture.rs"
 required-features = ["gst"]
 
 [dependencies]
+log.workspace = true
 edge-core = { path = "../core" }
 nvbuf-sys = { path = "nvbuf-sys", optional = true }
 sha2.workspace = true

@@ -117,7 +117,7 @@ impl RtspSink {
         gst::init().map_err(|e| Error::Platform(format!("gstreamer init: {e}")))?;
         check_elements(codec, |name| gst::ElementFactory::find(name).is_some())?;
         if gst::ElementFactory::find("udpsink").is_none() {
-            eprintln!("video_rtsp: udp plugin missing; only TCP-interleaved clients will work");
+            log::warn!("video_rtsp: udp plugin missing; only TCP-interleaved clients will work");
         }
         let launch = match codec {
             Codec::H264 => {
@@ -145,7 +145,7 @@ impl RtspSink {
             // The launch string is a `( ... )` bin, not a pipeline: a
             // Pipeline downcast always failed and no packet was pushed.
             let Ok(pipeline) = media.element().downcast::<gst::Bin>() else {
-                eprintln!("video_rtsp: media element is not a bin; client gets no video");
+                log::error!("video_rtsp: media element is not a bin; client gets no video");
                 return;
             };
             let Some(src) = pipeline

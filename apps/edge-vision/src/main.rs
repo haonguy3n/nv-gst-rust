@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+mod logger;
 mod recovery;
 
 use anyhow::{bail, Context, Result};
@@ -79,10 +80,18 @@ fn stats_json(m: &edge_pipeline::PipelineMetrics, drops: &edge_sinks::AsyncDrops
     )
 }
 
-fn parse_args() -> Result<(PathBuf, Option<u64>, bool)> {
+struct Args {
+    config: PathBuf,
+    frames: Option<u64>,
+    prometheus: bool,
+    log_level: log::LevelFilter,
+}
+
+fn parse_args() -> Result<Args> {
     let mut config = PathBuf::from("config/x86-dev.toml");
     let mut frames: Option<u64> = None;
     let mut prometheus = false;
+    let mut log_level = log::LevelFilter::Info;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -91,10 +100,17 @@ fn parse_args() -> Result<(PathBuf, Option<u64>, bool)> {
                 frames = Some(value.parse().context("--frames must be a number")?);
             }
             "--prometheus" => prometheus = true,
+            "--log-level" => {
+                let value = args.next().context("--log-level needs a value")?;
+                log_level = parse_log_level(&value)?;
+            }
             "-h" | "--help" => {
-                println!("usage: edge-vision [CONFIG.toml] [--frames N] [--prometheus]");
+                println!(
+                    "usage: edge-vision [CONFIG.toml] [--frames N] [--prometheus] [--log-level L]"
+                );
                 println!("  --frames N   stop after N frames are *captured*;");
                 println!("               with drops under load, fewer are processed");
+                println!("  --log-level L  error, warn, info (default), debug or trace");
                 std::process::exit(0);
             }
             _ if arg.starts_with("--frames=") => {
@@ -104,14 +120,33 @@ fn parse_args() -> Result<(PathBuf, Option<u64>, bool)> {
                         .context("--frames must be a number")?,
                 );
             }
+            _ if arg.starts_with("--log-level=") => {
+                log_level = parse_log_level(arg.trim_start_matches("--log-level="))?;
+            }
             _ => config = PathBuf::from(arg),
         }
     }
-    Ok((config, frames, prometheus))
+    Ok(Args {
+        config,
+        frames,
+        prometheus,
+        log_level,
+    })
+}
+
+fn parse_log_level(text: &str) -> Result<log::LevelFilter> {
+    logger::parse_level(text)
+        .with_context(|| format!("--log-level `{text}`: use error, warn, info, debug or trace"))
 }
 
 fn main() -> Result<()> {
-    let (config_path, frames, prometheus) = parse_args()?;
+    let Args {
+        config: config_path,
+        frames,
+        prometheus,
+        log_level,
+    } = parse_args()?;
+    logger::init(log_level);
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
 
@@ -121,7 +156,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "jetson")]
             {
                 let platform = platform_jetson::JetsonPlatform::new(std::path::Path::new("/"));
-                println!("module: {:?}", platform.module_identity());
+                log::info!("module: {:?}", platform.module_identity());
                 Box::new(platform)
             }
             #[cfg(not(feature = "jetson"))]
@@ -177,14 +212,14 @@ fn main() -> Result<()> {
             .push(Box::new(edge_sinks::TcpH264Sink::bind(addr).with_context(
                 || format!("binding stream.video_tcp {addr}"),
             )?));
-        println!("video: raw H.264 on tcp://{addr}");
+        log::info!("video: raw H.264 on tcp://{addr}");
     }
     let web_ui = match config.stream.web_ui {
         Some(addr) => {
             let ui = edge_sinks::WebUi::bind(addr)
                 .with_context(|| format!("binding stream.web_ui {addr}"))?;
             sinks.push(Box::new(ui.sink()));
-            println!("video: web UI at http://{}/", ui.local_addr());
+            log::info!("video: web UI at http://{}/", ui.local_addr());
             Some(std::sync::Arc::new(ui))
         }
         None => None,
@@ -194,7 +229,7 @@ fn main() -> Result<()> {
         {
             let rtsp = edge_sinks::rtsp::RtspSink::new(port, config.encoder.codec)
                 .with_context(|| format!("starting RTSP on port {port}"))?;
-            println!("video: RTSP at {}", rtsp.url());
+            log::info!("video: RTSP at {}", rtsp.url());
             sinks.push(Box::new(rtsp));
         }
         #[cfg(not(feature = "rtsp"))]
@@ -215,8 +250,10 @@ fn main() -> Result<()> {
     let sink: Box<dyn Sink> = Box::new(async_sink);
     let mut pipeline = Pipeline::build(&*platform, config, postprocessor, sink)?;
 
-    println!("platform: {}", platform.name());
-    println!("{}", pipeline.buffer_budget());
+    log::info!("platform: {}", platform.name());
+    for line in pipeline.buffer_budget().lines() {
+        log::info!("{}", line.trim_end());
+    }
     let stop = pipeline.stop_handle();
     ctrlc::set_handler(move || {
         use std::sync::atomic::Ordering;
@@ -252,7 +289,7 @@ fn main() -> Result<()> {
                         }
                     }
                     if prometheus && ticks.is_multiple_of(50) {
-                        eprintln!("[live] {}", live.snapshot().summary());
+                        log::info!("[live] {}", live.snapshot().summary());
                     }
                 }
             })
@@ -282,16 +319,16 @@ fn main() -> Result<()> {
     if let Err(edge_core::Error::CaptureServiceLost(reason)) = &result {
         match recovery::CaptureRecoveryPolicy::from_env().on_capture_loss() {
             recovery::RecoveryAction::RestartDaemonAndExit75 => {
-                eprintln!(
+                log::error!(
                     "capture service lost ({reason}); queuing nvargus-daemon restart, exit 75"
                 );
                 if let Err(e) = recovery::request_daemon_restart() {
-                    eprintln!("warning: could not restart nvargus-daemon: {e}");
+                    log::warn!("could not restart nvargus-daemon: {e}");
                 }
                 std::process::exit(75);
             }
             recovery::RecoveryAction::LogAndFail => {
-                eprintln!(
+                log::error!(
                     "capture service lost again ({reason}) after one recovery this boot; failing"
                 );
                 std::process::exit(1);

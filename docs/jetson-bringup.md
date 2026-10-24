@@ -43,6 +43,7 @@ Orin Nano 8 GB (p3767-0003), LPR image, sensor 0, `gst-capture` example,
 | Encoder buffer | first buffer `flags=DISCONT writable=false`: no copy of the capture buffer (E5) |
 | Exit | SIGINT exits 0; no "CameraProvider was not destroyed" |
 | Image | `h264parse` was missing; `gstreamer1.0-plugins-bad-videoparsersbad` installed from the feed (the camera-viber recipe now RDEPENDS on it) |
+| Zero copy up to the encoder | `GST_DEBUG=appsink:6,appsrc:6`, 6 s: 163 of 163 buffers queued into the encoder appsrc are the same `GstBuffer` objects the capture appsink handed out (same address, 0 from elsewhere); only 6 distinct buffers, recycled (the Argus pool); every one is 72 bytes, the `NvBufSurface` descriptor, so the pixels stay in NVMM. The only copy is `nvvidconv` (VIC, NVMM → I420) for x264, the Nano's `relaxed` opt-in |
 
 The `nvbuf-sys` struct mirror matches the r39.2 `nvbufsurface.h` (sizes
 72/416/232, field order, `NVBUF_LAYOUT_PITCH = 0`,

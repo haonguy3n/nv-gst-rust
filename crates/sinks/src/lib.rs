@@ -145,16 +145,16 @@ impl TcpH264Sink {
                         .and_then(|()| stream.set_write_timeout(Some(Self::WRITE_TIMEOUT)))
                         .and_then(|()| stream.set_nodelay(true));
                     if let Err(e) = ready {
-                        eprintln!("video_tcp: dropping {peer}: socket setup: {e}");
+                        log::warn!("video_tcp: dropping {peer}: socket setup: {e}");
                         continue;
                     }
-                    eprintln!("video_tcp: viewer {peer} connected; waiting for a keyframe");
+                    log::info!("video_tcp: viewer {peer} connected; waiting for a keyframe");
                     self.client = Some(stream);
                     self.synced = false;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(e) => {
-                    eprintln!("video_tcp: accept failed: {e}");
+                    log::error!("video_tcp: accept failed: {e}");
                     return;
                 }
             }
@@ -171,7 +171,7 @@ impl Sink for TcpH264Sink {
         self.synced = true;
         if let Some(client) = &mut self.client {
             if let Err(e) = write_within(client, &pkt.data, Self::PACKET_DEADLINE) {
-                eprintln!("video_tcp: viewer dropped: {e}");
+                log::warn!("video_tcp: viewer dropped: {e}");
                 self.client = None;
             }
         }

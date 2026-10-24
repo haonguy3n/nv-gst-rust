@@ -18,6 +18,7 @@ onnx = ["platform-sim/onnx"]
 rtsp = ["edge-sinks/rtsp"]
 
 [dependencies]
+log.workspace = true
 edge-core = { path = "../../crates/core" }
 edge-pipeline = { path = "../../crates/pipeline" }
 edge-postproc = { path = "../../crates/postproc" }

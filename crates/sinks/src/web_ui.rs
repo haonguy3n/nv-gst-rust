@@ -141,7 +141,7 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                eprintln!("web_ui: accept failed: {e}");
+                log::error!("web_ui: accept failed: {e}");
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -158,12 +158,12 @@ fn spawn_handler(stream: TcpStream, peer: SocketAddr, shared: &Arc<Shared>) {
         .name("web-ui-conn".into())
         .spawn(move || {
             if let Err(e) = handle_connection(stream, peer, &handler_shared) {
-                eprintln!("web_ui: {peer}: {e}");
+                log::warn!("web_ui: {peer}: {e}");
             }
             handler_shared.handshakes.fetch_sub(1, Ordering::Relaxed);
         });
     if let Err(e) = spawned {
-        eprintln!("web_ui: cannot spawn a handler: {e}");
+        log::error!("web_ui: cannot spawn a handler: {e}");
         shared.handshakes.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -239,10 +239,10 @@ fn upgrade(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> std::io::Res
             PACKET_DEADLINE,
         );
         let _ = write_within(&mut raw, &ws_frame(OP_CLOSE, &[]), PACKET_DEADLINE);
-        eprintln!("web_ui: refused {peer}: {MAX_VIEWERS} viewers already");
+        log::warn!("web_ui: refused {peer}: {MAX_VIEWERS} viewers already");
         return Ok(());
     }
-    eprintln!("web_ui: viewer {peer} connected; waiting for a keyframe");
+    log::info!("web_ui: viewer {peer} connected; waiting for a keyframe");
     shared
         .pending
         .lock()
@@ -307,7 +307,7 @@ impl WebUiSink {
             match write_within(&mut v.stream, frame, left) {
                 Ok(()) => true,
                 Err(e) => {
-                    eprintln!("web_ui: viewer {} dropped: {e}", v.peer);
+                    log::warn!("web_ui: viewer {} dropped: {e}", v.peer);
                     false
                 }
             }

@@ -168,6 +168,7 @@ version = "0.1.0"
 dependencies = [
  "edge-core",
  "edge-sinks",
+ "log",
  "platform-sim",
 ]
 
@@ -186,6 +187,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-rtsp-server",
+ "log",
  "serde",
  "serde_json",
  "tungstenite",
@@ -201,6 +203,7 @@ dependencies = [
  "edge-pipeline",
  "edge-postproc",
  "edge-sinks",
+ "log",
  "platform-jetson",
  "platform-sim",
 ]
@@ -897,6 +900,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-app",
+ "log",
  "nvbuf-sys",
  "sha2",
 ]
