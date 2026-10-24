@@ -1,0 +1,57 @@
+# SDK container: cross-compile `-p edge-vision --features trt` for the Jetson
+# (JetPack 7 / L4T r39.2.1, TensorRT 10.16, CUDA 13.2, aarch64) from an x86 PC.
+#
+# NVIDIA's TensorRT and L4T multimedia libraries are gated downloads and not
+# in this image. The image brings the toolchain (Ubuntu 24.04, whose glibc 2.39
+# matches L4T r39), Rust 1.98 and the GStreamer build tools; the target files
+# come from a sysroot you mount at /sysroot (or a Yocto SDK, see below):
+#
+#   docker build -f tools/Dockerfile.jetson-sdk -t edge-vision-jetson-sdk .
+#
+#   # A: a sysroot with TensorRT, CUDA, GStreamer and libnvbufsurface*:
+#   #    an extracted L4T r39.2.1 rootfs (JetPack "Root_FS" + the TensorRT and
+#   #    CUDA cross packages unpacked into it), or the Orin's own `/` copied
+#   #    with `rsync -a --include='/usr/***' --include='/lib/***' --exclude='*' orin:/ sysroot/`
+#   docker run --rm -v "$PWD:/work" -v /path/to/sysroot:/sysroot:ro \
+#       edge-vision-jetson-sdk cargo build --release -p edge-vision \
+#       --features trt --target aarch64-unknown-linux-gnu
+#
+#   # B: the camera-viber Yocto SDK (`bitbake camera-image -c populate_sdk`,
+#   #    then run the installer into a folder). Its own compiler and sysroot
+#   #    are used; /sysroot is not needed:
+#   docker run --rm -v "$PWD:/work" -v /path/to/sdk:/opt/yocto-sdk:ro \
+#       edge-vision-jetson-sdk cargo build --release -p edge-vision \
+#       --features trt --target aarch64-unknown-linux-gnu
+#
+# Compile-only check without any sysroot (what CI does on a plain runner):
+#   docker run --rm -v "$PWD:/work" -e TRT_SYS_SKIP_SHIM=1 edge-vision-jetson-sdk \
+#       cargo check -p edge-vision --features trt
+#
+# The sysroot needs: usr/include/{NvInfer.h,NvOnnxParser.h}, CUDA's
+# cuda_runtime_api.h (usr/local/cuda*/include), libnvinfer, libnvonnxparser,
+# libcudart, libnvbufsurface, libnvbufsurftransform, and the GStreamer 1.x
+# aarch64 .pc files and libraries. Override the places with TRT_SYS_INCLUDE,
+# TRT_SYS_CUDA_INCLUDE, TRT_SYS_LIB, TRT_SYS_CUDA_LIB (trt-sys/build.rs).
+FROM ubuntu:24.04
+
+ARG RUST_VERSION=1.98.0
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:$PATH
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl build-essential pkg-config git \
+        gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross \
+        libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+        libgstreamer-plugins-bad1.0-dev libgstrtspserver-1.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
+        --default-toolchain "${RUST_VERSION}" \
+        --target aarch64-unknown-linux-gnu -c rustfmt -c clippy \
+    && chmod -R a+rwX /opt/rustup /opt/cargo
+
+COPY tools/jetson-sdk-entrypoint.sh /usr/local/bin/jetson-sdk-entrypoint
+ENTRYPOINT ["/usr/local/bin/jetson-sdk-entrypoint"]
+WORKDIR /work
