@@ -225,7 +225,8 @@ fn slow_downstream_makes_the_appsrc_drop_not_queue() {
 
 /// Output packets carry the capture frame's PTS, not the encoder's shifted one
 /// (x264enc moves timestamps up by 1000 h). The first frames start at a
-/// non-zero PTS like a live capture does.
+/// non-zero PTS with a sub-second part, like a live capture does (a
+/// whole-second start once hid a constant shift error, P1).
 #[test]
 fn packet_pts_equal_the_pushed_frames_pts() {
     if !software_h264_available() {
@@ -241,7 +242,7 @@ fn packet_pts_equal_the_pushed_frames_pts() {
     };
     let mut encoder = GstEncoder::new_with_launch(EncoderKind::Cpu, &cfg, W, H, test_launch())
         .expect("build CPU encoder");
-    let base = 12_000;
+    let base = 12_011; // 396.363 s
     let mut packets: Vec<EncodedPacket> = Vec::new();
     for seq in base..base + 10 {
         encoder

@@ -17,6 +17,7 @@ use edge_core::{Codec, EncodedPacket, Encoder, EncoderConfig, Error, HwFrame, Re
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -92,24 +93,29 @@ pub struct GstEncoder {
     appsrc_dropped: u64,
     /// PTS (ns) of the first buffer pushed into the appsrc.
     first_in_pts: Option<u64>,
+    /// PTS (ns) of the first buffer that left the appsrc, i.e. the one the
+    /// encoder saw first (`NO_PTS` until then); the leaky queue may have
+    /// dropped the first pushed one.
+    first_enc_pts: Arc<AtomicU64>,
     /// The encoder's constant timestamp shift, learned from the first packet.
     pts_shift: Option<u64>,
 }
 
-/// Whole-second shift the encoder added to the timestamps: the first output
-/// PTS minus the first input PTS, rounded to the nearest second.
+const NO_PTS: u64 = u64::MAX;
+
+/// The constant shift the encoder added to every timestamp: the first
+/// output PTS minus the PTS of the first frame the encoder received.
 ///
-/// `GstVideoEncoder` (x264enc calls `set_min_pts(1000 h)`) moves every output
-/// PTS/DTS up by a constant so DTS stays positive; a measured Nano run saw
-/// 3 600 000 s exactly. The shift is a whole number of seconds, anything
-/// below that is pipeline latency or a leaked first frame, so rounding keeps
-/// the mapping right even when the leaky appsrc dropped the first frames.
-/// Encoders that do not shift (NVENC) give 0. The result is the same clock as
-/// `FrameMeta.pts` and the detections.
+/// `GstVideoEncoder` (x264enc calls `set_min_pts(1000 h)`) adds
+/// `1000 h - first input PTS` to every frame, so the first output is
+/// exactly 1000 h. The shift is not a whole number of seconds: rounding
+/// it left the first frame's sub-second PTS as a constant error between
+/// video and detections (327 ms measured on the Nano, about ten frames).
+/// x264 with `tune=zerolatency` neither reorders nor drops, so the first
+/// output is the first input. Encoders that do not shift (NVENC) give 0.
+/// The result is the same clock as `FrameMeta.pts` and the detections.
 pub fn encoder_pts_shift(first_in_ns: u64, first_out_ns: u64) -> u64 {
-    const SEC: u64 = 1_000_000_000;
-    let diff = first_out_ns.saturating_sub(first_in_ns);
-    (diff + SEC / 2) / SEC * SEC
+    first_out_ns.saturating_sub(first_in_ns)
 }
 
 impl GstEncoder {
@@ -128,6 +134,7 @@ impl GstEncoder {
             logged_first_buffer: false,
             appsrc_dropped: 0,
             first_in_pts: None,
+            first_enc_pts: Arc::new(AtomicU64::new(NO_PTS)),
             pts_shift: None,
         })
     }
@@ -156,6 +163,7 @@ impl GstEncoder {
             logged_first_buffer: false,
             appsrc_dropped: 0,
             first_in_pts: None,
+            first_enc_pts: Arc::new(AtomicU64::new(NO_PTS)),
             pts_shift: None,
         })
     }
@@ -207,6 +215,7 @@ impl GstEncoder {
         if appsrc.find_property("leaky-type").is_some() {
             appsrc.set_property_from_str("leaky-type", "downstream");
         }
+        self.watch_first_encoder_input(&appsrc);
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| Error::Platform(format!("starting encoder pipeline: {e}")))?;
@@ -214,6 +223,23 @@ impl GstEncoder {
         self.appsrc = Some(appsrc);
         self.appsink = Some(appsink);
         Ok(())
+    }
+
+    /// Record the PTS of the first buffer that leaves the appsrc: the
+    /// frame the encoder's timestamp shift is computed from.
+    fn watch_first_encoder_input(&self, appsrc: &gst_app::AppSrc) {
+        self.first_enc_pts.store(NO_PTS, Ordering::Release);
+        let Some(pad) = appsrc.static_pad("src") else {
+            return;
+        };
+        let first = Arc::clone(&self.first_enc_pts);
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(pts) = info.buffer().and_then(|b| b.pts()) {
+                first.store(pts.nseconds(), Ordering::Release);
+                return gst::PadProbeReturn::Remove;
+            }
+            gst::PadProbeReturn::Ok
+        });
     }
 
     fn emit_sample(
@@ -231,7 +257,11 @@ impl GstEncoder {
         let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
         let raw = buffer.pts().map_or(0, |t| t.nseconds());
         if self.pts_shift.is_none() {
-            let shift = self.first_in_pts.map_or(0, |i| encoder_pts_shift(i, raw));
+            let first_enc = self.first_enc_pts.load(Ordering::Acquire);
+            let first_in = (first_enc != NO_PTS)
+                .then_some(first_enc)
+                .or(self.first_in_pts);
+            let shift = first_in.map_or(0, |i| encoder_pts_shift(i, raw));
             log::info!("encoder: output timestamps are shifted by {shift} ns; mapped back");
             self.pts_shift = Some(shift);
         }
@@ -403,14 +433,23 @@ mod tests {
     use super::encoder_pts_shift;
 
     #[test]
-    fn shift_rounds_to_whole_seconds() {
+    fn shift_is_exact_not_rounded() {
         let thousand_hours = 3_600_000_000_000_000u64;
-        let first_in = 454_552_445_000u64;
+        // x264: first output is exactly 1000 h whatever the first input was.
+        let first_in = 327_497_000u64;
         assert_eq!(
-            encoder_pts_shift(first_in, first_in + thousand_hours + 40_000_000),
-            thousand_hours
+            encoder_pts_shift(first_in, thousand_hours),
+            thousand_hours - first_in
         );
-        assert_eq!(encoder_pts_shift(first_in, first_in + 66_000_000), 0);
+        // A later frame maps back to its own capture PTS.
+        let later_in = first_in + 33_366_000;
+        let later_out = later_in + encoder_pts_shift(first_in, thousand_hours);
+        assert_eq!(
+            later_out - encoder_pts_shift(first_in, thousand_hours),
+            later_in
+        );
+        // NVENC keeps the timestamps.
+        assert_eq!(encoder_pts_shift(first_in, first_in), 0);
         assert_eq!(encoder_pts_shift(5, 3), 0);
     }
 }
