@@ -196,3 +196,43 @@ fn argus_eos_is_reported_as_a_capture_fault() {
     }
     panic!("finite Argus pipeline never surfaced EOS");
 }
+
+/// A runtime element failure (`identity error-after=3`) posts an Error
+/// on the bus after PLAYING. The appsink never EOSes, so only the bus
+/// can surface it; the old zero-timeout poll saw nothing.
+#[test]
+fn runtime_element_error_surfaces_on_the_bus_within_two_seconds() {
+    if !element_exists("videotestsrc") || !element_exists("videoconvert") {
+        eprintln!("skipping: test-pattern elements not in this GStreamer install");
+        return;
+    }
+    let launch = "videotestsrc is-live=true \
+        ! videoconvert ! video/x-raw,format=NV12,width=64,height=64,framerate=30/1 \
+        ! identity error-after=3 \
+        ! appsink name=frames max-buffers=1 drop=true sync=false";
+    let mut source = GstLaunchSource::new(
+        launch,
+        cfg("test"),
+        FrameMemory::DmaBuf,
+        Layout::PitchLinear,
+    )
+    .expect("build gst source");
+    source
+        .start()
+        .expect("start must succeed: the failure under test happens after 3 buffers");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let error = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bus error not reported within 2 s: the poll only saw timeouts"
+        );
+        match source.next_frame(Duration::from_millis(100)) {
+            Err(e) => break e,
+            Ok(FramePoll::EndOfStream) => panic!("element failure must not be a clean EOS"),
+            // The first buffers pass through before the failure.
+            Ok(_) => {}
+        }
+    };
+    let _ = source.stop();
+    assert!(error.to_string().contains("pipeline error"), "{error}");
+}

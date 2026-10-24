@@ -48,6 +48,8 @@ pub struct JetsonPlatform {
     engines: MediaEngines,
     module: ModuleIdentity,
     root: std::path::PathBuf,
+    /// Frame rate of the last `source()`; the encoder's appsrc caps need it.
+    source_fps: std::sync::atomic::AtomicU32,
 }
 
 impl JetsonPlatform {
@@ -56,6 +58,7 @@ impl JetsonPlatform {
             engines: probe_media_engines(sysfs_root),
             module: probe_module_identity(sysfs_root),
             root: sysfs_root.to_path_buf(),
+            source_fps: std::sync::atomic::AtomicU32::new(30),
         }
     }
 
@@ -64,6 +67,7 @@ impl JetsonPlatform {
             engines,
             module: ModuleIdentity::default(),
             root: std::path::PathBuf::from("/"),
+            source_fps: std::sync::atomic::AtomicU32::new(30),
         }
     }
 
@@ -123,6 +127,8 @@ impl Platform for JetsonPlatform {
     }
 
     fn source(&self, cfg: &SourceConfig) -> Result<Box<dyn FrameSource>> {
+        self.source_fps
+            .store(cfg.fps.max(1), std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "gst")]
         {
             let launch = match cfg.kind.as_str() {
@@ -213,12 +219,10 @@ impl Platform for JetsonPlatform {
                         .into(),
                 ));
             }
-            Ok(Some(Box::new(gst_encoder::GstEncoder::new(
-                EncoderKind::Cpu,
-                cfg,
-                width,
-                height,
-            )?)))
+            Ok(Some(Box::new(
+                gst_encoder::GstEncoder::new(EncoderKind::Cpu, cfg, width, height)?
+                    .with_fps(self.source_fps.load(std::sync::atomic::Ordering::Relaxed)),
+            )))
         }
         #[cfg(not(feature = "gst"))]
         {

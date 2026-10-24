@@ -321,10 +321,11 @@ impl GstLaunchSource {
         let Some(bus) = self.pipeline.bus() else {
             return Ok(None);
         };
-        while let Some(msg) = bus.timed_pop_filtered(
-            gst::ClockTime::ZERO,
-            &[gst::MessageType::Error, gst::MessageType::Eos],
-        ) {
+        // `pop_filtered`, not `timed_pop_filtered(ZERO, ..)`: gstreamer-rs
+        // 0.25 computes `total - elapsed` first, and a zero budget is
+        // already spent by then, so it returned None without ever
+        // looking at the bus.
+        while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error, gst::MessageType::Eos]) {
             match msg.view() {
                 gst::MessageView::Error(e) => {
                     return Err(Error::Platform(format!(

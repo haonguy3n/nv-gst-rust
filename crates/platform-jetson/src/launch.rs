@@ -37,7 +37,7 @@ pub fn capture_launch(cfg: &SourceConfig) -> String {
     format!(
         "nvarguscamerasrc name=camsrc sensor-id={} \
          ! {},framerate={}/1 \
-         ! appsink name=frames max-buffers=2 drop=true sync=false",
+         ! appsink name=frames max-buffers=1 drop=true sync=false",
         cfg.camera_id,
         raw_caps("(memory:NVMM)", "NV12", cfg.width, cfg.height),
         cfg.fps.max(1),
@@ -55,22 +55,33 @@ pub fn capture_launch(cfg: &SourceConfig) -> String {
 pub fn file_capture_launch(cfg: &SourceConfig) -> String {
     format!(
         "filesrc name=source ! decodebin ! nvvidconv \
-         ! {} ! appsink name=frames max-buffers=2 drop=true sync=false",
+         ! {} ! appsink name=frames max-buffers=1 drop=true sync=false",
         raw_caps("(memory:NVMM)", "NV12", cfg.width, cfg.height),
     )
 }
 
 /// Encode side: appsrc (NVMM in) -> encoder -> byte-stream appsink.
-pub fn encode_launch(kind: EncoderKind, cfg: &EncoderConfig, width: u32, height: u32) -> String {
+///
+/// The appsrc caps carry `framerate`: `nvvidconv` rejects NVMM caps
+/// without one (not-negotiated on the Nano), which a PC's
+/// `videoconvert` tolerates.
+pub fn encode_launch(
+    kind: EncoderKind,
+    cfg: &EncoderConfig,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> String {
     let bitrate_bps = cfg.bitrate_kbps.saturating_mul(1000);
-    // Bounded and non-blocking: a stalled/caps-mismatched encoder
-    // must return an error, never hang the encoder thread. The runner
-    // already drops frames in the one-deep hand-off, so a full appsrc
-    // is a fault to surface, not a reason to block forever.
+    // Bounded, leaky and non-blocking: a slow element drops the oldest
+    // queued frame (counted by the encoder), and a stalled/caps-mismatched
+    // one can never block the encoder thread. `block=false` alone does
+    // not bound the queue; `leaky-type=downstream` does.
     let src = format!(
-        "appsrc name=framesrc is-live=true format=time block=false max-buffers=2 \
-         caps={}",
-        raw_caps("(memory:NVMM)", "NV12", width, height)
+        "appsrc name=framesrc is-live=true format=time block=false \
+         max-buffers=1 leaky-type=downstream caps={},framerate={}/1",
+        raw_caps("(memory:NVMM)", "NV12", width, height),
+        fps.max(1)
     );
     match (kind, cfg.codec) {
         (EncoderKind::Nvenc, Codec::H264) => format!(
@@ -144,7 +155,7 @@ mod tests {
             capture_launch(&source_cfg()),
             "nvarguscamerasrc name=camsrc sensor-id=1 \
              ! video/x-raw(memory:NVMM),format=NV12,width=1440,height=1080,framerate=30/1 \
-             ! appsink name=frames max-buffers=2 drop=true sync=false"
+             ! appsink name=frames max-buffers=1 drop=true sync=false"
         );
     }
 
@@ -182,14 +193,16 @@ mod tests {
             bitrate_kbps: 8000,
             ..EncoderConfig::default()
         };
-        let launch = encode_launch(EncoderKind::Nvenc, &cfg, 1440, 1080);
+        let launch = encode_launch(EncoderKind::Nvenc, &cfg, 1440, 1080, 30);
         assert!(launch.contains("nvv4l2h265enc bitrate=8000000"), "{launch}");
         assert!(
-            launch.contains("block=false max-buffers=2"),
+            launch.contains("block=false max-buffers=1 leaky-type=downstream"),
             "appsrc must be bounded: {launch}"
         );
         assert!(
-            launch.contains("video/x-raw(memory:NVMM),format=NV12"),
+            launch.contains(
+                "caps=video/x-raw(memory:NVMM),format=NV12,width=1440,height=1080,framerate=30/1"
+            ),
             "{launch}"
         );
         assert!(
@@ -205,9 +218,13 @@ mod tests {
     #[test]
     fn cpu_encode_launch_has_exactly_one_copy_out_of_nvmm() {
         let cfg = EncoderConfig::default();
-        let launch = encode_launch(EncoderKind::Cpu, &cfg, 1440, 1080);
+        let launch = encode_launch(EncoderKind::Cpu, &cfg, 1440, 1080, 30);
         assert_eq!(launch.matches("nvvidconv").count(), 1, "{launch}");
         assert!(launch.contains("x264enc"), "{launch}");
+        assert!(
+            launch.contains("height=1080,framerate=30/1 ! nvvidconv"),
+            "appsrc caps need a framerate for nvvidconv: {launch}"
+        );
         assert!(launch.contains("format=I420"), "{launch}");
         assert!(
             launch.contains("threads=3 sliced-threads=true"),

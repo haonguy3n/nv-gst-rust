@@ -43,7 +43,7 @@ fn main() -> std::process::ExitCode {
         (
             "videotestsrc is-live=true ! videoconvert \
              ! video/x-raw,format=NV12,width=1440,height=1080,framerate=30/1 \
-             ! appsink name=frames max-buffers=2 drop=true sync=false"
+             ! appsink name=frames max-buffers=1 drop=true sync=false"
                 .to_string(),
             FrameMemory::DmaBuf,
             Layout::PitchLinear,

@@ -174,7 +174,7 @@ pub fn surface_from_bytes(mapped: &[u8]) -> Result<SurfaceInfo, SurfaceError> {
     // least `size_of::<NvBufSurface>()`; the C structs are `repr(C)`
     // mirrors checked by tests. We only read plain fields.
     let surface = unsafe { &*(mapped.as_ptr().cast::<NvBufSurface>()) };
-    if surface.batch_size == 0 || surface.surface_list.is_null() {
+    if surface.batch_size == 0 || surface.num_filled == 0 || surface.surface_list.is_null() {
         return Err(SurfaceError::Empty);
     }
     // SAFETY: the driver's surfaceList points to at least batchSize
@@ -250,12 +250,12 @@ mod tests {
         fixture.params.plane_params.num_planes = 2;
         fixture.params.plane_params.width[0] = 1440;
         fixture.params.plane_params.height[0] = 1080;
-        fixture.params.plane_params.pitch[0] = if padded { 1536 } else { 1440 };
+        fixture.params.plane_params.pitch[0] = if padded { 1472 } else { 1440 };
         fixture.params.plane_params.bytes_per_pix[0] = 1;
-        fixture.params.plane_params.psize[0] = fixture.params.plane_params.pitch[0] * 1080;
+        fixture.params.plane_params.psize[0] = if padded { 1_736_704 } else { 1440 * 1080 };
         fixture.params.plane_params.width[1] = 720;
         fixture.params.plane_params.height[1] = 540;
-        fixture.params.plane_params.pitch[1] = if padded { 1536 } else { 1440 };
+        fixture.params.plane_params.pitch[1] = if padded { 1472 } else { 1440 };
         fixture.params.plane_params.bytes_per_pix[1] = 2;
         fixture.params.plane_params.offset[1] = fixture.params.plane_params.psize[0];
         fixture.params.plane_params.psize[1] = fixture.params.plane_params.pitch[1] * 540;
@@ -283,10 +283,10 @@ mod tests {
         assert_eq!(info.fd, 42);
         assert_eq!(info.plane_count(), 2);
         let planes: Vec<_> = info.planes().copied().collect();
-        assert_eq!(planes[0].pitch, 1536);
+        assert_eq!(planes[0].pitch, 1472);
         assert_eq!(planes[0].row_bytes, 1440);
         assert_eq!(planes[1].row_bytes, 1440);
-        assert_eq!(planes[1].offset, 1536 * 1080);
+        assert_eq!(planes[1].offset, 1_736_704);
     }
 
     #[test]

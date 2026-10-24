@@ -146,9 +146,8 @@ fn cpu_encoder_can_be_reused_after_finish() {
 }
 
 /// E1: a downstream caps mismatch must not block the encoder thread
-/// forever. The appsrc is non-blocking and the encoder polls the bus;
-/// this test pins the bounded push path (a hard error is not required:
-/// a stalled pipeline may report no packets, but it must not hang).
+/// forever, and the pipeline's bus error must reach the caller within
+/// a second (the Nano ran 60 s on a not-negotiated encoder, silently).
 #[test]
 fn downstream_caps_mismatch_does_not_block_forever() {
     if !software_h264_available() {
@@ -172,11 +171,54 @@ fn downstream_caps_mismatch_does_not_block_forever() {
     let mut encoder =
         GstEncoder::new_with_launch(EncoderKind::Cpu, &cfg, W, H, launch).expect("build encoder");
     let started = std::time::Instant::now();
-    for seq in 0..10 {
-        let _ = encoder.encode(frame(seq), &mut |_| {});
+    let mut failure = None;
+    for seq in 0..60 {
+        if let Err(e) = encoder.encode(frame(seq), &mut |_| {}) {
+            failure = Some(e);
+            break;
+        }
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "push path blocked on a caps mismatch"
+            started.elapsed() < Duration::from_secs(1),
+            "caps mismatch was not reported within 1 s"
         );
+        std::thread::sleep(Duration::from_millis(33));
     }
+    let err = failure.expect("a caps mismatch must surface as an encode error");
+    assert!(err.to_string().contains("encoder pipeline error"), "{err}");
+}
+
+/// E1b: with a slow (not failed) element downstream, the leaky appsrc
+/// must evict the oldest frame instead of queueing every push. The
+/// sleeping `identity` holds the streaming thread, so the queue fills.
+#[test]
+fn slow_downstream_makes_the_appsrc_drop_not_queue() {
+    let gst_version = gstreamer::version();
+    if gst_version.1 < 20 {
+        eprintln!("skipping: appsrc leaky-type needs GStreamer 1.20");
+        return;
+    }
+    let cfg = EncoderConfig {
+        enabled: true,
+        codec: Codec::H264,
+        hardware: false,
+        bitrate_kbps: 500,
+        gop_frames: 5,
+    };
+    let launch = "appsrc name=framesrc is-live=true format=time block=false \
+         max-buffers=1 leaky-type=downstream \
+         caps=video/x-raw,format=NV12,width=64,height=64,framerate=30/1 \
+         ! identity sleep-time=200000 \
+         ! appsink name=enc max-buffers=8 drop=false sync=false";
+    let mut encoder =
+        GstEncoder::new_with_launch(EncoderKind::Cpu, &cfg, W, H, launch).expect("build encoder");
+    for seq in 0..30 {
+        encoder
+            .encode(frame(seq), &mut |_| {})
+            .expect("push never fails");
+    }
+    assert!(
+        encoder.dropped_frames() >= 20,
+        "30 pushes against a 200 ms element must mostly leak, dropped {}",
+        encoder.dropped_frames()
+    );
 }

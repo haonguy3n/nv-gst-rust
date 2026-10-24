@@ -81,6 +81,7 @@ pub struct GstEncoder {
     cfg: EncoderConfig,
     width: u32,
     height: u32,
+    fps: u32,
     /// Optional override for tests: a system-memory launch string
     /// instead of the NVMM device string.
     launch_override: Option<String>,
@@ -88,6 +89,7 @@ pub struct GstEncoder {
     appsrc: Option<gst_app::AppSrc>,
     appsink: Option<gst_app::AppSink>,
     logged_first_buffer: bool,
+    appsrc_dropped: u64,
 }
 
 impl GstEncoder {
@@ -98,11 +100,13 @@ impl GstEncoder {
             cfg: cfg.clone(),
             width,
             height,
+            fps: 30,
             launch_override: None,
             pipeline: None,
             appsrc: None,
             appsink: None,
             logged_first_buffer: false,
+            appsrc_dropped: 0,
         })
     }
 
@@ -122,12 +126,27 @@ impl GstEncoder {
             cfg: cfg.clone(),
             width,
             height,
+            fps: 30,
             launch_override: Some(launch.into()),
             pipeline: None,
             appsrc: None,
             appsink: None,
             logged_first_buffer: false,
+            appsrc_dropped: 0,
         })
+    }
+
+    /// Source frame rate for the appsrc caps (default 30). NVIDIA's
+    /// `nvvidconv` refuses NVMM caps without a framerate.
+    pub fn with_fps(mut self, fps: u32) -> Self {
+        self.fps = fps.max(1);
+        self
+    }
+
+    /// Frames the leaky `appsrc` queue evicted because the encoder
+    /// was behind (a proxy: counted when the queue was non-empty at push).
+    pub fn appsrc_dropped(&self) -> u64 {
+        self.appsrc_dropped
     }
 
     /// Parse and start the pipeline on first use. Keeping this lazy
@@ -138,7 +157,7 @@ impl GstEncoder {
             return Ok(());
         }
         let launch = self.launch_override.clone().unwrap_or_else(|| {
-            launch::encode_launch(self.kind, &self.cfg, self.width, self.height)
+            launch::encode_launch(self.kind, &self.cfg, self.width, self.height, self.fps)
         });
         let pipeline = gst::parse::launch(&launch)
             .map_err(|e| Error::Platform(format!("parsing encoder launch string: {e}")))?
@@ -157,10 +176,13 @@ impl GstEncoder {
             .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
             .ok_or_else(|| Error::Platform("encoder launch string has no appsink `enc`".into()))?;
         // Defence in depth: even a hand-written launch string must
-        // never make push_buffer block forever (E1). A full queue is a
-        // surfaced FlowError, not a hung encoder thread.
+        // never block the encoder thread. The queue is one frame and
+        // leaks the oldest; `block=false` alone would let it grow.
         appsrc.set_property("block", false);
-        appsrc.set_property("max-buffers", 2u64);
+        appsrc.set_property("max-buffers", 1u64);
+        if appsrc.find_property("leaky-type").is_some() {
+            appsrc.set_property_from_str("leaky-type", "downstream");
+        }
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| Error::Platform(format!("starting encoder pipeline: {e}")))?;
@@ -199,9 +221,13 @@ impl GstEncoder {
         let Some(bus) = pipeline.bus() else {
             return Ok(());
         };
-        while let Some(msg) =
-            bus.timed_pop_filtered(gst::ClockTime::ZERO, &[gst::MessageType::Error])
-        {
+        // `pop_filtered`, not `timed_pop_filtered(ZERO, ..)`: gstreamer-rs
+        // 0.25 computes `total - elapsed` first, and a zero budget is
+        // already spent by then, so it returned None without ever
+        // looking at the bus.
+        let mut examined = 0u32;
+        while let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+            examined += 1;
             if let gst::MessageView::Error(e) = msg.view() {
                 return Err(Error::Platform(format!(
                     "encoder pipeline error from {:?}: {} ({:?})",
@@ -211,6 +237,10 @@ impl GstEncoder {
                 )));
             }
         }
+        gst::debug!(
+            gst::CAT_DEFAULT,
+            "encoder: poll_bus examined {examined} error messages"
+        );
         Ok(())
     }
 
@@ -232,6 +262,10 @@ impl GstEncoder {
 }
 
 impl Encoder for GstEncoder {
+    fn dropped_frames(&self) -> u64 {
+        self.appsrc_dropped
+    }
+
     fn encode(&mut self, frame: HwFrame, out: &mut dyn FnMut(EncodedPacket)) -> Result<()> {
         self.ensure_started()?;
         let buffer = {
@@ -253,6 +287,12 @@ impl Encoder for GstEncoder {
             // E5 diagnostic for the first board run: a writable buffer
             // or a set DISCONT flag means the no-share NVMM buffer was
             // copied before it reached the encoder.
+            gst::info!(
+                gst::CAT_DEFAULT,
+                "encoder: first buffer flags={:?} writable={}",
+                buffer.flags(),
+                buffer.is_writable()
+            );
             eprintln!(
                 "encoder: first buffer flags={:?} writable={}",
                 buffer.flags(),
@@ -263,6 +303,13 @@ impl Encoder for GstEncoder {
             .appsrc
             .as_ref()
             .ok_or_else(|| Error::Platform("encoder appsrc not started".into()))?;
+        // With max-buffers=1 + leaky downstream, a non-empty queue
+        // means this push will drop the oldest frame. `current_level_buffers`
+        // needs gstreamer-app's v1_20 feature; queued bytes is a
+        // sufficient non-empty proxy here.
+        if appsrc.current_level_bytes() > 0 {
+            self.appsrc_dropped += 1;
+        }
         appsrc
             .push_buffer(buffer)
             .map_err(|e| Error::Platform(format!("pushing frame into encoder: {e}")))?;
