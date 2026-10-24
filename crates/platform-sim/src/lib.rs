@@ -606,7 +606,12 @@ impl Platform for SimPlatform {
         Ok(Box::new(SimOverlay))
     }
 
-    fn encoder(&self, _cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
+    fn encoder(
+        &self,
+        _cfg: &EncoderConfig,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<Box<dyn Encoder>>> {
         // Like Orin Nano: no hardware encoder, metadata only.
         Ok(None)
     }
@@ -664,8 +669,13 @@ impl Platform for DelayedSimPlatform {
     fn overlay(&self) -> Result<Box<dyn Overlay>> {
         SimPlatform.overlay()
     }
-    fn encoder(&self, cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
-        SimPlatform.encoder(cfg)
+    fn encoder(
+        &self,
+        cfg: &EncoderConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Box<dyn Encoder>>> {
+        SimPlatform.encoder(cfg, width, height)
     }
 
     fn stream(&self, camera_id: u8) -> Result<GpuStream> {

@@ -205,6 +205,14 @@ pub trait Encoder: Send {
     /// until the hardware releases it, then dropping it returns the
     /// buffer to the capture pool.
     fn encode(&mut self, frame: HwFrame, out: &mut dyn FnMut(EncodedPacket)) -> Result<()>;
+
+    /// Flush at end of stream, emitting any delayed packets. The
+    /// runner calls this once on the encoder thread after the last
+    /// frame; the default is a no-op for synchronous encoders.
+    fn finish(&mut self, out: &mut dyn FnMut(EncodedPacket)) -> Result<()> {
+        let _ = out;
+        Ok(())
+    }
 }
 
 /// RTSP, WebRTC, file, MQTT metadata.
@@ -229,6 +237,8 @@ pub struct PlatformCaps {
     pub formats: Vec<PixelFormat>,
     pub max_width: u32,
     pub max_height: u32,
+    /// Hardware-encoder codecs. The CPU path is described by
+    /// `cpu_encode` and currently supports H.264 only.
     pub codecs: Vec<Codec>,
     pub precisions: Vec<Precision>,
     /// Accelerator names `model.device` may select ("gpu", "dla0",
@@ -251,9 +261,15 @@ pub trait Platform {
     /// runner handles both; see `EngineWarmup`.
     fn engine(&self, cfg: &ModelConfig) -> Result<EngineState>;
     fn overlay(&self) -> Result<Box<dyn Overlay>>;
-    /// `None` when the SoC has no HW encoder (Orin Nano): the pipeline
-    /// then streams metadata only.
-    fn encoder(&self, cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>>;
+    /// `None` when the platform has no encoder at all. `width`/`height`
+    /// are the source dimensions the encoder must consume (the launch
+    /// string needs them).
+    fn encoder(
+        &self,
+        cfg: &EncoderConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Box<dyn Encoder>>>;
     /// The ordered GPU work queue for one camera. Required (no
     /// default): a GPU backend that forgets it must fail to
     /// compile, not silently run on a no-op stream. CPU-only

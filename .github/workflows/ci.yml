@@ -17,7 +17,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy -p platform-sim --features onnx --all-targets -- -D warnings
       - run: cargo test -p platform-sim --features onnx
-      - run: sudo apt-get update && sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base
+      - run: sudo apt-get update && sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-ugly
       - run: cargo clippy -p platform-jetson --features gst --all-targets -- -D warnings
       - run: cargo test -p platform-jetson --features gst
       # The feature combination the app actually ships with.

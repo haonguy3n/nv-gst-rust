@@ -1,0 +1,46 @@
+# Orin Nano 8 GB profile (M1 target): metadata + H.264 video through
+# the CPU encoder. The Nano has no NVENC, so this is the explicit
+# relaxed-mode opt-in: one VIC copy NVMM -> I420, then x264.
+# Pin JetPack 7 / L4T r39.2.1 and record the exact versions on the
+# board, as for the NX profile.
+platform = "jetson"
+zero_copy = "relaxed"
+
+[source]
+kind = "argus" # nvarguscamerasrc -> NVMM; direct libargus is later
+width = 1440 # IMX296 native
+height = 1080
+fps = 30
+pool_size = 8 # sim semantics; the Argus pool is fixed (see docs/jetson-bringup.md)
+# No gain/exposure ranges here: at-start ranges gave black frames on
+# the Nano. Apply them after PLAYING once brightness is checked.
+
+[model]
+# YOLOX (Apache-2.0) is the device default. FP16 selects TensorRT
+# layer execution; the I/O bindings stay F32.
+path = "/data/models/yolox-tiny.onnx"
+decoder = "yolox"
+precision = "fp16"
+device = "gpu"
+input_width = 416
+input_height = 416
+input_color = "bgr"
+input_normalize = "none"
+num_classes = 80
+score_threshold = 0.3
+
+[encoder]
+enabled = true
+codec = "H264" # software H.265 cannot hold 1440x1080@30 on the Nano
+hardware = false # explicit opt-in; strict mode refuses this
+bitrate_kbps = 8000
+gop_frames = 30
+
+[stream]
+metadata_only = false
+# Video is served by the RTSP sink once it lands; until then the file
+# sink/tests exercise the encoder stage.
+
+[pipeline]
+queue_depth = 2 # live source: small queues keep the in-flight budget under Argus
+max_idle_ms = 5000

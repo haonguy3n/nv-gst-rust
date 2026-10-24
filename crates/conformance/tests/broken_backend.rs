@@ -92,7 +92,12 @@ impl Platform for BrokenPlatform {
         Ok(GpuStream::noop())
     }
 
-    fn encoder(&self, _cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
+    fn encoder(
+        &self,
+        _cfg: &EncoderConfig,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<Box<dyn Encoder>>> {
         Ok(None)
     }
 }
@@ -123,5 +128,5 @@ fn suite_catches_non_increasing_sequence() {
 #[test]
 #[should_panic(expected = "encoder() must return Some exactly when")]
 fn suite_catches_encoder_caps_lie() {
-    edge_conformance::check_encoder_option_matches_caps(&BrokenPlatform);
+    edge_conformance::check_encoder_option_matches_caps(&BrokenPlatform, &source_cfg());
 }

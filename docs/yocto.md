@@ -9,8 +9,9 @@ checkout in place:
   (the GStreamer runtime). A virtual workspace root takes no
   `--features`, so the recipe points cargo at the app's manifest and the
   workspace's `Cargo.lock`.
-- Installs `/usr/bin/edge-vision` and `config/orin-nx-yolo.toml`,
-  `config/x86-dev.toml` in `/etc/edge-vision/`.
+- Installs `/usr/bin/edge-vision` and the profiles
+  (`config/orin-nx-yolo.toml`, `config/orin-nano-yolo.toml`,
+  `config/x86-dev.toml`) in `/etc/edge-vision/`.
 - `onnx` is not built: `ort`'s `download-binaries` fetches ONNX Runtime
   in its build script, and a Yocto `do_compile` has no network.
 - Toolchain: OE-core's Rust 1.98.1 and `cargo` class; every crate is

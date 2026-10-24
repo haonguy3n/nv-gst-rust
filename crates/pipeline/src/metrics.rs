@@ -132,6 +132,9 @@ pub struct PipelineMetrics {
     pub frames_captured: u64,
     /// Frames evicted by drop-oldest backpressure.
     pub frames_dropped: u64,
+    /// Frames dropped by the leaky processing → encoder hand-off
+    /// (encoder slower than the sensor).
+    pub encode_dropped: u64,
     /// Capture polls starved by pool exhaustion (all buffers
     /// held downstream). Normal sensor pacing between frames is
     /// not counted. The run continues; this is the counter that
@@ -192,6 +195,12 @@ impl PipelineMetrics {
             "edge_capture_timeouts_total",
             "Capture polls starved by pool exhaustion",
             self.capture_timeouts,
+        );
+        counter(
+            &mut out,
+            "edge_encode_dropped_total",
+            "Frames dropped by the leaky processing-to-encoder hand-off",
+            self.encode_dropped,
         );
         counter(
             &mut out,
@@ -264,11 +273,12 @@ impl PipelineMetrics {
             None => "n/a".to_string(),
         };
         format!(
-            "captured={} dropped={} timeouts={} processed={} detections={} \
+            "captured={} dropped={} enc_dropped={} timeouts={} processed={} detections={} \
              qmax={} p50={} p95={} p99={} \
              avg pre={:?} infer={:?} post={:?} overlay={:?} encode={:?}",
             self.frames_captured,
             self.frames_dropped,
+            self.encode_dropped,
             self.capture_timeouts,
             self.frames_processed,
             self.detections,
@@ -298,6 +308,7 @@ impl PipelineMetrics {
 pub struct LiveMetrics {
     frames_captured: AtomicU64,
     frames_dropped: AtomicU64,
+    encode_dropped: AtomicU64,
     /// The channel's own drop counter for the current run, read
     /// directly so drops stay visible even while processing is
     /// stalled (when nothing calls `sync_processing`).
@@ -342,6 +353,7 @@ impl LiveMetrics {
                     || self.frames_dropped.load(Ordering::Relaxed),
                     |source| source.load(Ordering::Relaxed),
                 ),
+            encode_dropped: self.encode_dropped.load(Ordering::Relaxed),
             capture_timeouts: self.capture_timeouts.load(Ordering::Relaxed),
             frames_processed: self.frames_processed.load(Ordering::Relaxed),
             detections: self.detections.load(Ordering::Relaxed),
@@ -360,6 +372,7 @@ impl LiveMetrics {
         for counter in [
             &self.frames_captured,
             &self.frames_dropped,
+            &self.encode_dropped,
             &self.capture_timeouts,
             &self.frames_processed,
             &self.detections,
@@ -410,6 +423,8 @@ impl LiveMetrics {
             .store(metrics.frames_processed, Ordering::Relaxed);
         self.detections.store(metrics.detections, Ordering::Relaxed);
         self.frames_dropped.store(dropped, Ordering::Relaxed);
+        self.encode_dropped
+            .store(metrics.encode_dropped, Ordering::Relaxed);
         let depth = self.attached_depth();
         self.queue_depth.store(depth, Ordering::Relaxed);
         self.queue_depth_max.fetch_max(depth, Ordering::Relaxed);

@@ -29,7 +29,10 @@ model hash, power mode, cooling, ambient, checks run/pending.
 nvarguscamerasrc → NV12 NVMM → appsink
       → HwFrame (same gst::Buffer / NvBufSurface)
       → [pre → infer → post] (M1: CPU post; GPU stages per T5/T8/T9)
-      → appsrc → nvv4l2h26xenc → byte-stream appsink → RTSP (M1)
+      → encode thread (leaky one-deep hand-off)
+      → NX:  appsrc → nvv4l2h26xenc → byte-stream appsink
+      → Nano: appsrc → nvvidconv → I420 → x264enc → h264parse → appsink
+      → RTSP (M1)
 ```
 
 - Capture and encode strings are built in
@@ -41,11 +44,11 @@ nvarguscamerasrc → NV12 NVMM → appsink
   `appsrc` is bounded/blocking (`block=true max-buffers=2`), and the
   encode `appsink` is bounded too (`max-buffers=8 drop=false`). Freshness
   belongs in the Rust drop-oldest channel, where drops are counted.
-- The encode output is asynchronous. The `Encoder` trait's callback
-  implies packets during `encode()`; `appsrc → nvv4l2 → appsink`
-  produces them later on another thread. Decide between blocking on the
-  encode `appsink` and a pull/poll packet API before implementing the
-  stage.
+- The encode output is asynchronous. `GstEncoder::encode` pushes a
+  frame and drains samples non-blockingly; delayed packets are collected
+  on later calls and `Encoder::finish` sends EOS and flushes. The runner
+  calls it on the encoder thread and drains the packet channel before
+  joining, so teardown cannot deadlock.
 
 ### Same-buffer NVENC hypothesis (prove first)
 
@@ -164,10 +167,15 @@ any stage drops the frame early.
   PLAYING. Ship the Nano profile without those keys first, check
   brightness, then apply ranges after PLAYING and log the sensor's
   reported limits.
-- Orin Nano has no NVENC. The CPU-encode launch strings exist, but the
-  `Encoder` stage and `PlatformCaps::cpu_encode` are still false; a
-  strict Nano profile is metadata-only by construction until that stage
-  is implemented.
+- Orin Nano has no NVENC. The CPU H.264 stage now exists (GStreamer
+  `appsrc` → `nvvidconv` → I420 → `x264enc` → `h264parse` → `appsink`;
+  one deliberate VIC copy) and `PlatformCaps::cpu_encode` advertises
+  the compiled stage, and `encoder()` checks `x264enc` before building
+  the string (missing element names
+  `gstreamer1.0-plugins-ugly-x264`). A strict profile still refuses it; the Nano
+  profile is `config/orin-nano-yolo.toml` with `zero_copy = "relaxed"`
+  and `encoder.hardware = false`. Device streaming still depends on the
+  NVMM capture branch, which refuses buffers rather than copying them.
 
 ### Building the engine on the image
 
@@ -334,12 +342,14 @@ session runs T2 and T3 before investing in T6–T10.
 
 ## Remaining findings from the 2026-10-24 device review
 
-Resolved in the PC pass: input dtype no longer tied to execution
-precision (N6); Argus EOS fails the run instead of exiting 0 (N8,
-first half); the copy-fallback pool is lazy and `O_EXCL` (N10); plan
-cache keys include SoC/L4T/CUDA/GPU (N13); INT8 is not advertised
-without calibration (N15); encode appsinks are bounded and x264 is
-capped at three threads (N7/N17); the engine-build script uses
+Resolved in the PC pass: the CPU H.264 encoder stage exists with an
+element check and a Nano profile (N2/N16); encoding runs on its own
+thread with a leaky one-deep hand-off (N7); input dtype is no longer
+tied to execution precision (N6); Argus EOS fails the run instead of
+exiting 0 (N8, first half); the copy-fallback pool is lazy and `O_EXCL`
+(N10); plan cache keys include SoC/L4T/CUDA/GPU (N13); INT8 is not
+advertised without calibration (N15); encode appsinks are bounded and
+x264 is capped at three threads (N17); the engine-build script uses
 `EDGE_VISION_CACHE`, a 256 MiB workspace, a build lock and a memory
 check (N1/N3/N4/N5).
 
@@ -347,12 +357,9 @@ Still device-gated:
 
 | Item | Status / next step |
 | --- | --- |
-| N2 Nano CPU encode | `Encoder` stage not implemented; `cpu_encode = false`; Nano video remains metadata-only until the GStreamer CPU encoder lands |
-| N7 video/inference split | Encode still runs on the processing thread; move to a leaky one-deep encode thread before the NVENC/x264 stage |
 | N9 teardown after daemon loss | `set_state(Null)` still unconditional; add the `nvargus-daemon` restart check and skip teardown when it fired |
 | N11 in-flight budget | Table above is the design; add a validated Jetson budget and log it at startup |
 | N14 module identity | Probe `/proc/device-tree/compatible`, `MemTotal` and DLA devices; derive caps from them |
-| N16 encoder element checks | Check `x264enc`/`x265enc`/`nvv4l2*` presence before building the launch string; name the package in the error |
 | N18 VIC clock floor | Propose `edge-vision-clocks.service` with the recipe; no unit is shipped |
 | N19 cross build | Docker covers the workspace/sim only; `--features jetson` and `trt-sys` need the Yocto SDK (T0) |
 | N20 disk writer | Sinks still write/flush on the processing thread; add a bounded writer thread |
@@ -360,3 +367,4 @@ Still device-gated:
 | X1 same-`gst::Buffer` NVENC | First board session, as above |
 | X3 DLA | Deferred; reserve the builder flag and `model.device` hook |
 | X4 two cameras | Blocked on the cam1 Argus timeout |
+| Nano measurement | Record `tegrastats`, process CPU, `edge_encode_dropped_total` and the x264 `threads=3` setting alongside the H.264 stream once the NVMM/VIC stages run on the board |

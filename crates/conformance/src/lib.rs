@@ -65,7 +65,7 @@ pub fn check_all(platform: &dyn Platform, source_cfg: &SourceConfig, model_cfg: 
     check_frame_order_and_timestamps(platform, source_cfg);
     check_pool_exhaustion_drops_and_recovers(platform, source_cfg);
     check_preprocess_and_inference(platform, source_cfg, model_cfg);
-    check_encoder_option_matches_caps(platform);
+    check_encoder_option_matches_caps(platform, source_cfg);
     check_clean_shutdown(platform, source_cfg);
 }
 
@@ -382,22 +382,29 @@ pub fn check_preprocess_and_inference(
         .unwrap_or_else(|e| panic!("{}: source stop: {e}", platform.name()));
 }
 
-pub fn check_encoder_option_matches_caps(platform: &dyn Platform) {
+pub fn check_encoder_option_matches_caps(platform: &dyn Platform, source_cfg: &SourceConfig) {
     let caps = platform.caps();
     let mut cfg = EncoderConfig {
         enabled: true,
+        hardware: caps.has_hw_encoder,
         ..EncoderConfig::default()
     };
-    if let Some(&codec) = caps.codecs.first() {
+    let expected = caps.has_hw_encoder || caps.cpu_encode;
+    if expected {
+        let codec = caps
+            .codecs
+            .first()
+            .copied()
+            .unwrap_or(edge_core::Codec::H264);
         cfg.codec = codec;
     }
     let encoder = platform
-        .encoder(&cfg)
+        .encoder(&cfg, source_cfg.width, source_cfg.height)
         .unwrap_or_else(|e| panic!("{}: encoder(): {e}", platform.name()));
     assert_eq!(
         encoder.is_some(),
-        caps.has_hw_encoder,
-        "{}: encoder() must return Some exactly when caps advertise a HW encoder",
+        expected,
+        "{}: encoder() must return Some exactly when caps advertise an encoder",
         platform.name()
     );
 }

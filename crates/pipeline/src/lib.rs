@@ -15,11 +15,11 @@ pub mod metrics;
 pub use metrics::{LiveMetrics, PipelineMetrics};
 
 use edge_core::{
-    Config, Detections, Encoder, EngineState, EngineWarmup, Error, FramePoll, FrameSource,
-    GpuStream, HwFrame, InferenceEngine, ModelConfig, Overlay, PixelFormat, Platform,
+    Config, Detections, EncodedPacket, Encoder, EngineState, EngineWarmup, Error, FramePoll,
+    FrameSource, GpuStream, HwFrame, InferenceEngine, ModelConfig, Overlay, PixelFormat, Platform,
     PostProcessor, PreConfig, Preprocessor, Result, Sink, TensorSpec,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,10 @@ enum EngineSlot {
     Ready(Box<dyn InferenceEngine>),
     Warming(Box<dyn EngineWarmup>),
 }
+
+/// The encoder thread hands its encoder back on exit so the pipeline
+/// can run again.
+type EncoderJoin = std::thread::JoinHandle<(Box<dyn Encoder>, Result<()>)>;
 
 /// The engine's declared input must match the config the
 /// preprocessor was built for, or the mismatch would surface
@@ -211,7 +215,7 @@ impl Pipeline {
                     ));
                 }
             }
-            match platform.encoder(&config.encoder)? {
+            match platform.encoder(&config.encoder, config.source.width, config.source.height)? {
                 Some(enc) => Some(enc),
                 None => {
                     return Err(Error::invalid(
@@ -344,6 +348,94 @@ impl Pipeline {
         let limit = max_frames.or(self.config.source.frames);
         let max_idle = Duration::from_millis(self.config.pipeline.max_idle_ms);
 
+        // --- processing -> encoder hand-off -------------------------
+        // Encoding runs on its own thread: x264 (the Nano path) or
+        // NVENC must never stretch the inference loop. The frame
+        // channel is one deep and drops the oldest frame, so a slow
+        // encoder costs video frames, not freshness of inference.
+        let mut video_tx: Option<channel::Sender<HwFrame>> = None;
+        let mut video_dropped: Option<Arc<AtomicU64>> = None;
+        let mut packet_rx: Option<std::sync::mpsc::Receiver<EncodedPacket>> = None;
+        let mut encoder_thread: Option<EncoderJoin> = None;
+        let mut encode_ns: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+        let mut encoder_failed: Option<Arc<AtomicBool>> = None;
+
+        if self.encoder.is_some() {
+            let (tx, rx, dropped) = channel::channel::<HwFrame>(1);
+            let encoder = self.encoder.take();
+            let slot = Arc::new(std::sync::Mutex::new(encoder));
+            let thread_slot = Arc::clone(&slot);
+            let (packet_tx, packet_rx_local) = std::sync::mpsc::sync_channel::<EncodedPacket>(8);
+            let packet_tx_thread = packet_tx.clone();
+            let encode_ns_local = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let encode_ns_thread = Arc::clone(&encode_ns_local);
+            let failed = Arc::new(AtomicBool::new(false));
+            let failed_thread = Arc::clone(&failed);
+            let handle = std::thread::Builder::new()
+                .name(format!("encode-cam{}", self.config.source.camera_id))
+                .spawn(move || {
+                    let mut encoder = thread_slot
+                        .lock()
+                        .expect("encoder slot poisoned")
+                        .take()
+                        .expect("encoder slot empty in encoder thread");
+                    let mut result = Ok(());
+                    loop {
+                        match rx.recv_timeout(Duration::from_millis(100)) {
+                            Some(frame) => {
+                                let t = Instant::now();
+                                let r = encoder.encode(frame, &mut |pkt| {
+                                    let _ = packet_tx_thread.send(pkt);
+                                });
+                                encode_ns_thread
+                                    .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                if let Err(e) = r {
+                                    failed_thread.store(true, Ordering::Relaxed);
+                                    result = Err(e);
+                                    break;
+                                }
+                            }
+                            None => {
+                                if rx.is_closed_and_empty() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if result.is_ok() {
+                        let t = Instant::now();
+                        if let Err(e) = encoder.finish(&mut |pkt| {
+                            let _ = packet_tx_thread.send(pkt);
+                        }) {
+                            failed_thread.store(true, Ordering::Relaxed);
+                            result = Err(e);
+                        }
+                        encode_ns_thread
+                            .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    (encoder, result)
+                });
+            let handle = match handle {
+                Ok(handle) => handle,
+                Err(e) => {
+                    if let Some(encoder) = slot.lock().expect("encoder slot poisoned").take() {
+                        self.encoder = Some(encoder);
+                    }
+                    return (
+                        metrics,
+                        Err(Error::Platform(format!("spawning encoder thread: {e}"))),
+                    );
+                }
+            };
+            drop(packet_tx);
+            video_tx = Some(tx);
+            video_dropped = Some(dropped);
+            packet_rx = Some(packet_rx_local);
+            encoder_thread = Some(handle);
+            encode_ns = Some(encode_ns_local);
+            encoder_failed = Some(failed);
+        }
+
         let (tx, rx, dropped) = channel::channel::<HwFrame>(self.config.pipeline.queue_depth);
         self.live_metrics.attach_dropped(Arc::clone(&dropped));
         let queue_depth = rx.depth_handle();
@@ -385,6 +477,13 @@ impl Pipeline {
                 if let Some(source) = slot.lock().expect("source slot poisoned").take() {
                     self.source = source;
                 }
+                drop(video_tx.take());
+                drop(packet_rx.take());
+                if let Some(handle) = encoder_thread.take() {
+                    if let Ok((encoder, _)) = handle.join() {
+                        self.encoder = Some(encoder);
+                    }
+                }
                 return (
                     metrics,
                     Err(Error::Platform(format!("spawning capture thread: {e}"))),
@@ -395,7 +494,34 @@ impl Pipeline {
         let mut detections = Detections::with_capacity(64);
         let mut last_err: Option<Error> = None;
 
-        loop {
+        'run: loop {
+            // Deliver packets the encoder produced since the last
+            // iteration before doing more inference work.
+            if let Some(packet_rx) = &packet_rx {
+                loop {
+                    match packet_rx.try_recv() {
+                        Ok(pkt) => {
+                            if let Err(e) = self.sink.push_video(pkt) {
+                                last_err = Some(e);
+                                break 'run;
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        // The encoder thread dropped its sender: it
+                        // either failed or panicked. Stop; teardown
+                        // collects the error from the join.
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'run,
+                    }
+                }
+            }
+            // An encoder failure must stop an unbounded run promptly;
+            // the actual error is collected from the thread at teardown.
+            if encoder_failed
+                .as_ref()
+                .is_some_and(|failed| failed.load(Ordering::Relaxed))
+            {
+                break;
+            }
             if self.stop.load(Ordering::Relaxed) && rx.is_empty() {
                 break;
             }
@@ -409,9 +535,17 @@ impl Pipeline {
                 }
                 continue;
             };
-            if let Err(e) = self.process_one(frame, &mut detections, &mut metrics) {
+            if let Err(e) =
+                self.process_one(frame, &mut detections, &mut metrics, video_tx.as_ref())
+            {
                 last_err = Some(e);
                 break;
+            }
+            if let Some(dropped) = &video_dropped {
+                metrics.encode_dropped = dropped.load(Ordering::Relaxed);
+            }
+            if let Some(ns) = &encode_ns {
+                metrics.encode_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
             }
             self.live_metrics
                 .sync_processing(&metrics, dropped.load(Ordering::Relaxed));
@@ -438,6 +572,43 @@ impl Pipeline {
             Err(_) => Err(Error::Platform("capture thread panicked".into())),
         };
         metrics.frames_dropped += dropped.load(Ordering::Relaxed);
+
+        // Stop the encoder by closing the frame channel, then drain
+        // every packet it still emits before joining it. Draining
+        // first avoids a deadlock when the encoder is blocked on a
+        // full packet channel.
+        drop(video_tx);
+        let mut encoder_result = Ok(());
+        if let Some(packet_rx) = packet_rx {
+            for pkt in packet_rx.iter() {
+                if let Err(e) = self.sink.push_video(pkt) {
+                    if last_err.is_none() {
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(handle) = encoder_thread {
+            match handle.join() {
+                Ok((encoder, result)) => {
+                    self.encoder = Some(encoder);
+                    encoder_result = result;
+                }
+                Err(_) => encoder_result = Err(Error::Platform("encoder thread panicked".into())),
+            }
+        }
+        if let Some(dropped) = &video_dropped {
+            metrics.encode_dropped = dropped.load(Ordering::Relaxed);
+        }
+        if let Some(ns) = &encode_ns {
+            metrics.encode_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
+        }
+        if let Err(e) = encoder_result {
+            if last_err.is_none() {
+                last_err = Some(e);
+            }
+        }
+
         self.live_metrics
             .set_capture(metrics.frames_captured, metrics.capture_timeouts);
         self.live_metrics
@@ -477,9 +648,10 @@ impl Pipeline {
         frame: HwFrame,
         detections: &mut Detections,
         metrics: &mut PipelineMetrics,
+        video_tx: Option<&channel::Sender<HwFrame>>,
     ) -> Result<()> {
-        // Taken before the encoder consumes the frame: the age
-        // covers queueing plus every stage and the sink call.
+        // Taken before the frame is handed to the encoder thread:
+        // the age covers queueing, inference and the video hand-off.
         let received_at = frame.received_at();
         self.poll_engine()?;
         match &mut self.engine {
@@ -511,14 +683,11 @@ impl Pipeline {
         self.overlay.draw(&frame, detections, &self.stream)?;
         metrics.overlay_total += t.elapsed();
 
-        let t = Instant::now();
-        match &mut self.encoder {
-            Some(encoder) => {
-                let sink = &mut *self.sink;
-                let mut sink_err: Option<Error> = None;
-                // The encoder holds the HwFrame until the hardware
-                // releases it; enforce the same-fd contract in
-                // release builds too, not just debug ones.
+        match video_tx {
+            Some(tx) => {
+                // The encoder thread owns the frame until the
+                // encoder releases it; enforce the same-fd contract
+                // in release builds too, not just debug ones.
                 if frame.meta().dmabuf_fd != frame.buf.dmabuf_fd() {
                     return Err(Error::Platform(format!(
                         "encoder fd contract violated: meta says fd {}, buffer is fd {}",
@@ -526,18 +695,12 @@ impl Pipeline {
                         frame.buf.dmabuf_fd()
                     )));
                 }
-                encoder.encode(frame, &mut |pkt| {
-                    if let Err(e) = sink.push_video(pkt) {
-                        sink_err = Some(e);
-                    }
-                })?;
-                if let Some(e) = sink_err {
-                    return Err(e);
-                }
+                // Leaky one-deep hand-off: an evicted frame is
+                // returned to the capture pool here.
+                drop(tx.send(frame));
             }
             None => drop(frame), // returns the buffer to the capture pool
         }
-        metrics.encode_total += t.elapsed();
 
         self.sink.push_meta(detections)?;
         metrics.latency.record(received_at.elapsed());

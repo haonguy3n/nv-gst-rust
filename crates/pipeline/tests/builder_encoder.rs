@@ -155,7 +155,12 @@ impl Platform for FakePlatform {
         Ok(GpuStream::noop())
     }
 
-    fn encoder(&self, cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
+    fn encoder(
+        &self,
+        cfg: &EncoderConfig,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<Box<dyn Encoder>>> {
         let available = if cfg.hardware { self.hw } else { self.cpu };
         Ok(available.then(|| Box::new(NoopEncoder) as Box<dyn Encoder>))
     }

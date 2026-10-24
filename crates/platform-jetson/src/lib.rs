@@ -21,6 +21,8 @@
 #![forbid(unsafe_code)]
 
 #[cfg(feature = "gst")]
+pub mod gst_encoder;
+#[cfg(feature = "gst")]
 pub mod gst_source;
 pub mod launch;
 pub mod plan_cache;
@@ -62,6 +64,13 @@ impl JetsonPlatform {
 const M1_PENDING: &str = "platform-jetson device runtime lands in M1 \
     (GStreamer pipelines on the Orin; see launch.rs for the pinned strings)";
 
+/// Is the CPU encode *stage* part of this build? Element presence is
+/// checked in `encoder()`, so a missing `x264enc` fails with the package
+/// name instead of being hidden behind a generic "no encoder" error.
+fn cpu_encode_available() -> bool {
+    cfg!(feature = "gst")
+}
+
 impl Platform for JetsonPlatform {
     fn name(&self) -> &'static str {
         "jetson"
@@ -86,11 +95,10 @@ impl Platform for JetsonPlatform {
             precisions: vec![Precision::Fp32, Precision::Fp16],
             devices: vec!["gpu".into()],
             has_hw_encoder: self.engines.nvenc,
-            // The launch strings for the VIC + x264/x265 path exist,
-            // but no encoder stage does yet; do not advertise a
-            // capability the platform cannot supply. Flip this when
-            // the M1 encoder stage lands.
-            cpu_encode: false,
+            // The CPU stage exists now, but only when the image
+            // actually has x264's GStreamer element. A strict profile
+            // still refuses it in the builder.
+            cpu_encode: cpu_encode_available(),
         }
     }
 
@@ -147,13 +155,58 @@ impl Platform for JetsonPlatform {
         Ok(GpuStream::noop())
     }
 
-    fn encoder(&self, _cfg: &EncoderConfig) -> Result<Option<Box<dyn Encoder>>> {
-        // Honest even before the runtime exists: the option must
-        // match caps, and caps come from the probe.
-        if self.engines.nvenc {
-            Err(Error::Unsupported(M1_PENDING.into()))
-        } else {
-            Ok(None)
+    fn encoder(
+        &self,
+        cfg: &EncoderConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Box<dyn Encoder>>> {
+        if cfg.hardware {
+            // NVENC needs the NVMM capture branch and the NVENC stage;
+            // both are M1 device work. A Nano has no NVENC at all.
+            return if self.engines.nvenc {
+                Err(Error::Unsupported(M1_PENDING.into()))
+            } else {
+                Err(Error::Unsupported(
+                    "encoder.hardware = true but this Jetson has no NVENC \
+                     (Orin Nano?); use zero_copy = \"relaxed\" with \
+                     encoder.hardware = false and H.264 for the CPU path"
+                        .into(),
+                ))
+            };
+        }
+        // CPU path: the Nano's only video encoder. H.264 first:
+        // software H.265 cannot hold 1440x1080@30 on the Nano.
+        if cfg.codec != Codec::H264 {
+            return Err(Error::Unsupported(
+                "software H.265 is not supported (it cannot hold 1440x1080@30 \
+                 on the Nano); use codec = \"H264\" with encoder.hardware = false"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "gst")]
+        {
+            if !gst_encoder::software_h264_available() {
+                return Err(Error::Unsupported(
+                    "CPU H.264 encoder unavailable: GStreamer element `x264enc` \
+                     (or `h264parse`) is missing; install \
+                     gstreamer1.0-plugins-ugly-x264"
+                        .into(),
+                ));
+            }
+            Ok(Some(Box::new(gst_encoder::GstEncoder::new(
+                EncoderKind::Cpu,
+                cfg,
+                width,
+                height,
+            )?)))
+        }
+        #[cfg(not(feature = "gst"))]
+        {
+            let _ = (width, height);
+            Err(Error::Unsupported(
+                "CPU encoder needs the `gst` feature (platform-jetson/gst)".into(),
+            ))
         }
     }
 }
@@ -175,7 +228,12 @@ mod tests {
         let nano = JetsonPlatform::with_engines(MediaEngines::default());
         assert!(!nano.caps().has_hw_encoder);
         assert!(nano.caps().codecs.is_empty());
-        assert!(matches!(nano.encoder(&EncoderConfig::default()), Ok(None)));
+        // `EncoderConfig::default()` asks for hardware; a Nano has none.
+        let err = match nano.encoder(&EncoderConfig::default(), 1440, 1080) {
+            Ok(_) => panic!("hardware=true on a Nano must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no NVENC"), "{err}");
     }
 
     #[test]
@@ -184,10 +242,77 @@ mod tests {
             nvenc: true,
             nvjpg: false,
         });
-        let err = match p.encoder(&EncoderConfig::default()) {
+        let err = match p.encoder(&EncoderConfig::default(), 1440, 1080) {
             Ok(_) => panic!("runtime must not pretend to exist"),
             Err(e) => e.to_string(),
         };
         assert!(err.contains("M1"), "{err}");
+    }
+
+    #[cfg(feature = "gst")]
+    #[test]
+    fn nano_cpu_encoder_is_h264_only_and_matches_caps() {
+        let nano = JetsonPlatform::with_engines(MediaEngines::default());
+        assert!(
+            nano.caps().cpu_encode,
+            "caps must advertise the CPU stage compiled into this build"
+        );
+        let h264 = EncoderConfig {
+            enabled: true,
+            hardware: false,
+            codec: Codec::H264,
+            ..EncoderConfig::default()
+        };
+        if !gst_encoder::software_h264_available() {
+            let err = match nano.encoder(&h264, 1440, 1080) {
+                Ok(_) => panic!("missing x264enc must fail"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("gstreamer1.0-plugins-ugly-x264"),
+                "missing element must name the package: {err}"
+            );
+            return;
+        }
+        assert!(nano
+            .encoder(&h264, 1440, 1080)
+            .expect("CPU H.264 encoder")
+            .is_some());
+        let h265 = EncoderConfig {
+            codec: Codec::H265,
+            ..h264
+        };
+        let err = match nano.encoder(&h265, 1440, 1080) {
+            Ok(_) => panic!("software H.265 must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("H.265") && err.contains("H264"), "{err}");
+    }
+
+    /// Strict mode keeps refusing CPU encoding before the platform is
+    /// reached; the error names the mode.
+    #[test]
+    fn strict_zero_copy_refuses_cpu_encode_before_the_platform() {
+        let err = edge_core::Config::from_toml_str(
+            r#"
+platform = "jetson"
+zero_copy = "strict"
+[source]
+kind = "argus"
+width = 1440
+height = 1080
+fps = 30
+[model]
+input_width = 416
+input_height = 416
+[encoder]
+enabled = true
+hardware = false
+[stream]
+metadata_only = false
+"#,
+        )
+        .expect_err("strict + CPU encoder must be rejected");
+        assert!(err.to_string().contains("strict"), "{err}");
     }
 }

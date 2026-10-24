@@ -18,7 +18,7 @@ be new `platform-*` crates without changes to the pipeline core.
 | --- | --- | --- |
 | Traits, `HwFrame`, `Tensor`, plane descriptors, errors | Done | `crates/core` (`#![forbid(unsafe_code)]`); unit tests |
 | Config: typed, `deny_unknown_fields`, validated against `PlatformCaps` | Done | `crates/core/src/config.rs`; config and builder tests |
-| Runner: two threads, bounded drop-oldest queue, `FramePoll`, stop handle, idle limit, partial metrics on error | Done | `crates/pipeline`; integration and regression tests |
+| Runner: capture + processing (+ encoder) threads, bounded drop-oldest queues, `FramePoll`, stop handle, idle limit, partial metrics on error | Done | `crates/pipeline`; integration and regression tests |
 | Live metrics: counters, queue depth, p50/p95/p99 frame age, Prometheus text | Done | `crates/pipeline/src/metrics.rs`; unit + live-run tests |
 | Sim backend: synthetic/file source, pooled DMA-BUF-like buffers, real NV12 letterbox CPU pre-processor | Done | `crates/platform-sim`; unit + conformance tests |
 | ONNX Runtime engine (sim, `--features onnx`) | Done | `crates/platform-sim/src/onnx.rs`; fixture tests |
@@ -29,6 +29,8 @@ be new `platform-*` crates without changes to the pipeline core.
 | Jetson: GStreamer capture (`appsink`) | Partial | `platform-jetson --features gst`: dmabuf branch and a PC-only copy fallback; NVMM buffers are refused, never copied |
 | Jetson: Argus EOS is a fault, not a clean end | Done (PC-tested) | `gst_source.rs` returns `Err` for an `argus` source; once-per-boot recovery/exit 75 still M1 |
 | Jetson: NVMM/NvBufSurface access (`gst_buffer_map` → `NvBufSurface*`) | Not implemented | Needs `nvbuf-sys` and the L4T sysroot; see `docs/jetson-bringup.md` |
+| Jetson: CPU H.264 encode (Orin Nano) | Done (PC-tested) | `GstEncoder` (`appsrc → nvvidconv → x264enc → h264parse → appsink`), element check, Nano profile; device run still needs the NVMM branch and the VIC/TensorRT stages |
+| Jetson: encode on its own thread | Done (PC-tested) | runner `encode-cam` thread, leaky one-deep frame hand-off, dropped-frame counter |
 | Jetson: VIC/CUDA pre-process, TensorRT engine, overlay, NVENC encode, RTSP | Not implemented | Device bring-up; launch strings are the contract |
 | Device zero-copy proof (`copied_frames == 0`, Nsight, EMC) | Not verified | M1 exit gate on the flashed board |
 | Multi-camera orchestration | Not implemented | One process per camera is the default for Argus fault isolation |
@@ -83,15 +85,24 @@ Unpinned DVFS numbers measure the governor, not the code.
 
 ```
 source ──HwFrame──> [capture thread] ──bounded drop-oldest channel──>
-         [processing thread] pre → infer → post → overlay? → encode? → sink
+         [processing thread] pre → infer → post → overlay?
+              │ leaky one-deep frame channel
+              ▼
+         [encode thread] encoder.encode → packet channel ──► sink (processing thread)
 ```
 
-The runner uses two threads. The capture thread pulls from the
-`FrameSource` and never blocks on a slow consumer: when the bounded
+The runner uses three threads when video is enabled: capture, one
+processing thread, and one encoder thread. The capture thread pulls from
+the `FrameSource` and never blocks on a slow consumer: when the bounded
 queue is full the oldest `HwFrame` is evicted (returning its buffer to
-the pool) and counted. The processing thread runs the remaining stages
-in order. Per-stage threads are a latency/parallelism decision to be
-made from device measurements, not baked into the traits.
+the pool) and counted. The processing thread runs pre/infer/post/overlay
+and hands the frame to the encoder through a one-deep leaky channel; a
+slow x264/NVENC therefore drops video frames instead of stretching the
+inference loop. Encoded packets come back to the processing thread and
+go to the sink. `Encoder::finish` flushes delayed packets at end of
+stream, and the packet channel is drained before joining the encoder so
+teardown cannot deadlock. Without an encoder the pipeline runs two
+threads and streams metadata only.
 
 `Platform::engine` may return `EngineState::Warming` instead of a ready
 engine. The runner polls it once per frame; while the TensorRT plan is
@@ -156,8 +167,13 @@ products:
 
 - capture: `nvarguscamerasrc` → NV12 NVMM → `appsink` (tiny, drop
   policy in Rust);
-- encode: `appsrc` → `nvv4l2h264enc`/`nvv4l2h265enc` → byte-stream
+- encode (NX): `appsrc` → `nvv4l2h264enc`/`nvv4l2h265enc` → byte-stream
   `appsink`.
+- encode (Nano, `zero_copy = "relaxed"`, `hardware = false`):
+  `appsrc` → `nvvidconv` → I420 → `x264enc` → `h264parse` → byte-stream
+  `appsink`. One VIC copy is the measured Nano product path; H.265 is
+  refused in software. The encoder checks `x264enc` before building the
+  string and names `gstreamer1.0-plugins-ugly-x264` when it is missing.
 
 The hypothesis to prove first on the board is that pushing **the same
 `gst::Buffer`** received from capture into the encode `appsrc` makes
@@ -290,6 +306,10 @@ config.
   from a fixed-size ring (no per-frame allocation, bounded memory).
 - **Queue depth**: current and peak depth are read directly from the
   channel, so they stay visible while processing is stalled.
+- **Encoder thread**: video frames go through a one-deep leaky channel;
+  drops are counted separately (`edge_encode_dropped_total`) and a slow
+  encoder cannot stall inference. `Encoder::finish` drains delayed
+  packets.
 - **Prometheus**: `--prometheus` prints a text exposition at exit and a
   live summary every 5 s to stderr. There is no HTTP endpoint yet;
   the sink/HTTP layer owns that.
@@ -345,7 +365,12 @@ trait suite.
 - A committed end-to-end detector test (`crates/platform-sim` fixture →
   ONNX Runtime → YOLO decoder → NMS → sink) under
   `--features onnx`.
-- Feature-gated tests for `platform-jetson --features gst` and
+- Encoder-thread tests: a fake slow encoder proves encoding runs on
+  `encode-cam*`, packets reach the sink, drops are counted, `finish`
+  flushes, and an encoder error cannot deadlock teardown.
+- Feature-gated tests for `platform-jetson --features gst`:
+  CPU `x264enc` packet output, the missing-element package error,
+  Nano caps, relaxed acceptance and strict refusal; plus
   `platform-sim --features onnx`.
 - CI: fmt, clippy `-D warnings` (default, onnx, gst, app `jetson,onnx`),
   workspace tests, ONNX tests, GStreamer tests, feature powerset,
@@ -385,6 +410,9 @@ sinks, conformance, CI, live metrics, end-to-end fixture test.
    systemd watchdog, sandbox/camera-guard grants, bounded disk writer,
    port 8555.
 9. RTSP sink; then glass-to-network p95 replaces the in-process number.
+10. Nano CPU path: stream H.264 at 1440×1080@30 with inference running;
+    record process CPU, `edge_encode_dropped_total`, x264's pinned
+    `threads=3` and `tegrastats` alongside the run.
 
 **M2+:** INT8 calibration gate, DLA on NX, per-stage threads if
 measurements justify them, multi-camera, NXP/Ambarella ports.
