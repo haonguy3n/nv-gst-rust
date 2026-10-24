@@ -44,6 +44,7 @@ Orin Nano 8 GB (p3767-0003), LPR image, sensor 0, `gst-capture` example,
 | Exit | SIGINT exits 0; no "CameraProvider was not destroyed" |
 | Image | `h264parse` was missing; `gstreamer1.0-plugins-bad-videoparsersbad` installed from the feed (the camera-viber recipe now RDEPENDS on it) |
 | Zero copy up to the encoder | `GST_DEBUG=appsink:6,appsrc:6`, 6 s: 163 of 163 buffers queued into the encoder appsrc are the same `GstBuffer` objects the capture appsink handed out (same address, 0 from elsewhere); only 6 distinct buffers, recycled (the Argus pool); every one is 72 bytes, the `NvBufSurface` descriptor, so the pixels stay in NVMM. The only copy is `nvvidconv` (VIC, NVMM → I420) for x264, the Nano's `relaxed` opt-in |
+| TensorRT plan (T3 precursor) | `tools/build-engine.sh` with `trtexec --fp16` on the LPR app's plate/vehicle detector (`mmdet_07032024.onnx`, private model, stays on the camera): built in 284 s, 5.4 MB, FP16 layers with FP32 I/O; input 1×3×320×416, outputs o1 1×2730×4, o2 1×2730×4, o3 1×2730×5. `trtexec --loadEngine`: GPU compute 2.00 ms mean (p99 2.01 ms), 500 inferences/s, with edge-vision streaming. Needed on the camera: `tensorrt-trtexec-prebuilt` and `tensorrt-plugins-prebuilt` (trtexec loads `libnvinfer_plugin.so.10`), both installed from the feed |
 
 The `nvbuf-sys` struct mirror matches the r39.2 `nvbufsurface.h` (sizes
 72/416/232, field order, `NVBUF_LAYOUT_PITCH = 0`,
