@@ -1,0 +1,28 @@
+# Development unit for a camera that runs another app (the lpr image's MainApp): edge-vision as root
+# from /opt/edge-vision, never at boot (no [Install]; the boot-ok check stays with the image's app).
+# `systemctl start edge-vision` stops MainApp (Conflicts=), `systemctl start MainApp` stops edge-vision.
+# Logs: journalctl -u edge-vision -f (stdout/stderr; a [live] line every 5 s from --prometheus).
+# The product unit is edge-vision.service (non-root, sandboxed).
+[Unit]
+Description=edge-vision camera pipeline (development)
+After=nvargus-daemon.service
+Wants=nvargus-daemon.service
+Conflicts=MainApp.service camera-streamer.service
+# A second capture loss in one boot exits 1: stop after three quick failures instead of
+# hammering Argus.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/edge-vision
+ExecStart=/opt/edge-vision/edge-vision /opt/edge-vision/config.toml --prometheus
+# 75: the app restarted nvargus-daemon once (Argus recovery) and wants a fresh process.
+Restart=on-failure
+RestartForceExitStatus=75
+RestartSec=3
+TimeoutStopSec=20
+# The once-per-boot recovery marker must survive restarts of this unit.
+RuntimeDirectory=edge-vision
+RuntimeDirectoryPreserve=yes
+Environment=EDGE_VISION_RECOVERY_MARKER=/run/edge-vision/argus-recovered

@@ -15,15 +15,21 @@ use std::path::PathBuf;
 /// Prints detections for the first few frames, then just counts.
 struct StdoutSink {
     verbose_frames: u64,
+    /// One line for the first video packet, not 30 per second: under
+    /// systemd every stdout line lands in the journal.
+    video_logged: bool,
 }
 
 impl Sink for StdoutSink {
     fn push_video(&mut self, pkt: EncodedPacket) -> edge_core::Result<()> {
-        println!(
-            "video packet: {} bytes keyframe={}",
-            pkt.data.len(),
-            pkt.keyframe
-        );
+        if !self.video_logged {
+            self.video_logged = true;
+            println!(
+                "video: first packet {} bytes keyframe={}",
+                pkt.data.len(),
+                pkt.keyframe
+            );
+        }
         Ok(())
     }
 
@@ -159,7 +165,10 @@ fn main() -> Result<()> {
             Box::new(SimPostProcessor::new(config.model.score_threshold))
         }
     };
-    let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(StdoutSink { verbose_frames: 3 })];
+    let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(StdoutSink {
+        verbose_frames: 3,
+        video_logged: false,
+    })];
     if let Some(path) = &config.stream.meta_file {
         sinks.push(Box::new(edge_sinks::JsonlMetaSink::create(path)?));
     }
