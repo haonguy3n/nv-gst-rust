@@ -78,7 +78,10 @@ impl JetsonPlatform {
         let request = WarmupRequest {
             source: ModelSource::from_path(path)?,
             precision: cfg.precision,
-            cache_dir: cache_dir(std::env::var(CACHE_ENV).ok().as_deref()),
+            cache_dir: cache_dir(
+                std::env::var(CACHE_ENV).ok().as_deref(),
+                std::env::var("CACHE_DIRECTORY").ok().as_deref(),
+            ),
             soc: self
                 .module
                 .compatible

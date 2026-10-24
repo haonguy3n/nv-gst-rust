@@ -97,10 +97,17 @@ systemd unit needs `CacheDirectory=edge-vision`). `tools/build-engine.sh`
 is a bring-up tool for a development image only (256 MiB workspace,
 build lock, memory check, `EDGE_VISION_CACHE`; see the script's header).
 
-The recipe currently installs the binary and the two configs, not the
-model. `config/orin-nx-yolo.toml` expects
-`/data/models/yolox-tiny.onnx`; install the ONNX model there (or extend
-the recipe with a model package) before the profile can run.
+The recipe installs the binary, the configs (`/etc/edge-vision/`; `config.toml` is the service's, a copy of the Nano
+yolox profile with `model.path = /data/edge-vision/models/yolox-s.onnx`), the unit `edge-vision.service` (user
+`edge-vision`, group `video`, sandboxed, **not enabled at boot**: `systemctl start edge-vision` stops MainApp and
+camera-streamer) and a root helper for the Argus recovery. The image has no polkit, so the app asks
+`edge-vision-control.socket` (`/run/edge-vision-control.sock`, group `edge-vision`) to restart `nvargus-daemon`, as
+camera-streamer does; `tools/systemd/50-edge-vision-nvargus.rules` is for an image that has polkit. The ONNX model is not
+shipped: copy it to `/data/edge-vision/models/yolox-s.onnx`. Plans are cached in `$CACHE_DIRECTORY`
+(`CacheDirectory=edge-vision`, `/var/cache/edge-vision`).
+
+`PACKAGECONFIG:append = " devtools"` also builds `gst-capture`, `trt-golden` and the `platform-jetson` test executables
+into the package `nv-gst-rust-devtools` (`/opt/edge-vision/devtools/`, `<crate>-unit` and `<test>-it`).
 
 ## Status
 

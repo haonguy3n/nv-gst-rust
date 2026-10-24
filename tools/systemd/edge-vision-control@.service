@@ -1,0 +1,6 @@
+[Unit]
+Description=edge-vision's root helper, one request
+
+[Service]
+ExecStart=/usr/libexec/edge-vision-control
+StandardInput=socket

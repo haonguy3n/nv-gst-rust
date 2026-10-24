@@ -1,31 +1,60 @@
-# Proposal only: not installed by the Yocto recipe yet.
-#
-# N20/N21 context: the writer thread is inside edge-vision, so the
-# unit does not need a writable CWD. Conflicts= makes the single-sensor
-# ownership explicit instead of discovering it through a bare EOS.
+# The product unit: edge-vision as the non-root user edge-vision, sandboxed. Installed by the Yocto recipe, NOT enabled at
+# boot (SYSTEMD_AUTO_ENABLE = "disable"): the image's own app (MainApp / camera-streamer) owns the camera and the boot-ok
+# marker. `systemctl start edge-vision` stops those apps (Conflicts=), `systemctl start MainApp` stops this one.
+# Config: /etc/edge-vision/config.toml (a copy of config/orin-nano-yolox.toml). Model: put the ONNX at
+# /data/edge-vision/models/yolox-s.onnx; without it the pipeline streams and the plan build logs why it cannot start.
+# Logs: journalctl -u edge-vision -f (a [live] line every 5 s from --prometheus).
 [Unit]
 Description=edge-vision camera pipeline
-After=network-online.target nvargus-daemon.service
-Wants=nvargus-daemon.service
+After=network-online.target nvargus-daemon.service data.mount edge-vision-control.socket
+Wants=nvargus-daemon.service edge-vision-control.socket
 Conflicts=camera-streamer.service MainApp.service lpr-app.service
+# A second capture loss in one boot exits 1: stop after three quick failures instead of hammering Argus.
+StartLimitIntervalSec=120
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=edge-vision
-Group=video
-ExecStart=/usr/bin/edge-vision /etc/edge-vision/orin-nx-yolo.toml
+Group=edge-vision
+# video: /dev/nvhost-*, /dev/nvmap and the other GPU, VIC and capture nodes (the same grant camera-streamer has).
+SupplementaryGroups=video
+ExecStart=/usr/bin/edge-vision /etc/edge-vision/config.toml --prometheus
+# 75: the app queued the one nvargus-daemon restart (Argus recovery) and wants a fresh process.
 Restart=on-failure
 RestartForceExitStatus=75
-RestartSec=2
+RestartSec=3
+TimeoutStopSec=20
+# TensorRT plans (built in-process on first start, minutes): the app uses $CACHE_DIRECTORY.
 CacheDirectory=edge-vision
+# GStreamer's plugin registry; its default home (~/.cache) does not exist for this user.
+Environment=GST_REGISTRY=/var/cache/edge-vision/gst-registry.bin
+# The once-per-boot recovery marker must survive restarts of this unit.
 RuntimeDirectory=edge-vision
+RuntimeDirectoryPreserve=yes
+Environment=EDGE_VISION_RECOVERY_MARKER=/run/edge-vision/argus-recovered
 # The app does not call sd_notify; enable this only after that lands.
 #WatchdogSec=15
+
+# Sandbox. Ports 8555, 8556 and 8080 are above 1024: no capabilities. The image has no polkit, so the daemon restart
+# goes through the root helper socket (edge-vision-control.socket), which NoNewPrivileges does not affect.
 NoNewPrivileges=yes
+CapabilityBoundingSet=
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
-ReadWritePaths=/data /recordings
+# /tmp stays shared, not PrivateTmp: the Argus client reaches nvargus-daemon at /tmp/argus_socket (as camera-streamer).
+ReadWritePaths=/tmp
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Not PrivateDevices (GPU, VIC, capture nodes), not MemoryDenyWriteExecute (CUDA and GStreamer generate code).
 
 [Install]
 WantedBy=multi-user.target
