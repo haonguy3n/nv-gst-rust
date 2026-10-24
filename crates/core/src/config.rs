@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// One TOML file picks the platform, camera, model, encoder and outputs.
@@ -84,6 +85,11 @@ fn default_pool_size() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
+    /// Run inference. `false` skips pre-process, engine, decode and
+    /// overlay (video only, e.g. a viewing profile); it needs
+    /// `stream.metadata_only = false` and an enabled encoder.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// ONNX model on sim; `.engine` built on-device on Jetson.
     #[serde(default)]
     pub path: Option<PathBuf>,
@@ -273,6 +279,20 @@ pub struct StreamConfig {
     /// per frame). Useful for metadata-only profiles and debugging.
     #[serde(default)]
     pub meta_file: Option<PathBuf>,
+    /// Serve the encoded video as a raw Annex-B byte stream on this
+    /// TCP address (one viewer at a time), e.g. "0.0.0.0:8555" for
+    /// `ffplay -f h264 tcp://<cam>:8555`. Needs an enabled encoder.
+    #[serde(default)]
+    pub video_tcp: Option<SocketAddr>,
+    /// Serve a browser page (live video via WebSocket + WebCodecs,
+    /// detection boxes, counters) on this address, e.g.
+    /// "0.0.0.0:8080". Needs an enabled H.264 encoder.
+    #[serde(default)]
+    pub web_ui: Option<SocketAddr>,
+    /// Serve the encoded video over RTSP on this port (e.g. 8555).
+    /// Requires an enabled encoder and a build with `--features rtsp`.
+    #[serde(default)]
+    pub rtsp_port: Option<u16>,
 }
 
 impl Default for StreamConfig {
@@ -280,6 +300,9 @@ impl Default for StreamConfig {
         Self {
             metadata_only: true,
             meta_file: None,
+            video_tcp: None,
+            web_ui: None,
+            rtsp_port: None,
         }
     }
 }
@@ -324,6 +347,31 @@ impl Config {
         let cfg: Config = toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn validate_web_ui(&self) -> Result<()> {
+        let Some(addr) = self.stream.web_ui else {
+            return Ok(());
+        };
+        if !self.encoder.enabled || self.stream.metadata_only {
+            return Err(Error::invalid(
+                "stream.web_ui",
+                "needs an enabled encoder and metadata_only = false",
+            ));
+        }
+        if self.encoder.codec != Codec::H264 {
+            return Err(Error::invalid(
+                "stream.web_ui",
+                "carries H.264 to the browser; set encoder.codec = \"h264\"",
+            ));
+        }
+        if self.stream.video_tcp == Some(addr) {
+            return Err(Error::invalid(
+                "stream.web_ui",
+                "must differ from stream.video_tcp",
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -392,6 +440,59 @@ impl Config {
                 "stream.metadata_only",
                 "conflicts with encoder.enabled = true",
             ));
+        }
+        if !m.enabled && self.stream.metadata_only {
+            return Err(Error::invalid(
+                "model.enabled",
+                "false with stream.metadata_only = true leaves nothing to run; \
+                 enable the model or stream video",
+            ));
+        }
+        if self.stream.video_tcp.is_some() && !self.encoder.enabled {
+            return Err(Error::invalid(
+                "stream.video_tcp",
+                "needs encoder.enabled = true",
+            ));
+        }
+        if self.stream.video_tcp.is_some() {
+            if self.stream.metadata_only {
+                return Err(Error::invalid(
+                    "stream.video_tcp",
+                    "needs metadata_only = false",
+                ));
+            }
+            if self.encoder.codec != Codec::H264 {
+                return Err(Error::invalid(
+                    "stream.video_tcp",
+                    "carries raw Annex-B H.264; set encoder.codec = \"h264\"",
+                ));
+            }
+        }
+        self.validate_web_ui()?;
+        if let Some(port) = self.stream.rtsp_port {
+            if !self.encoder.enabled || self.stream.metadata_only {
+                return Err(Error::invalid(
+                    "stream.rtsp_port",
+                    "needs an enabled encoder and metadata_only = false",
+                ));
+            }
+            if port == 0 {
+                return Err(Error::invalid("stream.rtsp_port", "must be > 0"));
+            }
+            if let Some(addr) = self.stream.video_tcp {
+                if addr.port() == port {
+                    return Err(Error::invalid(
+                        "stream.rtsp_port",
+                        "must differ from stream.video_tcp",
+                    ));
+                }
+            }
+            if self.stream.web_ui.is_some_and(|a| a.port() == port) {
+                return Err(Error::invalid(
+                    "stream.web_ui",
+                    "must differ from stream.rtsp_port",
+                ));
+            }
         }
         if self.pipeline.queue_depth == 0 {
             return Err(Error::invalid("pipeline.queue_depth", "must be >= 1"));
@@ -511,8 +612,137 @@ input_height = 320
     }
 
     #[test]
+    fn disabled_model_needs_video() {
+        let off = VALID.replace("[model]", "[model]\nenabled = false");
+        let err = Config::from_toml_str(&off).unwrap_err().to_string();
+        assert!(err.contains("model.enabled"), "{err}");
+        let video = format!(
+            "{off}\n[encoder]\nenabled = true\nhardware = false\n\
+             [stream]\nmetadata_only = false\n"
+        )
+        .replace(
+            "platform = \"sim\"",
+            "platform = \"sim\"\nzero_copy = \"relaxed\"",
+        );
+        let cfg = Config::from_toml_str(&video).expect("video-only config");
+        assert!(!cfg.model.enabled);
+    }
+
+    #[test]
+    fn video_tcp_needs_an_encoder() {
+        let bad = format!("{VALID}\n[stream]\nvideo_tcp = \"127.0.0.1:8555\"\n");
+        let err = Config::from_toml_str(&bad).unwrap_err().to_string();
+        assert!(err.contains("video_tcp"), "{err}");
+    }
+
+    #[test]
     fn file_source_requires_path() {
         let bad = VALID.replace("kind = \"synthetic\"", "kind = \"file\"");
         assert!(Config::from_toml_str(&bad).is_err());
+    }
+}
+
+#[cfg(test)]
+mod rtsp_config_tests {
+    use super::*;
+
+    fn video_config() -> Config {
+        let mut cfg = Config::from_toml_str(
+            r#"
+platform = "sim"
+[source]
+kind = "synthetic"
+width = 640
+height = 480
+fps = 30
+[model]
+input_width = 320
+input_height = 320
+[encoder]
+enabled = true
+hardware = true
+[stream]
+metadata_only = false
+"#,
+        )
+        .expect("config");
+        cfg.stream.rtsp_port = Some(8555);
+        cfg
+    }
+
+    #[test]
+    fn rtsp_port_requires_video() {
+        let mut cfg = video_config();
+        cfg.stream.metadata_only = true;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn video_tcp_requires_video() {
+        let mut cfg = video_config();
+        cfg.stream.rtsp_port = None;
+        cfg.stream.video_tcp = Some("127.0.0.1:8556".parse().unwrap());
+        assert!(cfg.validate().is_ok());
+        cfg.stream.metadata_only = true;
+        // The general encoder/metadata_only rule fires first; either way
+        // a raw video sink with metadata-only streaming is refused.
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("metadata_only"), "{err}");
+    }
+
+    #[test]
+    fn video_tcp_refuses_h265() {
+        let mut cfg = video_config();
+        cfg.stream.rtsp_port = None;
+        cfg.stream.video_tcp = Some("127.0.0.1:8556".parse().unwrap());
+        cfg.encoder.codec = Codec::H265;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("video_tcp") && err.contains("H.264"), "{err}");
+    }
+
+    #[test]
+    fn web_ui_validation() {
+        let mut cfg = video_config();
+        cfg.stream.rtsp_port = None;
+        cfg.stream.web_ui = Some("127.0.0.1:8080".parse().unwrap());
+        assert!(cfg.validate().is_ok());
+
+        let mut same = cfg.clone();
+        same.stream.video_tcp = same.stream.web_ui;
+        let err = same.validate().unwrap_err().to_string();
+        assert!(err.contains("web_ui") && err.contains("video_tcp"), "{err}");
+
+        let mut same = cfg.clone();
+        same.stream.rtsp_port = Some(8080);
+        let err = same.validate().unwrap_err().to_string();
+        assert!(err.contains("web_ui") && err.contains("rtsp_port"), "{err}");
+
+        let mut h265 = cfg.clone();
+        h265.encoder.codec = Codec::H265;
+        let err = h265.validate().unwrap_err().to_string();
+        assert!(err.contains("web_ui") && err.contains("H.264"), "{err}");
+
+        let mut meta = cfg;
+        meta.stream.metadata_only = true;
+        let err = meta.validate().unwrap_err().to_string();
+        assert!(err.contains("metadata_only"), "{err}");
+    }
+
+    #[test]
+    fn web_ui_needs_an_enabled_encoder() {
+        let mut cfg = video_config();
+        cfg.stream.rtsp_port = None;
+        cfg.stream.web_ui = Some("127.0.0.1:8080".parse().unwrap());
+        cfg.encoder.enabled = false;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rtsp_port_must_be_nonzero() {
+        let mut cfg = video_config();
+        cfg.stream.rtsp_port = Some(0);
+        assert!(cfg.validate().is_err());
+        cfg.stream.rtsp_port = Some(8555);
+        assert!(cfg.validate().is_ok());
     }
 }

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 fn fixture_cfg() -> ModelConfig {
     ModelConfig {
+        enabled: true,
         path: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/relu.onnx")),
         decoder: Default::default(),
         input_color: Default::default(),

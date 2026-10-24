@@ -27,6 +27,7 @@ fn source_cfg() -> SourceConfig {
 
 fn model_cfg() -> ModelConfig {
     ModelConfig {
+        enabled: true,
         path: None,
         decoder: Default::default(),
         input_color: Default::default(),

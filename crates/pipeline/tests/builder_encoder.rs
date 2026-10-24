@@ -381,10 +381,10 @@ fn builder_refuses_an_engine_without_outputs() {
     }
 }
 
-/// N11/E6: with an explicit Argus pool, the builder refuses a live
-/// in-flight budget that would starve the sensor.
+/// N11/E6: with an explicit Argus pool, a live in-flight budget larger
+/// than the pool only warns; the build still succeeds.
 #[test]
-fn builder_refuses_an_in_flight_budget_larger_than_the_argus_pool() {
+fn builder_warns_but_builds_an_in_flight_budget_larger_than_the_argus_pool() {
     let platform = FakePlatform {
         hw: true,
         cpu: false,
@@ -395,9 +395,9 @@ fn builder_refuses_an_in_flight_budget_larger_than_the_argus_pool() {
     };
     let mut cfg = config("strict", true);
     cfg.pipeline.queue_depth = 4;
-    cfg.source.argus_pool = Some(7); // needs 10
-    match build(&platform, cfg) {
-        Ok(_) => panic!("too-small Argus pool must be refused"),
-        Err(e) => assert!(e.to_string().contains("in-flight"), "{e}"),
-    }
+    cfg.source.argus_pool = Some(10); // queue_depth 4 + 7 holders = 11 surfaces
+    assert!(
+        build(&platform, cfg).is_ok(),
+        "an oversized budget warns, not refuses"
+    );
 }

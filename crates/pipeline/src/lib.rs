@@ -16,8 +16,8 @@ pub use metrics::{LiveMetrics, PipelineMetrics};
 
 use edge_core::{
     Config, Detections, EncodedPacket, Encoder, EngineState, EngineWarmup, Error, FramePoll,
-    FrameSource, GpuStream, HwFrame, InferenceEngine, ModelConfig, Overlay, PixelFormat, Platform,
-    PostProcessor, PreConfig, Preprocessor, Result, Sink, TensorSpec,
+    FrameSource, GpuStream, HwFrame, InferenceEngine, Layout, ModelConfig, Overlay, PixelFormat,
+    Platform, PostProcessor, PreConfig, Preprocessor, Result, Sink, Tensor, TensorSpec,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,22 +42,46 @@ pub struct Pipeline {
     stream: GpuStream,
 }
 
-/// The engine stage: ready, or still warming (plan build). While
-/// warming, frames skip pre/infer/post and carry empty detections.
+/// The engine stage: ready, still warming (plan build), or disabled
+/// (`model.enabled = false`). While warming, frames skip
+/// pre/infer/post and carry empty detections; a disabled engine
+/// does the same forever and is never polled.
 enum EngineSlot {
     Ready(Box<dyn InferenceEngine>),
     Warming(Box<dyn EngineWarmup>),
+    Disabled,
+}
+
+/// Stands in for the preprocessor and overlay when inference is off;
+/// `process_one` never reaches them, so these are inert by design.
+struct NoopStage;
+
+impl Preprocessor for NoopStage {
+    fn run(&mut self, _frame: &HwFrame, _dst: &mut Tensor, _stream: &GpuStream) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Overlay for NoopStage {
+    fn draw(&mut self, _f: &HwFrame, _d: &Detections, _s: &GpuStream) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The encoder thread hands its encoder back on exit so the pipeline
 /// can run again.
 type EncoderJoin = std::thread::JoinHandle<(Box<dyn Encoder>, Result<()>)>;
 
-/// Worst-case Argus surfaces held on the M1 path (E6/N11): appsink 2,
-/// the Rust channel, one frame in processing, appsrc 2, one in the
-/// encoder, plus one for the CPU-encode VIC copy.
-fn in_flight_surfaces(queue_depth: usize, cpu_encode: bool) -> usize {
-    2 + queue_depth + 1 + 2 + 1 + usize::from(cpu_encode)
+/// Worst-case capture `GstBuffer`s alive at the same instant on the
+/// live NVENC path (the CPU path is no worse: nvvidconv copies to
+/// system memory). Holders: the capture appsink (max-buffers=1), the
+/// capture thread holding a pulled frame while `send` evicts, the
+/// Rust capture channel (`queue_depth`), the frame in processing, the
+/// one-deep leaky hand-off slot, the frame inside `GstEncoder::encode`
+/// (its ref lives until `encode` returns), the encoder appsrc queue
+/// (max-buffers=1) and the frame inside the hardware encoder.
+fn in_flight_surfaces(queue_depth: usize) -> usize {
+    1 + 1 + queue_depth + 1 + 1 + 1 + 1 + 1
 }
 
 /// The engine's bindings are a contract, not a suggestion. A
@@ -189,17 +213,12 @@ impl Pipeline {
 
         if config.source.kind == "argus" {
             if let Some(pool) = config.source.argus_pool {
-                let cpu_encode = config.encoder.enabled && !config.encoder.hardware;
-                let in_flight = in_flight_surfaces(config.pipeline.queue_depth, cpu_encode);
+                let in_flight = in_flight_surfaces(config.pipeline.queue_depth);
                 if in_flight >= pool {
-                    return Err(Error::invalid(
-                        "source.argus_pool",
-                        format!(
-                            "in-flight budget needs {in_flight} surfaces, but the Argus \
-                             pool has {pool}; lower pipeline.queue_depth or raise the \
-                             pool on the board"
-                        ),
-                    ));
+                    eprintln!(
+                        "warning: in-flight budget is {in_flight} surfaces (static worst case) \
+                         but the Argus pool has {pool}; watch capture timeouts"
+                    );
                 }
             }
         }
@@ -212,29 +231,8 @@ impl Pipeline {
             });
         }
 
-        let pre_cfg = PreConfig {
-            src_width: config.source.width,
-            src_height: config.source.height,
-            dst_width: config.model.input_width,
-            dst_height: config.model.input_height,
-            layout: source.layout(),
-            color: config.model.input_color,
-            colorspace: config.model.input_colorspace,
-            normalize: config.model.input_normalize,
-            pad_value: config.model.pad_value,
-        };
-        let preprocessor = platform.preprocessor(&pre_cfg)?;
-        // The engine may still be warming (plan build); its input
-        // spec is checked now when ready, or at the moment it
-        // becomes ready. Video flows either way.
-        let (engine, input_spec) = match platform.engine(&config.model)? {
-            EngineState::Ready(mut engine) => {
-                let spec = check_engine_bindings(&mut *engine, &config.model)?;
-                (EngineSlot::Ready(engine), Some(spec))
-            }
-            EngineState::Warming(warmup) => (EngineSlot::Warming(warmup), None),
-        };
-        let overlay = platform.overlay()?;
+        let (preprocessor, engine, input_spec, overlay) =
+            Self::build_inference_stages(platform, &config, source.layout())?;
 
         let encoder = if config.encoder.enabled {
             if config.encoder.hardware {
@@ -315,6 +313,54 @@ impl Pipeline {
         })
     }
 
+    /// The inference stages, or inert ones when `model.enabled = false`
+    /// (the platform's preprocessor, engine and overlay are not called).
+    #[allow(clippy::type_complexity)]
+    fn build_inference_stages(
+        platform: &dyn Platform,
+        config: &Config,
+        layout: Layout,
+    ) -> Result<(
+        Box<dyn Preprocessor>,
+        EngineSlot,
+        Option<edge_core::TensorSpec>,
+        Box<dyn Overlay>,
+    )> {
+        if !config.model.enabled {
+            eprintln!("inference: off (model.enabled = false)");
+            return Ok((
+                Box::new(NoopStage),
+                EngineSlot::Disabled,
+                None,
+                Box::new(NoopStage),
+            ));
+        }
+        let pre_cfg = PreConfig {
+            src_width: config.source.width,
+            src_height: config.source.height,
+            dst_width: config.model.input_width,
+            dst_height: config.model.input_height,
+            layout,
+            color: config.model.input_color,
+            colorspace: config.model.input_colorspace,
+            normalize: config.model.input_normalize,
+            pad_value: config.model.pad_value,
+        };
+        let preprocessor = platform.preprocessor(&pre_cfg)?;
+        // The engine may still be warming (plan build); its input
+        // spec is checked now when ready, or at the moment it
+        // becomes ready. Video flows either way.
+        let (engine, input_spec) = match platform.engine(&config.model)? {
+            EngineState::Ready(mut engine) => {
+                let spec = check_engine_bindings(&mut *engine, &config.model)?;
+                (EngineSlot::Ready(engine), Some(spec))
+            }
+            EngineState::Warming(warmup) => (EngineSlot::Warming(warmup), None),
+        };
+        let overlay = platform.overlay()?;
+        Ok((preprocessor, engine, input_spec, overlay))
+    }
+
     pub fn metadata_only(&self) -> bool {
         self.metadata_only
     }
@@ -351,6 +397,9 @@ impl Pipeline {
         let capture = planes.byte_len();
         let (dtype, input) = match &self.input_spec {
             Some(spec) => (format!("{:?}", spec.dtype), spec.byte_len()),
+            None if matches!(self.engine, EngineSlot::Disabled) => {
+                ("none (inference off)".to_string(), 0)
+            }
             None => (
                 "unknown (engine warming)".to_string(),
                 // Mapped-host bindings are F32 in the T5 design; this
@@ -367,8 +416,7 @@ impl Pipeline {
             ));
         }
         let live_budget = if s.kind == "argus" {
-            let cpu_encode = self.encoder.is_some() && !self.config.encoder.hardware;
-            let in_flight = in_flight_surfaces(self.config.pipeline.queue_depth, cpu_encode);
+            let in_flight = in_flight_surfaces(self.config.pipeline.queue_depth);
             format!(
                 "\n  live in-flight: {in_flight} surfaces (argus_pool: {})",
                 s.argus_pool
@@ -433,6 +481,7 @@ impl Pipeline {
         let mut packet_rx: Option<std::sync::mpsc::Receiver<EncodedPacket>> = None;
         let mut encoder_thread: Option<EncoderJoin> = None;
         let mut encode_push_ns: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+        let mut encoder_dropped_handle: Option<Arc<AtomicU64>> = None;
         let mut encoder_failed: Option<Arc<AtomicBool>> = None;
 
         if self.encoder.is_some() {
@@ -444,6 +493,8 @@ impl Pipeline {
             let packet_tx_thread = packet_tx.clone();
             let encode_push_ns_local = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let encode_push_ns_thread = Arc::clone(&encode_push_ns_local);
+            let encoder_dropped = Arc::new(AtomicU64::new(0));
+            let encoder_dropped_thread = Arc::clone(&encoder_dropped);
             let failed = Arc::new(AtomicBool::new(false));
             let failed_thread = Arc::clone(&failed);
             let handle = std::thread::Builder::new()
@@ -464,6 +515,8 @@ impl Pipeline {
                                 });
                                 encode_push_ns_thread
                                     .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                                encoder_dropped_thread
+                                    .store(encoder.dropped_frames(), Ordering::Relaxed);
                                 if let Err(e) = r {
                                     failed_thread.store(true, Ordering::Relaxed);
                                     result = Err(e);
@@ -481,6 +534,8 @@ impl Pipeline {
                                     result = Err(e);
                                     break;
                                 }
+                                encoder_dropped_thread
+                                    .store(encoder.dropped_frames(), Ordering::Relaxed);
                             }
                         }
                     }
@@ -515,6 +570,7 @@ impl Pipeline {
             packet_rx = Some(packet_rx_local);
             encoder_thread = Some(handle);
             encode_push_ns = Some(encode_push_ns_local);
+            encoder_dropped_handle = Some(encoder_dropped);
             encoder_failed = Some(failed);
         }
 
@@ -624,7 +680,10 @@ impl Pipeline {
                 break;
             }
             if let Some(dropped) = &video_dropped {
-                metrics.encode_dropped = dropped.load(Ordering::Relaxed);
+                metrics.encode_dropped = dropped.load(Ordering::Relaxed)
+                    + encoder_dropped_handle
+                        .as_ref()
+                        .map_or(0, |d| d.load(Ordering::Relaxed));
             }
             if let Some(ns) = &encode_push_ns {
                 metrics.encode_push_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
@@ -680,7 +739,10 @@ impl Pipeline {
             }
         }
         if let Some(dropped) = &video_dropped {
-            metrics.encode_dropped = dropped.load(Ordering::Relaxed);
+            metrics.encode_dropped = dropped.load(Ordering::Relaxed)
+                + encoder_dropped_handle
+                    .as_ref()
+                    .map_or(0, |d| d.load(Ordering::Relaxed));
         }
         if let Some(ns) = &encode_push_ns {
             metrics.encode_push_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
@@ -761,12 +823,14 @@ impl Pipeline {
             }
             // Still warming: video and metadata flow with empty
             // detections rather than waiting for the engine.
-            EngineSlot::Warming(_) => detections.clear(frame.meta()),
+            EngineSlot::Warming(_) | EngineSlot::Disabled => detections.clear(frame.meta()),
         }
 
-        let t = Instant::now();
-        self.overlay.draw(&frame, detections, &self.stream)?;
-        metrics.overlay_total += t.elapsed();
+        if !matches!(self.engine, EngineSlot::Disabled) {
+            let t = Instant::now();
+            self.overlay.draw(&frame, detections, &self.stream)?;
+            metrics.overlay_total += t.elapsed();
+        }
 
         match video_tx {
             Some(tx) => {

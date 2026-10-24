@@ -221,6 +221,12 @@ pub trait Encoder: Send {
         let _ = out;
         Ok(())
     }
+
+    /// Frames the encoder's own bounded queue dropped (for example a
+    /// leaky `appsrc`). The runner folds this into `encode_dropped`.
+    fn dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 /// RTSP, WebRTC, file, MQTT metadata.

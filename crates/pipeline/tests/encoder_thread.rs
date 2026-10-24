@@ -107,7 +107,11 @@ impl Platform for EncoderPlatform {
 }
 
 fn config(frames: u64) -> Config {
-    Config::from_toml_str(&format!(
+    Config::from_toml_str(&toml_source(frames)).expect("config")
+}
+
+fn toml_source(frames: u64) -> String {
+    format!(
         r#"
 platform = "sim"
 zero_copy = "relaxed"
@@ -131,8 +135,7 @@ metadata_only = false
 [pipeline]
 queue_depth = 4
 "#
-    ))
-    .expect("config")
+    )
 }
 
 fn run(
@@ -239,4 +242,70 @@ fn encoder_error_stops_an_unbounded_run() {
         started.elapsed() < Duration::from_secs(2),
         "encoder failure must not leave an unbounded run going"
     );
+}
+
+/// Inference-off platform: the three inference stages must never be
+/// asked for (the Jetson ones are "M1 pending" errors today).
+struct NoInferencePlatform(EncoderPlatform);
+
+impl Platform for NoInferencePlatform {
+    fn name(&self) -> &'static str {
+        "sim-no-inference"
+    }
+    fn caps(&self) -> PlatformCaps {
+        self.0.caps()
+    }
+    fn source(&self, cfg: &SourceConfig) -> Result<Box<dyn FrameSource>> {
+        self.0.source(cfg)
+    }
+    fn preprocessor(&self, _cfg: &PreConfig) -> Result<Box<dyn Preprocessor>> {
+        Err(Error::Platform("preprocessor must not be built".into()))
+    }
+    fn engine(&self, _cfg: &ModelConfig) -> Result<EngineState> {
+        Err(Error::Platform("engine must not be built".into()))
+    }
+    fn overlay(&self) -> Result<Box<dyn Overlay>> {
+        Err(Error::Platform("overlay must not be built".into()))
+    }
+    fn stream(&self, camera_id: u8) -> Result<GpuStream> {
+        self.0.stream(camera_id)
+    }
+    fn encoder(
+        &self,
+        cfg: &EncoderConfig,
+        width: u32,
+        height: u32,
+    ) -> Result<Option<Box<dyn Encoder>>> {
+        self.0.encoder(cfg, width, height)
+    }
+}
+
+#[test]
+fn inference_off_streams_video_with_empty_detections() {
+    let events = Arc::new(Mutex::new(EncoderEvents::default()));
+    let platform = NoInferencePlatform(EncoderPlatform {
+        slow: Duration::from_millis(1),
+        fail_after: None,
+        events: Arc::clone(&events),
+    });
+    let cfg =
+        Config::from_toml_str(&toml_source(30).replace("[model]", "[model]\nenabled = false"))
+            .expect("config");
+    let counts = Arc::new(Mutex::new(Counts::default()));
+    let mut pipeline = Pipeline::build(
+        &platform,
+        cfg,
+        Box::new(SimPostProcessor::new(0.25)),
+        Box::new(CountingSink::new(Arc::clone(&counts))),
+    )
+    .expect("an inference-off build calls no inference stage");
+    assert!(!pipeline.metadata_only());
+    let (metrics, result) = pipeline.run(None);
+    result.expect("run");
+    let counts = *counts.lock().unwrap();
+    assert!(metrics.frames_processed > 0, "{}", metrics.summary());
+    assert_eq!(counts.meta_frames, metrics.frames_processed);
+    assert_eq!(counts.detections, 0, "no inference, no detections");
+    assert!(counts.video_packets > 0, "video must still reach the sink");
+    assert_eq!(metrics.infer_total, Duration::ZERO);
 }
