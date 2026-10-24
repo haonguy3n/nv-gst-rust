@@ -7,8 +7,11 @@
 //! A second loss in the same boot is only logged, or a reboot loop
 //! follows.
 
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const DEFAULT_MARKER: &str = "/run/edge-vision/argus-recovered";
 
@@ -57,8 +60,40 @@ impl CaptureRecoveryPolicy {
     }
 }
 
-/// Best-effort `systemctl --no-block restart nvargus-daemon`.
+const DEFAULT_CONTROL_SOCKET: &str = "/run/edge-vision-control.sock";
+
+/// Ask for the nvargus-daemon restart. Under the product unit (non-root,
+/// no polkit on the image) the root helper behind
+/// `edge-vision-control.socket` does it; without that socket (a dev box,
+/// the root dev unit) the app runs `systemctl` itself.
 pub fn request_daemon_restart() -> std::io::Result<()> {
+    let socket = std::env::var_os("EDGE_VISION_CONTROL_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET));
+    if socket.exists() {
+        return restart_via_helper(&socket);
+    }
+    restart_via_systemctl()
+}
+
+/// One request per connection; the helper answers `ok` or why not.
+fn restart_via_helper(socket: &Path) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.write_all(b"restart-capture\n")?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply)?;
+    if reply.lines().last() == Some("ok") {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "control helper refused the restart: {}",
+            reply.trim()
+        )))
+    }
+}
+
+fn restart_via_systemctl() -> std::io::Result<()> {
     let status = Command::new("systemctl")
         .args(["--no-block", "restart", "nvargus-daemon"])
         .status()?;
@@ -102,5 +137,36 @@ mod tests {
         let policy = CaptureRecoveryPolicy::new(dir.join("marker"));
         assert_eq!(policy.on_capture_loss(), RecoveryAction::LogAndFail);
         let _ = std::fs::remove_file(&dir);
+    }
+
+    fn serve_once(name: &str, reply: &'static str) -> (PathBuf, std::thread::JoinHandle<String>) {
+        let sock = temp_marker(name);
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&conn), &mut line).unwrap();
+            conn.write_all(reply.as_bytes()).unwrap();
+            line
+        });
+        (sock, handle)
+    }
+
+    #[test]
+    fn helper_socket_gets_the_restart_request() {
+        let (sock, handle) = serve_once("helper-ok", "ok\n");
+        restart_via_helper(&sock).expect("ok reply");
+        assert_eq!(handle.join().unwrap(), "restart-capture\n");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn helper_refusal_is_an_error() {
+        let (sock, handle) = serve_once("helper-no", "unknown request\n");
+        let err = restart_via_helper(&sock).expect_err("refused");
+        assert!(err.to_string().contains("unknown request"), "{err}");
+        handle.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
     }
 }

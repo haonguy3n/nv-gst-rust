@@ -1,0 +1,12 @@
+[Unit]
+Description=edge-vision's root helper socket (nvargus-daemon restart)
+
+[Socket]
+ListenStream=/run/edge-vision-control.sock
+SocketGroup=edge-vision
+SocketMode=0660
+Accept=yes
+MaxConnections=2
+
+[Install]
+WantedBy=sockets.target

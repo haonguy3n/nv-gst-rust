@@ -44,12 +44,21 @@ impl ModelSource {
 }
 
 /// The plan cache directory: `EDGE_VISION_CACHE` when set and not empty,
-/// else the systemd `CacheDirectory`.
-pub fn cache_dir(env_value: Option<&str>) -> PathBuf {
-    match env_value {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(crate::plan_cache::DEFAULT_CACHE_DIR),
-    }
+/// else the first entry of systemd's `$CACHE_DIRECTORY` (set by
+/// `CacheDirectory=`; a colon-separated list), else the default.
+pub fn cache_dir(env_value: Option<&str>, systemd_value: Option<&str>) -> PathBuf {
+    let first = |v: Option<&str>| {
+        v.and_then(|s| s.split(':').next())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    first_non_empty(env_value)
+        .or_else(|| first(systemd_value))
+        .unwrap_or_else(|| PathBuf::from(crate::plan_cache::DEFAULT_CACHE_DIR))
+}
+
+fn first_non_empty(v: Option<&str>) -> Option<PathBuf> {
+    v.filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
 /// The builder settings the plan key must cover besides the precision.
@@ -219,9 +228,28 @@ mod tests {
 
     #[test]
     fn cache_dir_env_wins_when_not_empty() {
-        assert_eq!(cache_dir(Some("/x")), PathBuf::from("/x"));
-        assert_eq!(cache_dir(Some("")), PathBuf::from("/var/cache/edge-vision"));
-        assert_eq!(cache_dir(None), PathBuf::from("/var/cache/edge-vision"));
+        assert_eq!(cache_dir(Some("/x"), Some("/y")), PathBuf::from("/x"));
+        assert_eq!(
+            cache_dir(Some(""), None),
+            PathBuf::from("/var/cache/edge-vision")
+        );
+        assert_eq!(
+            cache_dir(None, None),
+            PathBuf::from("/var/cache/edge-vision")
+        );
+    }
+
+    #[test]
+    fn cache_dir_uses_systemd_cache_directory() {
+        assert_eq!(
+            cache_dir(None, Some("/c/edge-vision")),
+            PathBuf::from("/c/edge-vision")
+        );
+        assert_eq!(cache_dir(Some(""), Some("/a:/b")), PathBuf::from("/a"));
+        assert_eq!(
+            cache_dir(None, Some("")),
+            PathBuf::from("/var/cache/edge-vision")
+        );
     }
 
     #[test]
