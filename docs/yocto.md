@@ -102,6 +102,30 @@ model. `config/orin-nx-yolo.toml` expects
 `/data/models/yolox-tiny.onnx`; install the ONNX model there (or extend
 the recipe with a model package) before the profile can run.
 
+## SDK container (cross build without Yocto)
+
+`tools/Dockerfile.jetson-sdk` cross-builds `-p edge-vision --features trt`
+for aarch64 on a PC. It holds the compiler, Rust 1.98 and GStreamer tools,
+not NVIDIA's TensorRT, CUDA or L4T libraries (gated downloads). You give it
+the target files:
+
+- **A sysroot** mounted at `/sysroot`: an extracted L4T r39.2.1 rootfs with
+  TensorRT 10.16 and CUDA 13.2 added, or a copy of `/usr` and `/lib` from an
+  Orin.
+- **The Yocto SDK** (`bitbake camera-image -c populate_sdk`) mounted at
+  `/opt/yocto-sdk`: the entry point sources its `environment-setup-*`.
+
+```sh
+docker build -f tools/Dockerfile.jetson-sdk -t edge-vision-jetson-sdk .
+docker run --rm -v "$PWD:/work" -v /path/to/sysroot:/sysroot:ro edge-vision-jetson-sdk \
+    cargo build --release -p edge-vision --features trt --target aarch64-unknown-linux-gnu
+```
+
+Without a sysroot, `-e TRT_SYS_SKIP_SHIM=1` and `cargo check` type-check
+only; this is what CI runs, together with the `cargo hack` powerset (which
+reaches `trt-sys/shim` and would otherwise fail on missing `NvInfer.h`).
+Unverified: the image was not built, and no sysroot was tried with it.
+
 ## Status
 
 Built with `bitbake nv-gst-rust` for the Orin NX machine on 2026-10-24,

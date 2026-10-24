@@ -36,10 +36,22 @@ jobs:
       # Committed end-to-end detector test (ONNX fixture -> YOLO
       # decoder -> NMS -> sink), replacing the manual runs (P2-16).
       - run: cargo test -p edge-vision --features onnx
+      # The `trt` feature type-checks against the Rust side only; the C++
+      # shim needs the Jetson's TensorRT 10.16 / CUDA 13.2 headers, which a
+      # plain runner does not have (the real build is tools/Dockerfile.jetson-sdk).
+      - run: cargo check -p platform-jetson --features trt --all-targets
+        env:
+          TRT_SYS_SKIP_SHIM: "1"
+      - run: cargo clippy -p edge-vision --features trt -- -D warnings
+        env:
+          TRT_SYS_SKIP_SHIM: "1"
       # Every feature combination must at least type-check
       # (round 1's U-1 build break was a feature-gated path).
+      # The powerset includes trt-sys/shim, so it needs the same skip.
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --feature-powerset --workspace
+        env:
+          TRT_SYS_SKIP_SHIM: "1"
 
   msrv:
     runs-on: ubuntu-latest
