@@ -26,8 +26,11 @@ model hash, power mode, cooling, ambient, checks run/pending.
 
 ## Measured on the board
 
-Orin Nano 8 GB (p3767-0003), LPR image, sensor 0, `gst-capture` example,
-2026-10-24. These are reference values for the open work below.
+Orin Nano 8 GB (p3767-0003), LPR image, L4T r39.2.1, sensor 0, 2026-10-24.
+Capture rows use the `gst-capture` example; inference rows use `edge-vision`
+with `config/orin-nano-yolox.toml` (YOLOX-S 640×640 FP16, TensorRT 10.16.2,
+Apache-2.0 model from camera-viber's yolox-s package). These are reference
+values for the open work below.
 
 | Item         | Value                                                                                                                                                                                                                                                       |
 | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -44,21 +47,34 @@ Orin Nano 8 GB (p3767-0003), LPR image, sensor 0, `gst-capture` example,
 | Exit | SIGINT exits 0; no "CameraProvider was not destroyed" |
 | Image | `h264parse` was missing; `gstreamer1.0-plugins-bad-videoparsersbad` installed from the feed (the camera-viber recipe now RDEPENDS on it) |
 | Zero copy up to the encoder | `GST_DEBUG=appsink:6,appsrc:6`, 6 s: 163 of 163 buffers queued into the encoder appsrc are the same `GstBuffer` objects the capture appsink handed out (same address, 0 from elsewhere); only 6 distinct buffers, recycled (the Argus pool); every one is 72 bytes, the `NvBufSurface` descriptor, so the pixels stay in NVMM. The only copy is `nvvidconv` (VIC, NVMM → I420) for x264, the Nano's `relaxed` opt-in |
-| TensorRT plan (T3 precursor) | `tools/build-engine.sh` with `trtexec --fp16` on the LPR app's plate/vehicle detector (`mmdet_07032024.onnx`, private model, stays on the camera): built in 284 s, 5.4 MB, FP16 layers with FP32 I/O; input 1×3×320×416, outputs o1 1×2730×4, o2 1×2730×4, o3 1×2730×5. `trtexec --loadEngine`: GPU compute 2.00 ms mean (p99 2.01 ms), 500 inferences/s, with edge-vision streaming. Needed on the camera: `tensorrt-trtexec-prebuilt` and `tensorrt-plugins-prebuilt` (trtexec loads `libnvinfer_plugin.so.10`), both installed from the feed |
+| TensorRT plan (trtexec precursor) | `tools/build-engine.sh` with `trtexec --fp16` on the LPR app's plate/vehicle detector (`mmdet_07032024.onnx`, private model, stays on the camera): built in 284 s, 5.4 MB, FP16 layers with FP32 I/O; input 1×3×320×416, outputs o1 1×2730×4, o2 1×2730×4, o3 1×2730×5. `trtexec --loadEngine`: GPU compute 2.00 ms mean (p99 2.01 ms), 500 inferences/s, with edge-vision streaming. Needed on the camera: `tensorrt-trtexec-prebuilt` and `tensorrt-plugins-prebuilt` (trtexec loads `libnvinfer_plugin.so.10`), both installed from the feed |
+| Engine build (first start) | the `engine-warm` thread built the plan in-process in 398 s (21 MB, cached in `/var/cache/edge-vision/<model-hash>/`) while video streamed: 30 fps, 0 drops, 0 timeouts |
+| Engine reload (restart) | plan reloaded from the cache in 0.9 s |
+| CUDA graph | captured after the first inference; each inference launches one graph |
+| Steady state, inference on | 30 fps, every frame inferred, 0 drops, 0 capture timeouts |
+| Per-frame time | mean pre 2.7 ms (VIC letterbox + CPU planar write), infer 7.0 ms (TensorRT FP16 via CUDA graph, incl. sync), post 2.0 ms (YOLOX decode + NMS) |
+| Latency | capture → detections 11.6 ms p50, 11.7 ms p99 |
+| CPU, inference on | about 19 % busy in total; x264 dominates |
+| Detections on video | drawn on a decoded frame, they land on the right objects: a round fan → "clock" 0.37, the carton → "book" 0.35 |
+| Zero copy, inference on | 219 of 219 buffers queued into the encoder appsrc are the capture appsink's own `GstBuffer`s, 6 distinct (the Argus pool); the VIC preprocessor reads the `NvBufSurface` with no CPU copy |
+| Encoder PTS | `x264enc` shifts output PTS by 1000 h; `GstEncoder` maps it back to the capture clock; a constant ~3.5 ms residual remains between detection pts and video pts (inside the web UI's 150 ms matching window) |
 
 The `nvbuf-sys` struct mirror matches the r39.2 `nvbufsurface.h` (sizes
 72/416/232, field order, `NVBUF_LAYOUT_PITCH = 0`,
 `NVBUF_LAYOUT_BLOCK_LINEAR = 1`), checked by compiling the header.
 
-Not run on the board yet: inference (the Jetson preprocessor, engine and
-overlay still return "M1 pending"), RTSP, and anything on the Orin NX.
+Run on the board: inference on the Nano through `edge-vision` (the rows above).
+RTSP also ran on the board: `rtsp://<cam>:8556/stream` played over RTSP/TCP in VLC and
+ffmpeg (30 fps, 1440×1080), with and without inference.
+Not run on the board yet: anything on the Orin NX (NVENC, X1) and the two-camera
+setup (X4).
 
 ## M1 path
 
 ```
 nvarguscamerasrc → NV12 NVMM → appsink
       → HwFrame (same gst::Buffer / NvBufSurface)
-      → [pre → infer → post] (T3–T9: not written)
+      → [pre → infer → post] (T9 CUDA preprocessor: not written)
       → encode thread (leaky one-deep hand-off)
       → NX:  appsrc → nvv4l2h26xenc → byte-stream appsink
       → Nano: appsrc → nvvidconv → I420 → x264enc → h264parse → appsink
@@ -158,7 +174,8 @@ will not let it run one. The product path is D5: build the plan
 in-process through `trt-sys` and cache it under
 `/var/cache/edge-vision` (systemd `CacheDirectory=edge-vision`).
 `tools/build-engine.sh` is a development-image bring-up tool only. The
-image must install the model at `/data/models/yolox-tiny.onnx`.
+image must install the model at `model.path` (the Nano profile uses
+`/opt/edge-vision/models/yolox-s.onnx`, camera-viber's yolox-s package).
 
 ### Encoder details
 
@@ -233,21 +250,17 @@ needs nvcc; without `trt`, the crate builds on any PC.
 
 | Task    | What                                                                                                                                                      | Done when                                                                           |
 | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| **T0**  | Build against the Yocto SDK sysroot (`$SDKTARGETSYSROOT`/`JETSON_SYSROOT`); `bindgen --sysroot`; cxx/nvcc cross; `tools/Dockerfile.jetson-sdk`, Rust 1.98 | cross build of `--features trt` in the SDK container; clear error without a sysroot |
-| **T1**  | `nvbuf-sys`: bindings and link lines for `NvBufSurfTransform` and EGL mapping                                                                             | waits for T0; needed by T8/T9                                                       |
-| **T3**  | `trt-sys` skeleton: logger, version, load, io_infos, context, enqueue, synchronize; exceptions → `Result`                                                 | device: load a `trtexec` FP16 plan and enqueue once                                 |
-| **T4**  | CUDA buffers: `host_alloc`/`bind`; `MappedTensor`; `CudaStream`                                                                                           | unit test with a fake allocator; device allocation                                  |
-| **T5**  | `TrtEngine`: bind every I/O tensor to mapped memory, batch 1, `infer` = enqueue + synchronize; outputs with real specs                                    | device: FP32 within 1e-3 / FP16 within 1e-2 of ONNX Runtime, identical boxes        |
-| **T6**  | Shim `build_plan` (builder + `nvonnxparser`, FP16, progress) on top of the existing plan cache                                                            | waits for T3/T5. INT8 stays out of caps until calibration is in the key             |
-| **T7**  | Engine-warm thread under a process-wide lock; `engine()` returns Warming until the plan exists                                                            | waits for T5/T6                                                                     |
-| **T8**  | VIC preprocessor: pooled pitch-linear RGBA surfaces, `NvBufSurfTransform` letterbox, CPU planar write                                                     | waits for T1/T4                                                                     |
-| **T9**  | CUDA preprocessor: `NvBufSurfaceMapEglImage`, `cuGraphicsEGLRegisterImage`, kernel into the input binding                                                 | output equals T8 within 1e-6                                                        |
-| **T10** | CUDA graph after the first good inference; GPU time from events; fall back to `enqueueV3` once on capture failure                                         | waits for T5                                                                        |
-| **T11** | Conformance on the board + Nsight/`tegrastats` zero-copy gate                                                                                             | waits for T5–T8; M1 inference exit gate                                             |
-| **T12** | Install the systemd units (`tools/systemd/`), `CacheDirectory`, video group, camera-guard grants on the image                                             | image-owner work; the recipe builds the binary only                                 |
+| **T0**  | Standalone SDK container (`tools/Dockerfile.jetson-sdk`, Rust 1.98) and a CI compile-only check of `--features trt`; the camera-viber recipe already cross-builds it | compile-only `--features trt` passes in CI |
+| **T4 test** | Unit test of `MappedTensor` with a fake allocator (not written)                                                                                       | `cargo test` on the PC                                                              |
+| **Device tests** | `#[ignore]` checks for T3–T10 on the Orin (not written)                                                                                           | `cargo test -p platform-jetson --features trt -- --ignored` passes on the Orin      |
+| **T9**  | CUDA preprocessor (optional optimisation): `NvBufSurfaceMapEglImage`, `cuGraphicsEGLRegisterImage`, kernel into the input binding; pre is 2.7 ms on the VIC path | output equals T8 within 1e-6                                                        |
+| **T10** | GPU time from CUDA events (not implemented)                                                                                                               | GPU time reported from events on the board                                          |
+| **T11** | Conformance on the board + Nsight/`tegrastats` zero-copy gate; FP16 vs ONNX Runtime numeric check (within 1e-2) not done; golden-set mAP not done        | M1 inference exit gate                                                              |
+| **T12** | Install the systemd units and grants on the image (`tools/systemd/`): edge-vision runs from `/opt/edge-vision` via `tools/systemd/edge-vision-dev.service` as root; `CacheDirectory`, video group, camera-guard grants | image-owner work; the recipe builds the binary only                                 |
 
-**Order:** T0 first, then T3→T4→T5 and T1→T8 in parallel. T6/T7 follow
-T5; T9/T10 are optimisations.
+**Order:** T11 is the M1 inference exit gate, with the device `#[ignore]`
+tests. T9 and T10's timing are optimisations. T0 and T12 belong to the
+image and SDK owners.
 
 ### Reference: gst-nvmm-cpp
 
@@ -350,10 +363,11 @@ it again afterwards; never restart `nvargus-daemon` by hand.
 | ---------------- | -------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | E1b              | device   | `gst_encoder.rs` | Drop counting was dead until `dropped_frames` was overridden (the leaky `appsrc` dropped 0 frames at 30 fps on the Nano) | Verify `edge_encode_dropped_total` counts under load (slow encoder, NX) |
 | N9b              | major    | `apps/edge-vision/src/recovery.rs`, `tools/systemd/edge-vision.service` | The unit runs as `User=edge-vision`, but recovery calls `systemctl restart nvargus-daemon`, which a non-root user cannot do                                                                                                                                                                                                          | Proposal polkit rule added at `tools/systemd/50-edge-vision-nvargus.rules`; install and verify recovery on the board (root helper is the fallback)                              |
-| N11              | major    | capture/encoder budget                                                  | ≈9 buffers held on the M1 path against a measured pool of 6 (table above)                                                                                                                                                                                                                                                            | Static worst case is queue_depth + 7 = 8 surfaces at queue_depth 1 against a measured pool of 6; the build warns instead of refusing (60 s on the Nano: 0 capture timeouts) | Cut holders: evict before push in the capture channel, drop the frame ref in `encode` right after `push_buffer`, or a direct encode instead of the hand-off slot 
+| N11              | major    | capture/encoder budget                                                  | ≈9 buffers held on the M1 path against a measured pool of 6 (table above)                                                                                                                                                                                                                                                            | Static worst case is queue_depth + 6 = 7 surfaces at queue_depth 1 (was + 7 until `encode` dropped its frame ref before the push) against a measured pool of 6; the build warns instead of refusing (60 s on the Nano: 0 capture timeouts) | The capture channel already evicts before it inserts (no gain left there; the pulled frame coexists with a full queue, only an eviction before the pull would change that). Cut holders: done: `GstEncoder::encode` drops the `HwFrame` before `push_buffer` (-1); next: a direct encode instead of the hand-off slot 
 | NB1              | minor    | `nvbuf-sys` `surface_from_bytes`                                        | Reads batch 0 without checking `num_filled >= 1`                                                                                                                                                                                                                                                                                     | Fixed: `num_filled == 0` is rejected                                                                                                          |
 | X1               | device   | NX encoder                                                              | Same-`gst::Buffer` NVENC (see above)                                                                                                                                                                                                                                                                                                 | First NX session                                                                                                                             |
-| RTSP             | device   | `crates/sinks`                                                          | No RTSP sink: video cannot leave the device                                                                                                                                                                                                                                                                                          | PC sink added (`edge-sinks --features rtsp`, `stream.rtsp_port`); verify playback/port 8555 on the board |
+| RTSP             | device   | `crates/sinks`                                                          | No RTSP sink: video cannot leave the device                                                                                                                                                                                                                                                                                          | PC sink added (`edge-sinks --features rtsp`, `stream.rtsp_port`); a real `rtspsrc` client test passes on the PC; verify playback/port 8555 on the board |
 | X4               | blocked  | two cameras                                                             | cam1 stops after 13–15 s under Argus (hardware/driver, cause open)                                                                                                                                                                                                                                                                   | —                                                                                                                                            |
-| Nano measurement | device   | Nano                                                                    | `tegrastats`, process CPU, `edge_encode_dropped_total` and x264 `threads=3` with the H.264 stream                                                                                                                                                                                                                                    | Once inference runs on the board                                                                                                             |
+| Nano measurement | device   | Nano                                                                    | `tegrastats`, process CPU, `edge_encode_dropped_total` and x264 `threads=3` with the H.264 stream                                                                                                                                                                                                                                    | Inference runs on the board now (total CPU ≈19 %, 0 drops measured); take `tegrastats` and per-process CPU with inference on          |
+| P1               | minor    | `gst_encoder.rs` (x264 PTS)                                             | Constant ~3.5 ms residual between detection pts and video pts after the 1000 h shift is mapped back (inside the web UI's 150 ms matching window)                                                                                                                                                                                    | Find the residual's source (x264 latency or the clock mapping); no action while it stays inside 150 ms |
 | E8               | minor    | `launch.rs`                                                             | The CPU H.265 launch string is an unreachable future hook                                                                                                                                                                                                                                                                            | Keep documented or remove                                                                                                                    |
