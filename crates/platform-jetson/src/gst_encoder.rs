@@ -90,6 +90,26 @@ pub struct GstEncoder {
     appsink: Option<gst_app::AppSink>,
     logged_first_buffer: bool,
     appsrc_dropped: u64,
+    /// PTS (ns) of the first buffer pushed into the appsrc.
+    first_in_pts: Option<u64>,
+    /// The encoder's constant timestamp shift, learned from the first packet.
+    pts_shift: Option<u64>,
+}
+
+/// Whole-second shift the encoder added to the timestamps: the first output
+/// PTS minus the first input PTS, rounded to the nearest second.
+///
+/// `GstVideoEncoder` (x264enc calls `set_min_pts(1000 h)`) moves every output
+/// PTS/DTS up by a constant so DTS stays positive; a measured Nano run saw
+/// 3 600 000 s exactly. The shift is a whole number of seconds, anything
+/// below that is pipeline latency or a leaked first frame, so rounding keeps
+/// the mapping right even when the leaky appsrc dropped the first frames.
+/// Encoders that do not shift (NVENC) give 0. The result is the same clock as
+/// `FrameMeta.pts` and the detections.
+pub fn encoder_pts_shift(first_in_ns: u64, first_out_ns: u64) -> u64 {
+    const SEC: u64 = 1_000_000_000;
+    let diff = first_out_ns.saturating_sub(first_in_ns);
+    (diff + SEC / 2) / SEC * SEC
 }
 
 impl GstEncoder {
@@ -107,6 +127,8 @@ impl GstEncoder {
             appsink: None,
             logged_first_buffer: false,
             appsrc_dropped: 0,
+            first_in_pts: None,
+            pts_shift: None,
         })
     }
 
@@ -133,6 +155,8 @@ impl GstEncoder {
             appsink: None,
             logged_first_buffer: false,
             appsrc_dropped: 0,
+            first_in_pts: None,
+            pts_shift: None,
         })
     }
 
@@ -205,9 +229,13 @@ impl GstEncoder {
             .map_err(|e| Error::Platform(format!("mapping encoded buffer: {e}")))?;
         let data: Arc<[u8]> = Arc::from(map.as_slice());
         let keyframe = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
-        let pts = buffer
-            .pts()
-            .map_or(Duration::ZERO, |t| Duration::from_nanos(t.nseconds()));
+        let raw = buffer.pts().map_or(0, |t| t.nseconds());
+        if self.pts_shift.is_none() {
+            let shift = self.first_in_pts.map_or(0, |i| encoder_pts_shift(i, raw));
+            log::info!("encoder: output timestamps are shifted by {shift} ns; mapped back");
+            self.pts_shift = Some(shift);
+        }
+        let pts = Duration::from_nanos(raw.saturating_sub(self.pts_shift.unwrap_or(0)));
         out(EncodedPacket::new(pts, keyframe, data));
         Ok(())
     }
@@ -299,6 +327,9 @@ impl Encoder for GstEncoder {
                 buffer.is_writable()
             );
         }
+        // The appsrc holds its own ref from here on: release the frame's
+        // now, so the encoder path pins one capture surface less (N11).
+        drop(frame);
         let appsrc = self
             .appsrc
             .as_ref()
@@ -309,6 +340,9 @@ impl Encoder for GstEncoder {
         // sufficient non-empty proxy here.
         if appsrc.current_level_bytes() > 0 {
             self.appsrc_dropped += 1;
+        }
+        if self.first_in_pts.is_none() {
+            self.first_in_pts = buffer.pts().map(|t| t.nseconds());
         }
         appsrc
             .push_buffer(buffer)
@@ -350,6 +384,8 @@ impl Encoder for GstEncoder {
         }
         self.appsrc = None;
         self.appsink = None;
+        self.first_in_pts = None;
+        self.pts_shift = None;
         Ok(())
     }
 }
@@ -359,5 +395,22 @@ impl Drop for GstEncoder {
         if let Some(pipeline) = &self.pipeline {
             let _ = pipeline.set_state(gst::State::Null);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encoder_pts_shift;
+
+    #[test]
+    fn shift_rounds_to_whole_seconds() {
+        let thousand_hours = 3_600_000_000_000_000u64;
+        let first_in = 454_552_445_000u64;
+        assert_eq!(
+            encoder_pts_shift(first_in, first_in + thousand_hours + 40_000_000),
+            thousand_hours
+        );
+        assert_eq!(encoder_pts_shift(first_in, first_in + 66_000_000), 0);
+        assert_eq!(encoder_pts_shift(5, 3), 0);
     }
 }

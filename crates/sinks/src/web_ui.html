@@ -31,10 +31,13 @@ const vctx = video.getContext("2d");
 const octx = over.getContext("2d");
 const msgEl = document.getElementById("msg");
 const statsEl = document.getElementById("stats");
-let decoder = null, decoderCodec = "", needKey = true;
+let decoder = null, decoderCodec = "", needKey = true, skipped = false;
 let dets = [], shownFrames = 0, shownAt = performance.now(), fps = 0, lastItems = [];
 
+let msgShown = false; // a recoverable message is up; the next decoded frame clears it
+
 function say(text) {
+  msgShown = !!text;
   msgEl.style.display = text ? "block" : "none";
   msgEl.textContent = text || "";
 }
@@ -77,6 +80,15 @@ function drawBoxes(items) {
 }
 
 function onFrame(frame) {
+  try {
+    drawFrame(frame);
+  } finally {
+    frame.close();
+  }
+  if (msgShown) say("");
+}
+
+function drawFrame(frame) {
   if (video.width !== frame.displayWidth || video.height !== frame.displayHeight) {
     video.width = over.width = frame.displayWidth;
     video.height = over.height = frame.displayHeight;
@@ -85,7 +97,6 @@ function onFrame(frame) {
   const items = nearestDets(frame.timestamp);
   lastItems = items || [];
   drawBoxes(lastItems);
-  frame.close();
   shownFrames++;
   const now = performance.now();
   if (now - shownAt >= 1000) {
@@ -119,11 +130,18 @@ function onVideo(buf) {
   if (!window.VideoDecoder) return;
   if (key) {
     const codec = codecFromSps(data);
-    if (!codec || !ensureDecoder(codec)) return;
+    if (!codec) { say("Keyframe without an SPS: cannot configure the decoder."); needKey = true; return; }
+    if (!ensureDecoder(codec)) return;
+    // After skipped deltas the decoder holds a broken reference chain: start it afresh.
+    if (skipped) {
+      skipped = false;
+      try { decoder.reset(); decoder.configure({ codec: codec, optimizeForLatency: true }); }
+      catch (e) { say("Cannot reset the decoder: " + e.message); decoderCodec = ""; return; }
+    }
     needKey = false;
   }
   if (needKey || !decoder || decoder.state !== "configured") return;
-  if (decoder.decodeQueueSize > 10 && !key) return; // behind: skip until the next keyframe
+  if (decoder.decodeQueueSize > 10 && !key) { needKey = skipped = true; return; } // behind: wait for the next keyframe
   decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: pts, data: data }));
 }
 

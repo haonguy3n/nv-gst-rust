@@ -222,3 +222,40 @@ fn slow_downstream_makes_the_appsrc_drop_not_queue() {
         encoder.dropped_frames()
     );
 }
+
+/// Output packets carry the capture frame's PTS, not the encoder's shifted one
+/// (x264enc moves timestamps up by 1000 h). The first frames start at a
+/// non-zero PTS like a live capture does.
+#[test]
+fn packet_pts_equal_the_pushed_frames_pts() {
+    if !software_h264_available() {
+        eprintln!("skipping: x264enc is not installed here");
+        return;
+    }
+    let cfg = EncoderConfig {
+        enabled: true,
+        codec: Codec::H264,
+        hardware: false,
+        bitrate_kbps: 500,
+        gop_frames: 5,
+    };
+    let mut encoder = GstEncoder::new_with_launch(EncoderKind::Cpu, &cfg, W, H, test_launch())
+        .expect("build CPU encoder");
+    let base = 12_000;
+    let mut packets: Vec<EncodedPacket> = Vec::new();
+    for seq in base..base + 10 {
+        encoder
+            .encode(frame(seq), &mut |pkt| packets.push(pkt))
+            .expect("encode frame");
+        // The appsrc is leaky (one buffer): pace the pushes so none is evicted.
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    encoder
+        .finish(&mut |pkt| packets.push(pkt))
+        .expect("flush encoder");
+    let expected: Vec<Duration> = (base..base + 10)
+        .map(|s| Duration::from_nanos(s * 33_000_000))
+        .collect();
+    let got: Vec<Duration> = packets.iter().map(|p| p.pts).collect();
+    assert_eq!(got, expected, "packet pts must equal the frames' pts");
+}

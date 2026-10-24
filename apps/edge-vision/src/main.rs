@@ -62,11 +62,12 @@ fn stats_json(m: &edge_pipeline::PipelineMetrics, drops: &edge_sinks::AsyncDrops
         m.encode_push_total.as_secs_f64() * 1000.0 / m.frames_processed as f64
     };
     format!(
-        "{{\"type\":\"stats\",\"captured\":{},\"processed\":{},\"dropped\":{},\
+        "{{\"type\":\"stats\",\"captured\":{},\"processed\":{},\"inferred\":{},\"dropped\":{},\
          \"enc_dropped\":{},\"timeouts\":{},\"detections\":{},\"p50_ms\":{},\"p95_ms\":{},\
          \"p99_ms\":{},\"encode_push_ms\":{:.2},\"sink_drop_video\":{},\"sink_drop_meta\":{}}}",
         m.frames_captured,
         m.frames_processed,
+        m.frames_inferred,
         m.frames_dropped,
         m.encode_dropped,
         m.capture_timeouts,

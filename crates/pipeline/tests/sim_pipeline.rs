@@ -68,6 +68,7 @@ fn sim_pipeline_processes_every_frame_in_order() {
         metrics.summary()
     );
     assert!(metrics.frames_processed > 0);
+    assert_eq!(metrics.frames_inferred, metrics.frames_processed);
     // Exactly one above-threshold detection per processed frame.
     assert_eq!(metrics.detections, metrics.frames_processed);
 

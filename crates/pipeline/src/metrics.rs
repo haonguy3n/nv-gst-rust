@@ -141,6 +141,9 @@ pub struct PipelineMetrics {
     /// makes a starving pool visible instead of silent.
     pub capture_timeouts: u64,
     pub frames_processed: u64,
+    /// Frames that ran pre/infer/post (the engine was ready). The stage
+    /// averages divide by this, not by `frames_processed`.
+    pub frames_inferred: u64,
     pub detections: u64,
     pub pre_total: Duration,
     pub infer_total: Duration,
@@ -156,12 +159,22 @@ pub struct PipelineMetrics {
 }
 
 impl PipelineMetrics {
-    fn avg(&self, total: Duration) -> Duration {
-        if self.frames_processed == 0 {
+    fn avg_over(frames: u64, total: Duration) -> Duration {
+        if frames == 0 {
             Duration::ZERO
         } else {
-            Duration::from_nanos((total.as_nanos() / u128::from(self.frames_processed)) as u64)
+            Duration::from_nanos((total.as_nanos() / u128::from(frames)) as u64)
         }
+    }
+
+    /// Average of a stage that only runs on inferred frames.
+    fn avg(&self, total: Duration) -> Duration {
+        Self::avg_over(self.frames_inferred, total)
+    }
+
+    /// Average of a stage that runs on every processed frame.
+    fn avg_processed(&self, total: Duration) -> Duration {
+        Self::avg_over(self.frames_processed, total)
     }
 
     /// Prometheus text exposition, ready to serve from a `/metrics`
@@ -207,6 +220,12 @@ impl PipelineMetrics {
             "edge_frames_processed_total",
             "Frames that completed every stage",
             self.frames_processed,
+        );
+        counter(
+            &mut out,
+            "edge_frames_inferred_total",
+            "Frames that ran the detector (engine ready)",
+            self.frames_inferred,
         );
         counter(
             &mut out,
@@ -273,7 +292,7 @@ impl PipelineMetrics {
             None => "n/a".to_string(),
         };
         format!(
-            "captured={} dropped={} enc_dropped={} timeouts={} processed={} detections={} \
+            "captured={} dropped={} enc_dropped={} timeouts={} processed={} inferred={} detections={} \
              qmax={} p50={} p95={} p99={} \
              avg pre={:?} infer={:?} post={:?} overlay={:?} encode_push={:?}",
             self.frames_captured,
@@ -281,6 +300,7 @@ impl PipelineMetrics {
             self.encode_dropped,
             self.capture_timeouts,
             self.frames_processed,
+            self.frames_inferred,
             self.detections,
             self.queue_depth_max,
             p(self.latency.p50()),
@@ -290,7 +310,7 @@ impl PipelineMetrics {
             self.avg(self.infer_total),
             self.avg(self.post_total),
             self.avg(self.overlay_total),
-            self.avg(self.encode_push_total),
+            self.avg_processed(self.encode_push_total),
         )
     }
 }
@@ -317,6 +337,7 @@ pub struct LiveMetrics {
     depth_source: Mutex<Option<Arc<AtomicU64>>>,
     capture_timeouts: AtomicU64,
     frames_processed: AtomicU64,
+    frames_inferred: AtomicU64,
     detections: AtomicU64,
     queue_depth: AtomicU64,
     queue_depth_max: AtomicU64,
@@ -356,6 +377,7 @@ impl LiveMetrics {
             encode_dropped: self.encode_dropped.load(Ordering::Relaxed),
             capture_timeouts: self.capture_timeouts.load(Ordering::Relaxed),
             frames_processed: self.frames_processed.load(Ordering::Relaxed),
+            frames_inferred: self.frames_inferred.load(Ordering::Relaxed),
             detections: self.detections.load(Ordering::Relaxed),
             pre_total: Duration::from_nanos(self.pre_ns.load(Ordering::Relaxed)),
             infer_total: Duration::from_nanos(self.infer_ns.load(Ordering::Relaxed)),
@@ -375,6 +397,7 @@ impl LiveMetrics {
             &self.encode_dropped,
             &self.capture_timeouts,
             &self.frames_processed,
+            &self.frames_inferred,
             &self.detections,
             &self.queue_depth,
             &self.queue_depth_max,
@@ -421,6 +444,8 @@ impl LiveMetrics {
     pub(crate) fn sync_processing(&self, metrics: &PipelineMetrics, dropped: u64) {
         self.frames_processed
             .store(metrics.frames_processed, Ordering::Relaxed);
+        self.frames_inferred
+            .store(metrics.frames_inferred, Ordering::Relaxed);
         self.detections.store(metrics.detections, Ordering::Relaxed);
         self.frames_dropped.store(dropped, Ordering::Relaxed);
         self.encode_dropped
@@ -490,6 +515,7 @@ mod tests {
             frames_captured: 30,
             frames_dropped: 2,
             frames_processed: 28,
+            frames_inferred: 3,
             detections: 28,
             infer_total: Duration::from_millis(1500),
             latency: samples,
@@ -500,6 +526,7 @@ mod tests {
         let text = m.render_prometheus();
         assert!(text.contains("edge_frames_captured_total 30\n"));
         assert!(text.contains("edge_frames_dropped_total 2\n"));
+        assert!(text.contains("edge_frames_inferred_total 3\n"));
         assert!(text.contains("edge_queue_depth 1\n"));
         assert!(text.contains("edge_queue_depth_max 4\n"));
         assert!(text.contains("edge_latency_seconds{quantile=\"0.5\"} 0.020000\n"));
@@ -511,6 +538,26 @@ mod tests {
             text.matches("# HELP edge_stage_seconds_total").count(),
             1,
             "HELP must appear once per metric:\n{text}"
+        );
+    }
+
+    /// Frames processed while the engine warmed must not dilute the averages.
+    #[test]
+    fn stage_averages_divide_by_inferred_frames() {
+        let m = PipelineMetrics {
+            frames_processed: 1000,
+            frames_inferred: 10,
+            infer_total: Duration::from_millis(50),
+            encode_push_total: Duration::from_millis(1000),
+            ..Default::default()
+        };
+        let line = m.summary();
+        assert!(line.contains("inferred=10"), "{line}");
+        assert!(line.contains("infer=5ms"), "{line}");
+        assert!(line.contains("encode_push=1ms"), "{line}");
+        assert_eq!(
+            PipelineMetrics::default().avg(Duration::from_secs(1)),
+            Duration::ZERO
         );
     }
 }

@@ -395,7 +395,7 @@ fn builder_warns_but_builds_an_in_flight_budget_larger_than_the_argus_pool() {
     };
     let mut cfg = config("strict", true);
     cfg.pipeline.queue_depth = 4;
-    cfg.source.argus_pool = Some(10); // queue_depth 4 + 7 holders = 11 surfaces
+    cfg.source.argus_pool = Some(10); // queue_depth 4 + 6 holders = 10 surfaces
     assert!(
         build(&platform, cfg).is_ok(),
         "an oversized budget warns, not refuses"

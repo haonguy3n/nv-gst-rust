@@ -308,4 +308,5 @@ fn inference_off_streams_video_with_empty_detections() {
     assert_eq!(counts.detections, 0, "no inference, no detections");
     assert!(counts.video_packets > 0, "video must still reach the sink");
     assert_eq!(metrics.infer_total, Duration::ZERO);
+    assert_eq!(metrics.frames_inferred, 0, "no engine: nothing inferred");
 }

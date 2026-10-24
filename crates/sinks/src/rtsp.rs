@@ -420,4 +420,106 @@ mod tests {
             .expect("port is taken");
         assert!(err.to_string().contains(&port.to_string()), "{err}");
     }
+
+    /// Missing element names among `names`, for a skip message.
+    fn missing(names: &[&str]) -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| gst::ElementFactory::find(n).is_none())
+            .map(|n| (*n).to_string())
+            .collect()
+    }
+
+    /// 30 H.264 access units (a keyframe every 6) from a test source.
+    fn encode_test_packets() -> Vec<(bool, Vec<u8>)> {
+        let pipeline = gst::parse::launch(
+            "videotestsrc num-buffers=30 ! video/x-raw,width=320,height=240,framerate=30/1 \
+             ! x264enc tune=zerolatency key-int-max=6 bframes=0 \
+             ! h264parse config-interval=-1 \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=out sync=false",
+        )
+        .expect("encoder pipeline");
+        let bin = pipeline.clone().downcast::<gst::Bin>().expect("bin");
+        let out = bin
+            .by_name("out")
+            .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
+            .expect("appsink");
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        let mut packets = Vec::new();
+        while let Some(sample) = out.try_pull_sample(gst::ClockTime::from_seconds(5)) {
+            let buffer = sample.buffer().expect("buffer");
+            let map = buffer.map_readable().expect("map");
+            let key = !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT);
+            packets.push((key, map.as_slice().to_vec()));
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        packets
+    }
+
+    /// The test that catches a broken `media-configure`: a real RTSP
+    /// client must receive RTP/H.264 for packets pushed into the sink.
+    #[test]
+    fn a_real_rtsp_client_receives_rtp_h264() {
+        gst::init().expect("gst init");
+        let absent = missing(&[
+            "rtph264pay",
+            "h264parse",
+            "x264enc",
+            "videotestsrc",
+            "rtspsrc",
+            "rtph264depay",
+        ]);
+        if !absent.is_empty() {
+            eprintln!("skipping: GStreamer elements missing: {absent:?}");
+            return;
+        }
+        let packets = encode_test_packets();
+        assert!(packets.iter().any(|p| p.0), "encoder made no keyframe");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("probe port")
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut sink = RtspSink::new(port, Codec::H264).expect("construct RTSP sink");
+        let client = gst::parse::launch(&format!(
+            "rtspsrc location=rtsp://127.0.0.1:{port}/stream protocols=tcp latency=0 \
+             ! rtph264depay ! appsink name=out sync=false"
+        ))
+        .expect("client pipeline");
+        let out = client
+            .clone()
+            .downcast::<gst::Bin>()
+            .expect("bin")
+            .by_name("out")
+            .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
+            .expect("appsink");
+        client
+            .set_state(gst::State::Playing)
+            .expect("client playing");
+        let bus = client.bus().expect("bus");
+
+        let started = std::time::Instant::now();
+        let mut received = false;
+        let mut had_client = false;
+        let mut n = 0u64;
+        while started.elapsed() < Duration::from_secs(10) && !received {
+            let (key, data) = &packets[(n % packets.len() as u64) as usize];
+            let pts = Duration::from_millis(33 * n);
+            sink.push_video(EncodedPacket::new(pts, *key, data.clone()))
+                .expect("push");
+            n += 1;
+            had_client |= sink.has_client();
+            if let Some(sample) = out.try_pull_sample(gst::ClockTime::from_mseconds(33)) {
+                received = sample.buffer().is_some_and(|b| b.size() > 0);
+            }
+            if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                panic!("RTSP client error: {msg:?}");
+            }
+        }
+        let _ = client.set_state(gst::State::Null);
+        sink.finish().expect("finish");
+        assert!(had_client, "media-configure never gave the sink an appsrc");
+        assert!(received, "no H.264 data reached the RTSP client in 10 s");
+    }
 }

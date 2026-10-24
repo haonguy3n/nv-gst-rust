@@ -77,11 +77,16 @@ type EncoderJoin = std::thread::JoinHandle<(Box<dyn Encoder>, Result<()>)>;
 /// system memory). Holders: the capture appsink (max-buffers=1), the
 /// capture thread holding a pulled frame while `send` evicts, the
 /// Rust capture channel (`queue_depth`), the frame in processing, the
-/// one-deep leaky hand-off slot, the frame inside `GstEncoder::encode`
-/// (its ref lives until `encode` returns), the encoder appsrc queue
+/// one-deep leaky hand-off slot (`GstEncoder::encode` drops the
+/// frame's ref before pushing, so it adds none), the encoder appsrc queue
 /// (max-buffers=1) and the frame inside the hardware encoder.
+///
+/// The capture channel already evicts before it inserts, so its queue
+/// never exceeds `queue_depth`; the pulled frame still coexists with a
+/// full queue at the instant it is pulled, which only an eviction
+/// before the pull (an earlier drop) could avoid. Hence the `+ 1`.
 fn in_flight_surfaces(queue_depth: usize) -> usize {
-    1 + 1 + queue_depth + 1 + 1 + 1 + 1 + 1
+    1 + 1 + queue_depth + 1 + 1 + 1 + 1
 }
 
 /// The engine's bindings are a contract, not a suggestion. A
@@ -387,9 +392,10 @@ impl Pipeline {
 
     /// The per-frame buffer budget, printed at startup so a hidden
     /// extra buffer is visible in the log, not just in a trace.
-    /// Plane lines use the tight geometry implied by the config until
-    /// a backend can report its real surface pitch (the NVMM branch
-    /// fills this from `NvBufSurface` params on device).
+    /// Plane lines use the tight geometry implied by the config and are
+    /// labelled as an estimate: real NVMM frames are block-linear with
+    /// a larger pitch (1472 vs 1440 on the Nano at 1440 wide), which
+    /// only the `NvBufSurface` params report.
     pub fn buffer_budget(&self) -> String {
         let s = &self.config.source;
         let m = &self.config.model;
@@ -426,7 +432,9 @@ impl Pipeline {
             String::new()
         };
         format!(
-            "buffer budget:\n  capture NV12 {}x{} {}: {} bytes x pool {}{plane_lines}\n  \
+            "buffer budget:\n  capture NV12 {}x{} {}: {} bytes x pool {} \
+             (estimated from config, tight planes; real planes come from the \
+             NvBufSurface){plane_lines}\n  \
              input tensor {} 3x{}x{}: {} bytes (engine binding, written once)\n  \
              output tensors: host-visible, read in place\n  \
              mode: {}{live_budget}",
@@ -801,6 +809,7 @@ impl Pipeline {
         // the age covers queueing, inference and the video hand-off.
         let received_at = frame.received_at();
         self.poll_engine()?;
+        let mut inferred = false;
         match &mut self.engine {
             EngineSlot::Ready(engine) => {
                 let t = Instant::now();
@@ -820,6 +829,8 @@ impl Pipeline {
                     .decode(engine.output_bindings(), frame.meta(), detections)?;
                 metrics.post_total += t.elapsed();
                 metrics.detections += detections.len() as u64;
+                metrics.frames_inferred += 1;
+                inferred = true;
             }
             // Still warming: video and metadata flow with empty
             // detections rather than waiting for the engine.
@@ -829,7 +840,10 @@ impl Pipeline {
         if !matches!(self.engine, EngineSlot::Disabled) {
             let t = Instant::now();
             self.overlay.draw(&frame, detections, &self.stream)?;
-            metrics.overlay_total += t.elapsed();
+            // Stage averages divide by inferred frames, so only those count.
+            if inferred {
+                metrics.overlay_total += t.elapsed();
+            }
         }
 
         match video_tx {

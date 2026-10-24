@@ -28,7 +28,7 @@
 
 use crate::write_within;
 use edge_core::{Detections, EncodedPacket, Result, Sink};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,7 +40,13 @@ const PAGE: &str = include_str!("web_ui.html");
 pub const MAX_VIEWERS: usize = 4;
 /// Connections in the request/handshake phase at once.
 const MAX_HANDSHAKES: usize = 8;
+/// Total time for the request head and the WebSocket upgrade of one
+/// connection (not per read: a client trickling bytes is cut off too).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Least time a viewer gets for one write, even when the packet's
+/// budget is spent, so one stalled viewer does not get the healthy
+/// viewers behind it dropped with a zero budget.
+const MIN_WRITE_SLICE: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 /// Total time one packet may take across all viewers.
 const PACKET_DEADLINE: Duration = Duration::from_secs(1);
@@ -168,13 +174,54 @@ fn spawn_handler(stream: TcpStream, peer: SocketAddr, shared: &Arc<Shared>) {
     }
 }
 
-/// Waits (up to the request timeout) until the first request line is
-/// readable, without consuming it, and returns `(method, path)`.
-fn peek_request_line(stream: &TcpStream) -> std::io::Result<(String, String)> {
-    let start = Instant::now();
+/// A stream whose reads all share one total deadline: each read's
+/// timeout is the time left, and a read after the deadline fails.
+struct DeadlineStream {
+    inner: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    /// Arms the read timeout with the time left; `TimedOut` when none.
+    fn arm(&self) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.inner.set_read_timeout(Some(left))
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.inner.read(buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => std::io::ErrorKind::TimedOut.into(),
+            _ => e,
+        })
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Waits (up to the connection deadline) until the first request line
+/// is readable, without consuming it, and returns `(method, path)`.
+fn peek_request_line(stream: &DeadlineStream) -> std::io::Result<(String, String)> {
     let mut buf = [0u8; 1024];
     loop {
-        let n = stream.peek(&mut buf)?;
+        stream.arm()?;
+        let n = stream.inner.peek(&mut buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => std::io::ErrorKind::TimedOut.into(),
+            _ => e,
+        })?;
         if n == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
@@ -186,7 +233,7 @@ fn peek_request_line(stream: &TcpStream) -> std::io::Result<(String, String)> {
             let path = target.split('?').next().unwrap_or("").to_string();
             return Ok((method, path));
         }
-        if n == buf.len() || start.elapsed() >= REQUEST_TIMEOUT {
+        if n == buf.len() {
             return Err(std::io::ErrorKind::InvalidData.into());
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -195,9 +242,12 @@ fn peek_request_line(stream: &TcpStream) -> std::io::Result<(String, String)> {
 
 fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.set_nodelay(true)?;
+    let stream = DeadlineStream {
+        inner: stream,
+        deadline: Instant::now() + REQUEST_TIMEOUT,
+    };
     let (method, path) = peek_request_line(&stream)?;
     match (method.as_str(), path.as_str()) {
         ("GET", "/ws") => upgrade(stream, peer, shared),
@@ -206,7 +256,12 @@ fn handle_connection(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> st
     }
 }
 
-fn respond(mut stream: TcpStream, status: &str, mime: &str, body: &str) -> std::io::Result<()> {
+fn respond(
+    mut stream: DeadlineStream,
+    status: &str,
+    mime: &str,
+    body: &str,
+) -> std::io::Result<()> {
     // Consume the request head so closing does not reset the reply.
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -221,13 +276,14 @@ fn respond(mut stream: TcpStream, status: &str, mime: &str, body: &str) -> std::
          Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    write_within(&mut stream, reply.as_bytes(), PACKET_DEADLINE)
+    write_within(&mut stream.inner, reply.as_bytes(), PACKET_DEADLINE)
 }
 
-fn upgrade(stream: TcpStream, peer: SocketAddr, shared: &Shared) -> std::io::Result<()> {
+fn upgrade(stream: DeadlineStream, peer: SocketAddr, shared: &Shared) -> std::io::Result<()> {
     let ws = tungstenite::accept(stream).map_err(std::io::Error::other)?;
-    let mut raw = ws.get_ref().try_clone()?;
+    let mut raw = ws.get_ref().inner.try_clone()?;
     drop(ws);
+    raw.set_read_timeout(None)?;
     if shared.viewers.fetch_add(1, Ordering::Relaxed) >= MAX_VIEWERS {
         shared.viewers.fetch_sub(1, Ordering::Relaxed);
         let msg = format!(
@@ -303,7 +359,9 @@ impl WebUiSink {
             if !wanted(v) {
                 return true;
             }
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .max(MIN_WRITE_SLICE);
             match write_within(&mut v.stream, frame, left) {
                 Ok(()) => true,
                 Err(e) => {
@@ -510,6 +568,68 @@ mod tests {
             panic!("expected error text");
         };
         assert!(text.as_str().contains("too many viewers"), "{text}");
+    }
+
+    #[test]
+    fn a_trickling_client_is_cut_off_at_the_total_deadline() {
+        let ui = WebUi::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = ui.local_addr();
+        // One byte per 300 ms: every single read is well inside any
+        // per-read timeout, only a total deadline stops it.
+        let trickler = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let start = Instant::now();
+            let head = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n";
+            for b in head {
+                std::thread::sleep(Duration::from_millis(300));
+                if s.write_all(&[*b]).is_err() {
+                    break;
+                }
+            }
+            // The server closed (or the head ended): wait for EOF/reset.
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut sink = [0u8; 64];
+            while matches!(s.read(&mut sink), Ok(n) if n > 0) {}
+            start.elapsed()
+        });
+        // A normal client is served meanwhile.
+        std::thread::sleep(Duration::from_millis(500));
+        let mut s = TcpStream::connect(addr).unwrap();
+        write!(s, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        let cut_off = trickler.join().unwrap();
+        assert!(
+            cut_off < REQUEST_TIMEOUT + Duration::from_millis(1500),
+            "trickler held the handler for {cut_off:?}"
+        );
+        assert!(cut_off >= REQUEST_TIMEOUT - Duration::from_millis(300));
+    }
+
+    #[test]
+    fn an_expired_budget_still_serves_a_healthy_viewer() {
+        let ui = WebUi::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut sink = ui.sink();
+        let _idle = connect(&ui);
+        let mut healthy = connect(&ui);
+        for _ in 0..400 {
+            sink.push_video(packet(false, 1)).unwrap();
+            if sink.viewers.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(sink.viewers.len(), 2);
+        // The deadline is already spent: the slice still serves the
+        // healthy viewer's small frame.
+        let frame = ws_frame(OP_TEXT, b"hi");
+        sink.broadcast(&frame, |_| true, Instant::now());
+        assert_eq!(sink.viewers.len(), 2);
+        let Message::Text(t) = healthy.read().unwrap() else {
+            panic!("expected text");
+        };
+        assert_eq!(t.as_str(), "hi");
     }
 
     #[test]
