@@ -116,7 +116,7 @@ fn nvmm_grey_frame(width: u32, height: u32) -> (gstreamer::Pipeline, gstreamer::
     let launch = format!(
         "videotestsrc num-buffers=5 pattern=solid-color foreground-color=0xff808080 \
          ! video/x-raw,width={width},height={height},framerate=30/1 ! nvvidconv \
-         ! video/x-raw(memory:NVMM),format=NV12 ! appsink name=sink sync=false"
+         ! video/x-raw(memory:NVMM),format=NV12 ! appsink name=sink sync=false max-buffers=1 drop=true"
     );
     let pipeline = gstreamer::parse::launch(&launch)
         .expect("parse")
@@ -180,6 +180,9 @@ fn vic_letterbox_pads_and_fills_the_input_tensor() {
             "content, channel {channel}: {centre}"
         );
     }
+    // Return the NVMM buffer before the teardown: a held pool buffer
+    // deadlocks the Null state change (seen on the Nano).
     drop(map);
+    drop(buffer);
     let _ = pipeline.set_state(gstreamer::State::Null);
 }

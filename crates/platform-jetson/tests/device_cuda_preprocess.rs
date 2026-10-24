@@ -18,7 +18,7 @@ fn nvmm_bars_frame(width: u32, height: u32) -> (gstreamer::Pipeline, gstreamer::
     let launch = format!(
         "videotestsrc num-buffers=5 pattern=smpte \
          ! video/x-raw,width={width},height={height},framerate=30/1 ! nvvidconv \
-         ! video/x-raw(memory:NVMM),format=NV12 ! appsink name=sink sync=false"
+         ! video/x-raw(memory:NVMM),format=NV12 ! appsink name=sink sync=false max-buffers=1 drop=true"
     );
     let pipeline = gstreamer::parse::launch(&launch)
         .expect("parse")
@@ -85,6 +85,9 @@ fn cuda_tensor_equals_the_cpu_tensor() {
         );
         assert!(cpu.as_slice().iter().any(|v| *v != cpu.as_slice()[0]));
     }
+    // Return the NVMM buffer before the teardown: a held pool buffer
+    // deadlocks the Null state change (seen on the Nano).
     drop(map);
+    drop(buffer);
     let _ = pipeline.set_state(gstreamer::State::Null);
 }
