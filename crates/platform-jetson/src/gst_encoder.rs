@@ -261,7 +261,13 @@ impl GstEncoder {
             let first_in = (first_enc != NO_PTS)
                 .then_some(first_enc)
                 .or(self.first_in_pts);
-            let shift = first_in.map_or(0, |i| encoder_pts_shift(i, raw));
+            // Only GstVideoEncoder-based encoders (x264enc) shift; NVENC's
+            // first output may differ from its first input by a frame
+            // interval it re-derived, which must not become an offset.
+            let shift = match self.kind {
+                EncoderKind::Cpu => first_in.map_or(0, |i| encoder_pts_shift(i, raw)),
+                EncoderKind::Nvenc => 0,
+            };
             log::info!("encoder: output timestamps are shifted by {shift} ns; mapped back");
             self.pts_shift = Some(shift);
         }

@@ -21,7 +21,9 @@ use trt_sys::{Context, Graph, IoDesc, IoMode, MappedBuffer, Runtime, Stream};
 pub struct TrtEngine {
     // Field order is drop order: the graph before the context it came
     // from, the context before the buffers it reads and writes (and, by
-    // `Arc`, before its engine and runtime).
+    // `Arc`, before its engine and runtime); the timer's events first.
+    /// Events around the enqueue; `None` when they could not be created.
+    timer: Option<GpuTimer>,
     graph: Option<Graph>,
     context: Context,
     inputs: Vec<Tensor>,
@@ -29,8 +31,6 @@ pub struct TrtEngine {
     policy: GraphPolicy,
     /// Used when the caller passes a stream that is not ours (tests).
     fallback: Option<Stream>,
-    /// Events around the enqueue; `None` when they could not be created.
-    timer: Option<GpuTimer>,
     gpu_time: Option<Duration>,
     broken: Option<String>,
 }

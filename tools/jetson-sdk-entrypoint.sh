@@ -4,8 +4,10 @@
 set -eu
 
 if env_file=$(ls /opt/yocto-sdk/environment-setup-* 2>/dev/null | head -1) && [ -n "$env_file" ]; then
+    set +u  # the SDK script reads unset variables
     # shellcheck disable=SC1090
     . "$env_file"
+    set -u
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="${CC%% *}"
     export CC_aarch64_unknown_linux_gnu="$CC" CXX_aarch64_unknown_linux_gnu="$CXX"
     export SYSROOT="$SDKTARGETSYSROOT"

@@ -2,11 +2,11 @@
 # boot (SYSTEMD_AUTO_ENABLE = "disable"): the image's own app (MainApp / camera-streamer) owns the camera and the boot-ok
 # marker. `systemctl start edge-vision` stops those apps (Conflicts=), `systemctl start MainApp` stops this one.
 # Config: /etc/edge-vision/config.toml (a copy of config/orin-nano-yolox.toml). Model: put the ONNX at
-# /data/edge-vision/models/yolox-s.onnx; without it the pipeline streams and the plan build logs why it cannot start.
+# /var/lib/edge-vision/models/yolox-s.onnx; without it the pipeline streams and the plan build logs why it cannot start.
 # Logs: journalctl -u edge-vision -f (a [live] line every 5 s from --prometheus).
 [Unit]
 Description=edge-vision camera pipeline
-After=network-online.target nvargus-daemon.service data.mount edge-vision-control.socket
+After=network-online.target nvargus-daemon.service edge-vision-control.socket
 Wants=nvargus-daemon.service edge-vision-control.socket
 Conflicts=camera-streamer.service MainApp.service lpr-app.service
 # A second capture loss in one boot exits 1: stop after three quick failures instead of hammering Argus.
@@ -29,6 +29,8 @@ TimeoutStopSec=20
 CacheDirectory=edge-vision
 # GStreamer's plugin registry; its default home (~/.cache) does not exist for this user.
 Environment=GST_REGISTRY=/var/cache/edge-vision/gst-registry.bin
+# CUDA's JIT cache: HOME does not exist for this user (ProtectHome as well).
+Environment=CUDA_CACHE_PATH=/var/cache/edge-vision/cuda
 # The once-per-boot recovery marker must survive restarts of this unit.
 RuntimeDirectory=edge-vision
 RuntimeDirectoryPreserve=yes
@@ -50,11 +52,10 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
-RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
-# Not PrivateDevices (GPU, VIC, capture nodes), not MemoryDenyWriteExecute (CUDA and GStreamer generate code).
+# Not RestrictRealtime (GStreamer may ask for SCHED_RR), not PrivateDevices (GPU, VIC, capture nodes), not MemoryDenyWriteExecute (CUDA and GStreamer generate code).
 
 [Install]
 WantedBy=multi-user.target
