@@ -700,6 +700,7 @@ mod tests {
             gain_max: None,
             paced: true,
             pool_size,
+            argus_pool: None,
             frames: Some(frames),
         }
     }

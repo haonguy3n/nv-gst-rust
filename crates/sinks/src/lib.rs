@@ -315,3 +315,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---------------------------------------------------------------- async
+
+/// Moves a sink's blocking writes onto a bounded writer thread.
+///
+/// The processing thread only queues a packet/metadata frame; file
+/// flushes and slow disks happen on `sink-writer`. Backpressure is
+/// explicit: when the queue is full, `push_*` blocks rather than
+/// growing memory without bound.
+pub struct AsyncSink {
+    tx: Option<std::sync::mpsc::SyncSender<Command>>,
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+enum Command {
+    Video(EncodedPacket),
+    Meta(edge_core::Detections),
+    Finish,
+}
+
+impl AsyncSink {
+    pub fn new(mut inner: Box<dyn Sink>, capacity: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Command>(capacity.max(1));
+        let handle = std::thread::Builder::new()
+            .name("sink-writer".into())
+            .spawn(move || -> Result<()> {
+                let mut first: Option<Error> = None;
+                while let Ok(cmd) = rx.recv() {
+                    let is_finish = matches!(cmd, Command::Finish);
+                    let result = match cmd {
+                        Command::Video(pkt) => inner.push_video(pkt),
+                        Command::Meta(det) => inner.push_meta(&det),
+                        Command::Finish => inner.finish(),
+                    };
+                    if let Err(e) = result {
+                        if first.is_none() {
+                            first = Some(e);
+                        }
+                    }
+                    if is_finish {
+                        break;
+                    }
+                }
+                // Channel closed without an explicit Finish (Drop path).
+                if first.is_none() {
+                    if let Err(e) = inner.finish() {
+                        first = Some(e);
+                    }
+                }
+                first.map_or(Ok(()), Err)
+            })
+            .expect("spawning sink-writer thread");
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    fn send(&mut self, cmd: Command) -> Result<()> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| Error::Platform("async sink is already finished".into()))?;
+        tx.send(cmd)
+            .map_err(|_| Error::Platform("sink-writer thread is gone".into()))
+    }
+}
+
+impl Sink for AsyncSink {
+    fn push_video(&mut self, pkt: EncodedPacket) -> Result<()> {
+        self.send(Command::Video(pkt))
+    }
+
+    fn push_meta(&mut self, det: &edge_core::Detections) -> Result<()> {
+        self.send(Command::Meta(det.clone()))
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if self.tx.is_some() {
+            let _ = self.send(Command::Finish);
+            self.tx = None;
+        }
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(Error::Platform("sink-writer thread panicked".into())),
+        }
+    }
+}
+
+impl Drop for AsyncSink {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    use edge_core::{Detection, Detections, FrameMeta, Layout, PixelFormat};
+    use std::time::Duration;
+
+    fn detections(seq: u64) -> Detections {
+        let mut d = Detections::with_capacity(1);
+        d.clear(&FrameMeta {
+            seq,
+            pts: Duration::from_millis(seq),
+            width: 64,
+            height: 64,
+            format: PixelFormat::Nv12,
+            layout: Layout::PitchLinear,
+            planes: PixelFormat::Nv12.plane_layout(64, 64),
+            camera_id: 3,
+            dmabuf_fd: -1,
+        });
+        d.push(Detection {
+            x: 0.5,
+            y: 0.5,
+            width: 0.1,
+            height: 0.1,
+            score: 0.9,
+            class_id: 2,
+        });
+        d
+    }
+
+    #[test]
+    fn async_jsonl_sink_writes_on_the_writer_thread_and_flushes() {
+        let dir = std::env::temp_dir().join(format!("edge-sinks-async-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.jsonl");
+        let inner: Box<dyn Sink> = Box::new(JsonlMetaSink::create(&path).unwrap());
+        let mut sink = AsyncSink::new(inner, 4);
+        for seq in 0..5 {
+            sink.push_meta(&detections(seq)).unwrap();
+        }
+        sink.finish().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn async_sink_reports_a_closed_writer() {
+        let counts = Arc::new(Mutex::new(Counts::default()));
+        let inner: Box<dyn Sink> = Box::new(CountingSink::new(Arc::clone(&counts)));
+        let mut sink = AsyncSink::new(inner, 1);
+        sink.finish().unwrap();
+        assert!(sink.push_meta(&detections(1)).is_err());
+    }
+}

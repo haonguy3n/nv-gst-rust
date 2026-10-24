@@ -34,6 +34,12 @@ pub enum Error {
     #[error("stage `{stage}` is gone; the pipeline stopped")]
     StageGone { stage: &'static str },
 
+    /// An Argus capture ended as a bare EOS: the sensor or the
+    /// `nvargus-daemon` session may be gone. The app owns the
+    /// once-per-boot recovery policy; never treat this as a clean end.
+    #[error("capture service lost: {0}")]
+    CaptureServiceLost(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

@@ -146,7 +146,7 @@ pub struct PipelineMetrics {
     pub infer_total: Duration,
     pub post_total: Duration,
     pub overlay_total: Duration,
-    pub encode_total: Duration,
+    pub encode_push_total: Duration,
     /// End-to-end age samples: source hand-off to sink accept.
     pub latency: LatencySamples,
     /// Frames queued between capture and processing right now.
@@ -257,7 +257,7 @@ impl PipelineMetrics {
             ("infer", self.infer_total),
             ("post", self.post_total),
             ("overlay", self.overlay_total),
-            ("encode", self.encode_total),
+            ("encode_push", self.encode_push_total),
         ] {
             out.push_str(&format!(
                 "edge_stage_seconds_total{{stage=\"{stage}\"}} {:.6}\n",
@@ -275,7 +275,7 @@ impl PipelineMetrics {
         format!(
             "captured={} dropped={} enc_dropped={} timeouts={} processed={} detections={} \
              qmax={} p50={} p95={} p99={} \
-             avg pre={:?} infer={:?} post={:?} overlay={:?} encode={:?}",
+             avg pre={:?} infer={:?} post={:?} overlay={:?} encode_push={:?}",
             self.frames_captured,
             self.frames_dropped,
             self.encode_dropped,
@@ -290,7 +290,7 @@ impl PipelineMetrics {
             self.avg(self.infer_total),
             self.avg(self.post_total),
             self.avg(self.overlay_total),
-            self.avg(self.encode_total),
+            self.avg(self.encode_push_total),
         )
     }
 }
@@ -324,7 +324,7 @@ pub struct LiveMetrics {
     infer_ns: AtomicU64,
     post_ns: AtomicU64,
     overlay_ns: AtomicU64,
-    encode_ns: AtomicU64,
+    encode_push_ns: AtomicU64,
     latency: LatencySamples,
 }
 
@@ -361,7 +361,7 @@ impl LiveMetrics {
             infer_total: Duration::from_nanos(self.infer_ns.load(Ordering::Relaxed)),
             post_total: Duration::from_nanos(self.post_ns.load(Ordering::Relaxed)),
             overlay_total: Duration::from_nanos(self.overlay_ns.load(Ordering::Relaxed)),
-            encode_total: Duration::from_nanos(self.encode_ns.load(Ordering::Relaxed)),
+            encode_push_total: Duration::from_nanos(self.encode_push_ns.load(Ordering::Relaxed)),
             latency: self.latency.clone(),
             queue_depth: self.attached_depth(),
             queue_depth_max: self.queue_depth_max.load(Ordering::Relaxed),
@@ -382,7 +382,7 @@ impl LiveMetrics {
             &self.infer_ns,
             &self.post_ns,
             &self.overlay_ns,
-            &self.encode_ns,
+            &self.encode_push_ns,
         ] {
             counter.store(0, Ordering::Relaxed);
         }
@@ -436,8 +436,10 @@ impl LiveMetrics {
             .store(metrics.post_total.as_nanos() as u64, Ordering::Relaxed);
         self.overlay_ns
             .store(metrics.overlay_total.as_nanos() as u64, Ordering::Relaxed);
-        self.encode_ns
-            .store(metrics.encode_total.as_nanos() as u64, Ordering::Relaxed);
+        self.encode_push_ns.store(
+            metrics.encode_push_total.as_nanos() as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 

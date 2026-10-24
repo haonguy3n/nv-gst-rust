@@ -22,7 +22,7 @@ pub struct Detection {
 
 /// Reused across frames: `PostProcessor::decode` clears and refills it
 /// so the hot loop does not allocate.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Detections {
     pub frame_seq: u64,
     /// Which camera produced this frame (multi-camera metadata

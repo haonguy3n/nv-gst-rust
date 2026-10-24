@@ -53,6 +53,13 @@ enum EngineSlot {
 /// can run again.
 type EncoderJoin = std::thread::JoinHandle<(Box<dyn Encoder>, Result<()>)>;
 
+/// Worst-case Argus surfaces held on the M1 path (E6/N11): appsink 2,
+/// the Rust channel, one frame in processing, appsrc 2, one in the
+/// encoder, plus one for the CPU-encode VIC copy.
+fn in_flight_surfaces(queue_depth: usize, cpu_encode: bool) -> usize {
+    2 + queue_depth + 1 + 2 + 1 + usize::from(cpu_encode)
+}
+
 /// The engine's bindings are a contract, not a suggestion. A
 /// TensorRT engine (T5) is bound to one static FP32 NCHW input and
 /// float outputs; checking that here turns a mismatch into a startup
@@ -180,6 +187,22 @@ impl Pipeline {
             });
         }
 
+        if config.source.kind == "argus" {
+            if let Some(pool) = config.source.argus_pool {
+                let cpu_encode = config.encoder.enabled && !config.encoder.hardware;
+                let in_flight = in_flight_surfaces(config.pipeline.queue_depth, cpu_encode);
+                if in_flight >= pool {
+                    return Err(Error::invalid(
+                        "source.argus_pool",
+                        format!(
+                            "in-flight budget needs {in_flight} surfaces, but the Argus \
+                             pool has {pool}; lower pipeline.queue_depth or raise the \
+                             pool on the board"
+                        ),
+                    ));
+                }
+            }
+        }
         let source = platform.source(&config.source)?;
         if source.memory() != caps.frame_memory {
             return Err(Error::DomainMismatch {
@@ -343,11 +366,22 @@ impl Pipeline {
                 p.offset, p.pitch, p.row_bytes, p.rows
             ));
         }
+        let live_budget = if s.kind == "argus" {
+            let cpu_encode = self.encoder.is_some() && !self.config.encoder.hardware;
+            let in_flight = in_flight_surfaces(self.config.pipeline.queue_depth, cpu_encode);
+            format!(
+                "\n  live in-flight: {in_flight} surfaces (argus_pool: {})",
+                s.argus_pool
+                    .map_or_else(|| "unset, check the board".to_string(), |p| p.to_string())
+            )
+        } else {
+            String::new()
+        };
         format!(
             "buffer budget:\n  capture NV12 {}x{} {}: {} bytes x pool {}{plane_lines}\n  \
              input tensor {} 3x{}x{}: {} bytes (engine binding, written once)\n  \
              output tensors: host-visible, read in place\n  \
-             mode: {}",
+             mode: {}{live_budget}",
             s.width,
             s.height,
             self.source.layout(),
@@ -398,7 +432,7 @@ impl Pipeline {
         let mut video_dropped: Option<Arc<AtomicU64>> = None;
         let mut packet_rx: Option<std::sync::mpsc::Receiver<EncodedPacket>> = None;
         let mut encoder_thread: Option<EncoderJoin> = None;
-        let mut encode_ns: Option<Arc<std::sync::atomic::AtomicU64>> = None;
+        let mut encode_push_ns: Option<Arc<std::sync::atomic::AtomicU64>> = None;
         let mut encoder_failed: Option<Arc<AtomicBool>> = None;
 
         if self.encoder.is_some() {
@@ -408,8 +442,8 @@ impl Pipeline {
             let thread_slot = Arc::clone(&slot);
             let (packet_tx, packet_rx_local) = std::sync::mpsc::sync_channel::<EncodedPacket>(8);
             let packet_tx_thread = packet_tx.clone();
-            let encode_ns_local = Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let encode_ns_thread = Arc::clone(&encode_ns_local);
+            let encode_push_ns_local = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let encode_push_ns_thread = Arc::clone(&encode_push_ns_local);
             let failed = Arc::new(AtomicBool::new(false));
             let failed_thread = Arc::clone(&failed);
             let handle = std::thread::Builder::new()
@@ -428,7 +462,7 @@ impl Pipeline {
                                 let r = encoder.encode(frame, &mut |pkt| {
                                     let _ = packet_tx_thread.send(pkt);
                                 });
-                                encode_ns_thread
+                                encode_push_ns_thread
                                     .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                                 if let Err(e) = r {
                                     failed_thread.store(true, Ordering::Relaxed);
@@ -458,7 +492,7 @@ impl Pipeline {
                             failed_thread.store(true, Ordering::Relaxed);
                             result = Err(e);
                         }
-                        encode_ns_thread
+                        encode_push_ns_thread
                             .fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
                     (encoder, result)
@@ -480,7 +514,7 @@ impl Pipeline {
             video_dropped = Some(dropped);
             packet_rx = Some(packet_rx_local);
             encoder_thread = Some(handle);
-            encode_ns = Some(encode_ns_local);
+            encode_push_ns = Some(encode_push_ns_local);
             encoder_failed = Some(failed);
         }
 
@@ -592,8 +626,8 @@ impl Pipeline {
             if let Some(dropped) = &video_dropped {
                 metrics.encode_dropped = dropped.load(Ordering::Relaxed);
             }
-            if let Some(ns) = &encode_ns {
-                metrics.encode_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
+            if let Some(ns) = &encode_push_ns {
+                metrics.encode_push_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
             }
             self.live_metrics
                 .sync_processing(&metrics, dropped.load(Ordering::Relaxed));
@@ -648,8 +682,8 @@ impl Pipeline {
         if let Some(dropped) = &video_dropped {
             metrics.encode_dropped = dropped.load(Ordering::Relaxed);
         }
-        if let Some(ns) = &encode_ns {
-            metrics.encode_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
+        if let Some(ns) = &encode_push_ns {
+            metrics.encode_push_total = Duration::from_nanos(ns.load(Ordering::Relaxed));
         }
         if let Err(e) = encoder_result {
             // A `StageGone` from the hand-off is only a symptom; the

@@ -249,7 +249,7 @@ layout.
 
 | # | Decision | Why |
 | --- | --- | --- |
-| D1 | Two `-sys` crates: `nvbuf-sys` (bindgen over C headers) and `trt-sys` (C++ shim through `cxx`) | NvBufSurface is C with fields to read; TensorRT is C++ only |
+| D1 | Two `-sys` crates: `nvbuf-sys` (hand-written read-only `repr(C)` view for T2; bindgen only when transform APIs land) and `trt-sys` (C++ shim through `cxx`) | NvBufSurface is C with fields to read; TensorRT is C++ only |
 | D2 | CUDA calls live inside the C++ shim, not `cudarc` | ~12 calls sharing lifetimes with TensorRT; revisit after M1 |
 | D3 | I/O tensors in mapped host memory (`cudaHostAlloc(..., cudaHostAllocMapped)`) | integrated memory; CPU sees `&[f32]`, GPU sees a device pointer, `edge-postproc` unchanged |
 | D4 | Default pre-processing: VIC scales, CPU writes the planar tensor; CUDA kernel behind `cuda-preprocess` | reference default/fallback; kernel needs nvcc + EGL |
@@ -262,7 +262,7 @@ layout.
 
 ```text
 crates/platform-jetson/
-├── nvbuf-sys/              # unsafe: bindgen output + link lines; no logic
+├── nvbuf-sys/              # unsafe: repr(C) read-only view; no link, no pixel copy
 ├── trt-sys/                # unsafe: cxx bridge + C++ shim (+ .cu behind a feature)
 └── src/                    # safe: #![forbid(unsafe_code)]
     ├── nvmm.rs             # NvmmSurface::from_gst: fd, layout, pitch, planes
@@ -287,8 +287,8 @@ on any PC.
 | **C3** | Builder checks engine input shape/dtype against config | **Done** |
 | **C4** | Shared letterbox geometry/normalisation used by sim, device and decoders | **Done** (`core/src/letterbox.rs`) |
 | **T0** | Build against the Yocto SDK sysroot (`$SDKTARGETSYSROOT`/`JETSON_SYSROOT`); `bindgen --sysroot`; cxx/nvcc cross; `tools/Dockerfile.jetson-sdk`, Rust 1.98 | Not started; success = cross build of `--features trt` in the SDK container; clear error without a sysroot |
-| **T1** | `nvbuf-sys`: bindgen allowlist (`NvBufSurface*`, `NvBufSurfTransform*`, `NvBufSurfaceMapEglImage`), link lines, layout tests | Not started |
-| **T2** | `NvmmSurface::from_gst`: check `map.size() == size_of::<NvBufSurface>()`; read fd/layout/pitch/planes; hold the mapping; replace the NVMM refusal; `FrameMeta.planes` from the surface | Not started; device: `gst-capture` logs fd/layout/pitch, `copied_frames == 0` over 300 frames, stable fd |
+| **T1** | `nvbuf-sys`: read-only `repr(C)` view for surface fd/layout/planes (done); bindgen/link lines for `NvBufSurfTransform`/EGL when T8/T9 land | **PC part done** (layout tests on fabricated surfaces); transform/EGL bindings wait for T0/T8/T9 |
+| **T2** | `NvmmSurface::from_gst`: check `map.size() == size_of::<NvBufSurface>()`; read fd/layout/pitch/planes while the `GstBuffer` is held; replace the NVMM refusal; `FrameMeta.planes` from the surface | **PC implementation done** (`nvbuf-sys` + `GstFrameBuffer::Nvmm`). Device: `gst-capture` logs fd/layout/pitch, `copied_frames == 0` over 300 frames, stable fd |
 | **T3** | `trt-sys` skeleton: logger, version, load, io_infos, context, enqueue, synchronize; exceptions → `Result` | Not started; device: load a `trtexec` FP16 plan and enqueue once |
 | **T4** | CUDA buffers: `host_alloc`/`bind`; `MappedTensor`; `CudaStream` | Not started |
 | **T5** | `TrtEngine`: bind every I/O tensor to mapped memory, batch 1, refuse non-float I/O, `infer` = enqueue + synchronize; outputs with real specs | Builder-side binding checks **done** (one static F32 NCHW input, at least one static F32 output); engine stage not started. Device: FP32 within 1e-3 / FP16 within 1e-2 of ONNX Runtime, identical boxes |
@@ -298,7 +298,7 @@ on any PC.
 | **T9** | CUDA preprocessor: `NvBufSurfaceMapEglImage`, `cuGraphicsEGLRegisterImage`, kernel into the input binding | Waits for T8; output equals T8 within 1e-6 |
 | **T10** | CUDA graph after the first good inference; GPU time from events; fall back to `enqueueV3` once on capture failure | Waits for T5 |
 | **T11** | Conformance on the board + Nsight/`tegrastats` zero-copy gate | Waits for T5–T8; M1 inference exit gate |
-| **T12** | Packaging: OE recipe, `DEPENDS`, systemd `CacheDirectory`, video group, camera-guard grants | Recipe `nv-gst-rust` written in camera-viber and built for NX and Nano ([yocto.md](yocto.md)); unit, `CacheDirectory`, grants still proposals; not in any image |
+| **T12** | Packaging: OE recipe, `DEPENDS`, systemd `CacheDirectory`, video group, camera-guard grants | Recipe `nv-gst-rust` written in camera-viber and built for NX and Nano ([yocto.md](yocto.md)); proposal units now in `tools/systemd/` (Conflicts=, CacheDirectory); camera-guard grants and installation still image-owner work |
 
 **Order:** T0 first, then T1→T2 and T3→T4→T5 in parallel until T8 joins
 them. T6/T7 follow T5; T9/T10 are optimisations. The first board
@@ -414,15 +414,15 @@ Still device-gated:
 
 | Item | Status / next step |
 | --- | --- |
-| N9 teardown after daemon loss | `set_state(Null)` still unconditional; add the `nvargus-daemon` restart check and skip teardown when it fired |
-| N11 in-flight budget | Table above is the design; add a validated Jetson budget and log it at startup |
-| N14 module identity | Probe `/proc/device-tree/compatible`, `MemTotal` and DLA devices; derive caps from them |
-| N18 VIC clock floor | Propose `edge-vision-clocks.service` with the recipe; no unit is shipped |
-| N19 cross build | Docker covers the workspace/sim only; `--features jetson` and `trt-sys` need the Yocto SDK (T0) |
-| N20 disk writer | Sinks still write/flush on the processing thread; add a bounded writer thread |
-| N21 sensor ownership | No check that camera-streamer/lpr-app is inactive; add a startup check or unit `Conflicts=` |
+| N9 teardown after daemon loss | PC implementation: typed `CaptureServiceLost`, teardown skipped after Argus EOS, once-per-boot marker + `systemctl --no-block restart nvargus-daemon` + exit 75. Device verification pending |
+| N11 in-flight budget | `source.argus_pool` + builder validation and a startup `live in-flight` line; the board's exact pool size still has to be recorded |
+| N14 module identity | Done: `probe_module_identity` + `dla_cores`; caps add `dlaN` only when `/dev/nvhost-nvdlaN` exists |
+| N18 VIC clock floor | Proposal unit added at `tools/systemd/edge-vision-clocks.service`; install with the recipe |
+| N19 cross build | Docker now carries the aarch64 C++ toolchain; `--features jetson`/`trt-sys` still need the Yocto SDK (T0) |
+| N20 disk writer | `sinks::AsyncSink` moves writes to a bounded `sink-writer` thread; the app uses it |
+| N21 sensor ownership | Proposal unit uses `Conflicts=camera-streamer.service MainApp.service lpr-app.service`; install with the recipe |
 | X1 same-`gst::Buffer` NVENC | First board session, as above |
-| X3 DLA | Deferred; reserve the builder flag and `model.device` hook |
+| X3 DLA | `model.device = "dlaN"` is accepted only when the probe finds `/dev/nvhost-nvdlaN`; TensorRT execution still M1 |
 | X4 two cameras | Blocked on the cam1 Argus timeout |
 | Nano measurement | Record `tegrastats`, process CPU, `edge_encode_dropped_total` and the x264 `threads=3` setting alongside the H.264 stream once the NVMM/VIC stages run on the board |
 
@@ -474,15 +474,57 @@ packet channel stop the run); E1 is the case where it hangs instead.
 | R9 | minor | `tools/build-engine.sh` | Leaves `$engine.tmp` behind when `trtexec` fails under `set -e`. | `trap` to remove it |
 | R10 | minor | `apps/edge-vision/src/main.rs` | The unknown-platform error says "known: sim", though `jetson` exists. | List both |
 
-**Resolved in this pass:** R1–R10, E2, E4 and E7. R1 (ranges after
-PLAYING), R2/R3 (per-model cache namespaces and `create_new` temp),
-R4 (F32-only input), R5 (`Copied` reports `shm-copy`), R6 (release
-compile guard + CI feature check), R7 (file path set as a property),
-R8 (NX `max_idle_ms`), R9 (engine temp cleanup) and R10 (error text).
-E2 (encoder reusable after `finish`), E4 (idle packet drain) and E7
-(caps comment) are fixed; the encoder now also polls the GStreamer bus
-for errors. E8 is left as an unreachable-but-documented branch; E1's unbounded push is removed (non-blocking appsrc plus bus polling;
-the caps-mismatch test is bounded), but whether every negotiation
-failure becomes a hard error remains to verify on device, so E1 stays
-listed. E3, E5, E6 and the device findings remain open. The T5 binding checks (one static F32 NCHW input,
-static F32 outputs) are in the builder and conformance suite.
+**Resolved in this pass:** R1–R10, E1–E5, E7, T2, N9, N11, N14,
+N18–N21 and X3.
+- R1–R10: ranges after PLAYING, per-model cache namespaces and
+  `create_new` temp files, F32-only input, honest `shm-copy` tag,
+  release guard + CI feature check, file path as a property, NX
+  `max_idle_ms`, engine temp cleanup and the platform error text.
+- E1: non-blocking appsrc, bus polling and a bounded caps-mismatch
+  test; a hard error for every negotiation failure still needs the
+  board. E2: encoder reusable after `finish`. E3: `encode_push`
+  metric. E4: idle packet drain. E5: first-buffer flags/writability
+  log. E6: in-flight budget. E8 remains a documented future hook.
+- T2/T1: `nvbuf-sys` read-only surface view, exact map-size check and
+  `GstFrameBuffer::Nvmm` with plane params. T5 binding checks are in
+  the builder/conformance suite.
+- N9: typed capture loss, skipped teardown and once-per-boot recovery.
+  N11: `argus_pool` validation and startup budget. N14/X3: module and
+  DLA probing. N18/N21: systemd proposals. N19: cross C++ toolchain.
+  N20: async sink writer.
+Still open: E1 device verification, T0 SDK build, T3/T4/T5
+(TensorRT/CUDA engine), T8/T9/T10 (VIC/CUDA pre-process and graph),
+T11 on-board conformance, T12 installation/camera-guard grants,
+X1 NVENC dmabuf, the Nano measurement and X4's cam1 hardware issue.
+## First device run: Orin Nano, 2026-10-24
+
+Board: Orin Nano 8 GB (p3767-0003) on the LPR image (L4T r39.2.1),
+sensor 0 (IMX296). MainApp was stopped for the test and started again
+afterwards. Binary: the `gst-capture` example, cross-built by the
+camera-viber recipe with `--features gst --example gst-capture`.
+`edge-vision` itself cannot run on the device yet: the Jetson
+preprocessor, engine and overlay return "M1 pending".
+
+| Check | Result |
+| --- | --- |
+| Launch string | `nvarguscamerasrc name=camsrc sensor-id=0 ! video/x-raw(memory:NVMM),format=NV12,width=1440,height=1080,framerate=30/1 ! appsink name=frames max-buffers=2 drop=true sync=false`, accepted by GStreamer and Argus |
+| First buffer | Argus delivered it; `GstLaunchSource` refused it: "NVMM buffer without dmabuf memory: the NvBufSurface branch is not wired yet; refusing to copy". 0 frames reached the app |
+| Exit | The panic aborted the process (`panic = "abort"`, exit 134). nvargus-daemon logged "CameraProvider was not destroyed", cleaned up the session, and `SCF: Error 0x00000008` (critical error event for the session) |
+| After | MainApp restarted and processed frames again (its LPR/motion timings resumed); no reboot was needed this time |
+
+What it means:
+
+- **T2 is the first blocker on JP7, and it is confirmed.**
+  nvarguscamerasrc's NVMM `GstMemory` is not a dmabuf memory, so the
+  "same buffer via dmabuf" path never applies. `from_gst` must map the
+  memory, check `map.size() == size_of::<NvBufSurface>()` and read the fd
+  and planes from the NvBufSurface (gst-nvmm-cpp reference, T2 row).
+- **An unclean exit tears down the Argus session.** Here the next client
+  recovered, but the LPR app has seen sensor 1 fail with Error 8 until a
+  reboot after the same kind of exit. Device tools must stop the
+  pipeline before they exit: no `expect`/panic after `start()` in the
+  example. Return an error, call `stop()`, then exit non-zero.
+- Next board session: rerun this check after T2. The PC implementation
+  now parses `NvBufSurface` via `nvbuf-sys` and exposes the fd/layout/
+  planes; pass = 300 frames, `copied=0`, a stable fd set, layout and
+  pitch logged.

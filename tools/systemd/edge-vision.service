@@ -1,0 +1,31 @@
+# Proposal only: not installed by the Yocto recipe yet.
+#
+# N20/N21 context: the writer thread is inside edge-vision, so the
+# unit does not need a writable CWD. Conflicts= makes the single-sensor
+# ownership explicit instead of discovering it through a bare EOS.
+[Unit]
+Description=edge-vision camera pipeline
+After=network-online.target nvargus-daemon.service
+Wants=nvargus-daemon.service
+Conflicts=camera-streamer.service MainApp.service lpr-app.service
+
+[Service]
+Type=simple
+User=edge-vision
+Group=video
+ExecStart=/usr/bin/edge-vision /etc/edge-vision/orin-nx-yolo.toml
+Restart=on-failure
+RestartForceExitStatus=75
+RestartSec=2
+CacheDirectory=edge-vision
+RuntimeDirectory=edge-vision
+# The app does not call sd_notify; enable this only after that lands.
+#WatchdogSec=15
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/data /recordings
+
+[Install]
+WantedBy=multi-user.target

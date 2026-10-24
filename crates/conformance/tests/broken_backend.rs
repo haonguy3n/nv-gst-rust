@@ -115,6 +115,7 @@ fn source_cfg() -> SourceConfig {
         gain_max: None,
         paced: true,
         pool_size: 4,
+        argus_pool: None,
         frames: None,
     }
 }

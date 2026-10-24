@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+mod recovery;
+
 use anyhow::{bail, Context, Result};
 use edge_core::{Config, Detections, EncodedPacket, Platform, PostProcessor, Sink};
 use edge_pipeline::Pipeline;
@@ -79,9 +81,9 @@ fn main() -> Result<()> {
         "jetson" => {
             #[cfg(feature = "jetson")]
             {
-                Box::new(platform_jetson::JetsonPlatform::new(std::path::Path::new(
-                    "/",
-                )))
+                let platform = platform_jetson::JetsonPlatform::new(std::path::Path::new("/"));
+                println!("module: {:?}", platform.module_identity());
+                Box::new(platform)
             }
             #[cfg(not(feature = "jetson"))]
             {
@@ -124,13 +126,16 @@ fn main() -> Result<()> {
             Box::new(SimPostProcessor::new(config.model.score_threshold))
         }
     };
-    let sink: Box<dyn Sink> = match &config.stream.meta_file {
+    let inner: Box<dyn Sink> = match &config.stream.meta_file {
         Some(path) => Box::new(edge_sinks::MultiSink::new(vec![
             Box::new(StdoutSink { verbose_frames: 3 }) as Box<dyn Sink>,
             Box::new(edge_sinks::JsonlMetaSink::create(path)?) as Box<dyn Sink>,
         ])),
         None => Box::new(StdoutSink { verbose_frames: 3 }),
     };
+    // Disk/terminal writes happen on a bounded writer thread, never on
+    // the frame-processing thread (N20).
+    let sink: Box<dyn Sink> = Box::new(edge_sinks::AsyncSink::new(inner, 64));
     let mut pipeline = Pipeline::build(&*platform, config, postprocessor, sink)?;
 
     println!("platform: {}", platform.name());
@@ -180,6 +185,26 @@ fn main() -> Result<()> {
     println!("done: {}", metrics.summary());
     if prometheus {
         print!("{}", metrics.render_prometheus());
+    }
+
+    if let Err(edge_core::Error::CaptureServiceLost(reason)) = &result {
+        match recovery::CaptureRecoveryPolicy::from_env().on_capture_loss() {
+            recovery::RecoveryAction::RestartDaemonAndExit75 => {
+                eprintln!(
+                    "capture service lost ({reason}); queuing nvargus-daemon restart, exit 75"
+                );
+                if let Err(e) = recovery::request_daemon_restart() {
+                    eprintln!("warning: could not restart nvargus-daemon: {e}");
+                }
+                std::process::exit(75);
+            }
+            recovery::RecoveryAction::LogAndFail => {
+                eprintln!(
+                    "capture service lost again ({reason}) after one recovery this boot; failing"
+                );
+                std::process::exit(1);
+            }
+        }
     }
     result?;
     Ok(())

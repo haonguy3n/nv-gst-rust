@@ -10,7 +10,12 @@ description = "Jetson backend groundwork: media-engine probe and GStreamer launc
 # GStreamer runtime (M1 hybrid path). Needs system GStreamer dev
 # libraries; runs on the dev PC (videotestsrc/file pipelines) and
 # on the Jetson (nvarguscamerasrc pipelines from launch.rs).
-gst = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-allocators"]
+gst = [
+    "dep:gstreamer",
+    "dep:gstreamer-app",
+    "dep:gstreamer-allocators",
+    "dep:nvbuf-sys",
+]
 
 [[example]]
 name = "gst-capture"
@@ -19,6 +24,7 @@ required-features = ["gst"]
 
 [dependencies]
 edge-core = { path = "../core" }
+nvbuf-sys = { path = "nvbuf-sys", optional = true }
 sha2.workspace = true
 gstreamer = { version = "0.25", optional = true }
 gstreamer-app = { version = "0.25", optional = true }

@@ -133,6 +133,7 @@ mod tests {
             gain_max: None,
             paced: true,
             pool_size: 6,
+            argus_pool: None,
             frames: None,
         }
     }

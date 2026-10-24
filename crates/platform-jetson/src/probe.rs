@@ -9,6 +9,17 @@
 use edge_core::{Error, Result, ZeroCopyMode};
 use std::path::Path;
 
+/// Hardware identity read from the device tree and `/proc/meminfo`.
+/// Used for caps, logs and the plan-cache key; never guessed from a
+/// board name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModuleIdentity {
+    /// `/proc/device-tree/compatible`, NULs replaced by `|`.
+    pub compatible: Option<String>,
+    /// `MemTotal` from `/proc/meminfo`, in kB.
+    pub mem_total_kb: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MediaEngines {
     /// H.264/H.265 hardware encode (Orin NX: yes, Orin Nano: no).
@@ -43,6 +54,41 @@ pub fn probe_media_engines(root: &Path) -> MediaEngines {
         }
     }
     engines_from_entries(&entries)
+}
+
+/// Read the module identity under `root` (`/` on the device).
+pub fn probe_module_identity(root: &Path) -> ModuleIdentity {
+    let compatible = std::fs::read(root.join("proc/device-tree/compatible"))
+        .ok()
+        .map(|bytes| {
+            bytes
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .filter(|s| !s.is_empty());
+    let mem_total_kb = std::fs::read_to_string(root.join("proc/meminfo"))
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                rest.split_whitespace().next()?.parse().ok()
+            })
+        });
+    ModuleIdentity {
+        compatible,
+        mem_total_kb,
+    }
+}
+
+/// DLA cores visible as `/dev/nvhost-nvdlaN` under `root`.
+pub fn dla_cores(root: &Path) -> Vec<String> {
+    (0..2)
+        .filter(|i| root.join(format!("dev/nvhost-nvdla{i}")).exists())
+        .map(|i| format!("dla{i}"))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,5 +224,55 @@ mod tests {
             EncoderKind::Cpu,
             "software forces the Nano path even on an NX (for testing it)"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn fake_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "edge-jetson-identity-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proc/device-tree")).unwrap();
+        std::fs::create_dir_all(root.join("dev")).unwrap();
+        root
+    }
+
+    #[test]
+    fn reads_compatible_memory_and_dla_nodes() {
+        let root = fake_root("read");
+        std::fs::write(
+            root.join("proc/device-tree/compatible"),
+            b"nvidia,p3767-0000\0nvidia,tegra234\0",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("proc/meminfo"),
+            "MemTotal:       16384284 kB\nMemFree: 1 kB\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("dev/nvhost-nvdla1"), b"").unwrap();
+        let id = probe_module_identity(&root);
+        assert_eq!(
+            id.compatible.as_deref(),
+            Some("nvidia,p3767-0000|nvidia,tegra234")
+        );
+        assert_eq!(id.mem_total_kb, Some(16_384_284));
+        assert_eq!(dla_cores(&root), vec!["dla1".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pc_without_device_tree_has_no_identity() {
+        let root = fake_root("empty");
+        let id = probe_module_identity(&root);
+        assert_eq!(id.compatible, None);
+        assert_eq!(id.mem_total_kb, None);
+        assert!(dla_cores(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

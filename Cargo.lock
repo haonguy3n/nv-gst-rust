@@ -654,6 +654,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvbuf-sys"
+version = "0.1.0"
+
+[[package]]
 name = "objc2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -739,6 +743,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-allocators",
  "gstreamer-app",
+ "nvbuf-sys",
  "sha2",
 ]
 

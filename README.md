@@ -40,22 +40,22 @@ Everything below runs and is tested on x86:
   device streaming still awaits the NVMM capture branch and the
   VIC/TensorRT stages.
 - Conformance suite every backend must pass.
-- Jetson groundwork: NVENC/NVJPG sysfs probe, pinned GStreamer launch
-  strings, a GStreamer capture source (`--features gst`, dmabuf branch
-  plus a PC-only copy fallback), an integrity-checked TensorRT plan
-  cache, and Argus EOS treated as a capture fault rather than a clean
-  exit.
+- Jetson groundwork: NVENC/NVJPG sysfs probe, module/DLA identity,
+  pinned GStreamer launch strings, a GStreamer capture source
+  (`--features gst`) with dmabuf and NVMM `NvBufSurface` branches, an
+  integrity-checked TensorRT plan cache, and typed Argus capture-loss
+  recovery (skip teardown, once-per-boot exit 75).
 - CI: fmt, clippy (`-D warnings`) across default/onnx/gst/shipped
   features, workspace/ONNX/GStreamer tests, feature powerset, MSRV 1.92,
   `cargo deny`, and an aarch64 cross build.
 
 Not implemented yet (device work, tracked in the docs):
 
-- NVMM/NvBufSurface access, CUDA/VIC pre-processing, TensorRT execution,
-  NVENC encode, RTSP output and the overlay stage on Jetson.
+- CUDA/VIC pre-processing, TensorRT execution, NVENC encode, RTSP
+  output and the overlay stage on Jetson (NVMM surface access is
+  implemented and awaits a device run).
 - The device zero-copy proof (`copied_frames == 0`, Nsight, EMC load).
-- Argus process-level recovery, the in-flight surface budget and
-  multi-camera orchestration.
+- Multi-camera orchestration (one process per camera is the default).
 - The `rtsp_port` config field was removed until the sink exists; it had
   no reader.
 
@@ -94,6 +94,7 @@ crates/postproc/      YOLO/YOLOX decoders, NMS (platform-neutral)
 crates/sinks/         JSONL metadata, file video, fan-out/counting sinks
 crates/platform-sim/  synthetic/file source, deterministic or ONNX engine — runs anywhere
 crates/platform-jetson/ media-engine probe, launch strings, GStreamer capture, plan cache
+crates/platform-jetson/nvbuf-sys/  read-only NvBufSurface view (the only unsafe surface read)
 apps/edge-vision/     main: parse config, pick platform, run
 config/               x86-dev.toml (sim), orin-nx-yolo.toml, orin-nano-yolo.toml
 docs/                 design + Jetson M1 bring-up

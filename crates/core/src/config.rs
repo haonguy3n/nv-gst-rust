@@ -49,9 +49,17 @@ pub struct SourceConfig {
     /// Hardware sources ignore this (the sensor sets the pace).
     #[serde(default = "default_true")]
     pub paced: bool,
-    /// Preallocated buffer pool; must be >= frames in flight + 2.
+    /// Simulated backend's preallocated buffer pool; the minimum is
+    /// `pipeline.queue_depth + 3`. On Jetson the Argus pool is
+    /// owned by `nvarguscamerasrc` and this value is not used.
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+    /// Argus capture pool size on a Jetson. When set, the builder
+    /// validates the live in-flight surface budget (appsink, channel,
+    /// processing, appsrc and encoder, plus one for the CPU-encode
+    /// copy). Left unset until the board's count is known.
+    #[serde(default)]
+    pub argus_pool: Option<usize>,
     /// Pinned exposure time in microseconds (Argus
     /// `exposuretimerange`). `None` lets auto-exposure run; AE
     /// brightness swings were a real device problem, so the caps

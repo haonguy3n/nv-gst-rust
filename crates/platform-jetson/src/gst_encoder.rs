@@ -87,6 +87,7 @@ pub struct GstEncoder {
     pipeline: Option<gst::Pipeline>,
     appsrc: Option<gst_app::AppSrc>,
     appsink: Option<gst_app::AppSink>,
+    logged_first_buffer: bool,
 }
 
 impl GstEncoder {
@@ -101,6 +102,7 @@ impl GstEncoder {
             pipeline: None,
             appsrc: None,
             appsink: None,
+            logged_first_buffer: false,
         })
     }
 
@@ -124,6 +126,7 @@ impl GstEncoder {
             pipeline: None,
             appsrc: None,
             appsink: None,
+            logged_first_buffer: false,
         })
     }
 
@@ -245,6 +248,17 @@ impl Encoder for GstEncoder {
                 )
             })?
         };
+        if !self.logged_first_buffer {
+            self.logged_first_buffer = true;
+            // E5 diagnostic for the first board run: a writable buffer
+            // or a set DISCONT flag means the no-share NVMM buffer was
+            // copied before it reached the encoder.
+            eprintln!(
+                "encoder: first buffer flags={:?} writable={}",
+                buffer.flags(),
+                buffer.is_writable()
+            );
+        }
         let appsrc = self
             .appsrc
             .as_ref()

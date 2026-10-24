@@ -14,7 +14,7 @@
 
 use edge_core::{
     Error, FrameMemory, FrameMeta, FramePoll, FrameSource, HwBuffer, HwFrame, Layout, PixelFormat,
-    PlaneLayout, Result, SourceConfig, TimeoutReason,
+    PlaneDesc, PlaneLayout, Result, SourceConfig, TimeoutReason,
 };
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -61,6 +61,16 @@ pub enum GstFrameBuffer {
         fd: RawFd,
         memory: FrameMemory,
     },
+    /// NVMM surface: the fd/layout/planes come from `NvBufSurface`,
+    /// never from a guessed tight stride.
+    Nvmm {
+        buffer: gst::Buffer,
+        fd: RawFd,
+        layout: Layout,
+        planes: PlaneLayout,
+        width: u32,
+        height: u32,
+    },
     /// PC-dev fallback: one counted copy into a pooled shm file.
     Copied { file: Option<File>, pool: FilePool },
 }
@@ -69,6 +79,7 @@ impl HwBuffer for GstFrameBuffer {
     fn memory(&self) -> FrameMemory {
         match self {
             Self::DmaBuf { memory, .. } => *memory,
+            Self::Nvmm { .. } => FrameMemory::Nvmm,
             // Honest tag: this is a CPU copy into shm, not a dmabuf
             // and not zero-copy. It exists only for dev-PC pipelines.
             Self::Copied { .. } => FrameMemory::Other("shm-copy"),
@@ -77,7 +88,7 @@ impl HwBuffer for GstFrameBuffer {
 
     fn dmabuf_fd(&self) -> RawFd {
         match self {
-            Self::DmaBuf { fd, .. } => *fd,
+            Self::DmaBuf { fd, .. } | Self::Nvmm { fd, .. } => *fd,
             Self::Copied { file, .. } => file.as_ref().map_or(-1, AsRawFd::as_raw_fd),
         }
     }
@@ -93,8 +104,23 @@ impl GstFrameBuffer {
     /// from this inside the backend.
     pub fn gst_buffer(&self) -> Option<&gst::Buffer> {
         match self {
-            Self::DmaBuf { buffer, .. } => Some(buffer),
+            Self::DmaBuf { buffer, .. } | Self::Nvmm { buffer, .. } => Some(buffer),
             Self::Copied { .. } => None,
+        }
+    }
+
+    /// Layout/plane geometry read from the NvBufSurface, when this is
+    /// an NVMM frame. `None` for the host fallback.
+    pub fn nvmm_info(&self) -> Option<(Layout, PlaneLayout, u32, u32)> {
+        match self {
+            Self::Nvmm {
+                layout,
+                planes,
+                width,
+                height,
+                ..
+            } => Some((*layout, *planes, *width, *height)),
+            _ => None,
         }
     }
 }
@@ -131,6 +157,10 @@ pub struct GstLaunchSource {
     /// as a fault so systemd restarts the process, never as a clean
     /// end of stream (which exits 0 and recovers nothing).
     argus: bool,
+    /// Set when Argus EOS may mean a lost daemon. `set_state(Null)`
+    /// can segfault inside the Argus client after a daemon restart, so
+    /// teardown is skipped and the process exits instead.
+    skip_teardown: bool,
 }
 
 impl GstLaunchSource {
@@ -178,6 +208,7 @@ impl GstLaunchSource {
             pool,
             copied_frames: Arc::new(AtomicU64::new(0)),
             argus,
+            skip_teardown: false,
         })
     }
 
@@ -201,18 +232,43 @@ impl GstLaunchSource {
                 })));
             }
         }
-        // NVMM buffers (nvarguscamerasrc) are NOT upstream
-        // GstDmaBufMemory: they need the NvBufSurface branch
-        // (gst-nvmm's allocator) which lands with the M1 device
-        // work. Until then, fail loudly on an NVMM pipeline —
-        // copying block-linear bytes into shm and calling them a
-        // tight NV12 frame would be a silent lie.
+        // nvarguscamerasrc's NVMM memory is not an upstream
+        // GstDmaBufMemory. `gst_buffer_map(READ)` exposes an
+        // `NvBufSurface*` in the mapped bytes; read its fd, layout
+        // and plane params (T2), never the block-linear pixels.
         if self.memory == FrameMemory::Nvmm {
-            return Err(Error::Platform(
-                "NVMM buffer without dmabuf memory: the NvBufSurface branch \
-                 (gst-nvmm nvmmalloc) is not wired yet; refusing to copy"
-                    .into(),
-            ));
+            let map = buffer.map_readable().map_err(|e| {
+                Error::Platform(format!(
+                    "mapping NVMM buffer for NvBufSurface: {e}; refusing to copy"
+                ))
+            })?;
+            let info = nvbuf_sys::surface_from_bytes(map.as_slice()).map_err(|e| {
+                Error::Platform(format!(
+                    "NVMM buffer is not a readable NvBufSurface ({e}); refusing to copy"
+                ))
+            })?;
+            drop(map);
+            let layout = match info.layout {
+                nvbuf_sys::SurfaceLayout::Pitch => Layout::PitchLinear,
+                nvbuf_sys::SurfaceLayout::BlockLinear => Layout::BlockLinear,
+            };
+            let planes: Vec<PlaneDesc> = info
+                .planes()
+                .map(|p| PlaneDesc {
+                    offset: p.offset,
+                    pitch: p.pitch,
+                    row_bytes: p.row_bytes,
+                    rows: p.rows,
+                })
+                .collect();
+            return Ok(Some(Arc::new(GstFrameBuffer::Nvmm {
+                buffer,
+                fd: info.fd,
+                layout,
+                planes: PlaneLayout::from_planes(&planes),
+                width: info.width,
+                height: info.height,
+            })));
         }
         // Fallback: copy into the shm pool (dev PCs only). The map
         // must be exactly one tight NV12 frame; anything else
@@ -261,7 +317,7 @@ impl GstLaunchSource {
     /// Drain pending bus Error/Eos messages. A runtime pipeline
     /// error (camera loss, decoder failure) must surface as `Err`,
     /// not loop forever as `Timeout`.
-    fn poll_bus(&self) -> Result<Option<FramePoll>> {
+    fn poll_bus(&mut self) -> Result<Option<FramePoll>> {
         let Some(bus) = self.pipeline.bus() else {
             return Ok(None);
         };
@@ -280,13 +336,10 @@ impl GstLaunchSource {
                 }
                 gst::MessageView::Eos(_) => {
                     return if self.argus {
-                        Err(Error::Platform(
-                            concat!(
-                                "capture ended: the Argus sensor or nvargus-daemon ",
-                                "session may be lost (bare EOS from an Argus source ",
-                                "is a fault, not end of stream)"
-                            )
-                            .into(),
+                        self.skip_teardown = true;
+                        Err(Error::CaptureServiceLost(
+                            "Argus ended with a bare EOS; sensor or nvargus-daemon session lost"
+                                .into(),
                         ))
                     } else {
                         Ok(Some(FramePoll::EndOfStream))
@@ -367,13 +420,10 @@ impl FrameSource for GstLaunchSource {
                 }
                 if self.appsink.is_eos() {
                     return if self.argus {
-                        Err(Error::Platform(
-                            concat!(
-                                "capture ended: the Argus sensor or nvargus-daemon ",
-                                "session may be lost (bare EOS from an Argus source ",
-                                "is a fault, not end of stream)"
-                            )
-                            .into(),
+                        self.skip_teardown = true;
+                        Err(Error::CaptureServiceLost(
+                            "Argus ended with a bare EOS; sensor or nvargus-daemon session lost"
+                                .into(),
                         ))
                     } else {
                         Ok(FramePoll::EndOfStream)
@@ -393,21 +443,28 @@ impl FrameSource for GstLaunchSource {
             // Fallback pool exhausted: this frame is dropped.
             return Ok(FramePoll::Timeout(TimeoutReason::PoolExhausted));
         };
+        let (layout, planes, width, height) = buf
+            .as_any()
+            .downcast_ref::<GstFrameBuffer>()
+            .and_then(|b| b.nvmm_info())
+            .unwrap_or_else(|| {
+                // Host fallback: only the pitch-linear copy has a
+                // real tight layout; never claim one for block-linear.
+                let planes = if self.layout == Layout::BlockLinear {
+                    PlaneLayout::default()
+                } else {
+                    PixelFormat::Nv12.plane_layout(self.cfg.width, self.cfg.height)
+                };
+                (self.layout, planes, self.cfg.width, self.cfg.height)
+            });
         let meta = FrameMeta {
             seq: self.seq,
             pts,
-            width: self.cfg.width,
-            height: self.cfg.height,
+            width,
+            height,
             format: PixelFormat::Nv12,
-            layout: self.layout,
-            // T2 fills this from NvBufSurface planeParams. Until then
-            // a block-linear surface must not claim a tight pitch:
-            // only the pitch-linear host fallback has a real layout.
-            planes: if self.layout == Layout::BlockLinear {
-                PlaneLayout::default()
-            } else {
-                PixelFormat::Nv12.plane_layout(self.cfg.width, self.cfg.height)
-            },
+            layout,
+            planes,
             camera_id: self.cfg.camera_id,
             dmabuf_fd: buf.dmabuf_fd(),
         };
@@ -416,6 +473,11 @@ impl FrameSource for GstLaunchSource {
     }
 
     fn stop(&mut self) -> Result<()> {
+        if self.skip_teardown {
+            // Leak the pipeline until exit: tearing it down after a
+            // lost Argus daemon can segfault in C++.
+            return Ok(());
+        }
         self.pipeline
             .set_state(gst::State::Null)
             .map_err(|e| Error::Platform(format!("stopping capture pipeline: {e}")))?;
@@ -439,7 +501,9 @@ impl FrameSource for GstLaunchSource {
 
 impl Drop for GstLaunchSource {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        if !self.skip_teardown {
+            let _ = self.pipeline.set_state(gst::State::Null);
+        }
     }
 }
 
@@ -460,6 +524,7 @@ mod tests {
             gain_max: None,
             paced: true,
             pool_size: 2,
+            argus_pool: None,
             frames: None,
         }
     }

@@ -1,0 +1,17 @@
+# Proposal only: pin devfreq clocks before a latency measurement (N18).
+# The reference product uses the same one-line sysfs loop; the exact
+# VIC/engine devfreq paths are board-specific and should be generated
+# for the image, not guessed here.
+[Unit]
+Description=Pin Jetson clocks for edge-vision measurements
+Before=edge-vision.service
+After=nvargus-daemon.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Replace with the board's devfreq entries; verify with `cat .../governor`.
+ExecStart=/bin/sh -c 'for g in /sys/class/devfreq/*/governor; do echo performance > "$g" 2>/dev/null || true; done'
+
+[Install]
+WantedBy=multi-user.target

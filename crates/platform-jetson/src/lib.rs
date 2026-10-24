@@ -28,7 +28,10 @@ pub mod launch;
 pub mod plan_cache;
 pub mod probe;
 
-pub use probe::{choose_encoder, probe_media_engines, EncoderChoice, EncoderKind, MediaEngines};
+pub use probe::{
+    choose_encoder, dla_cores, probe_media_engines, probe_module_identity, EncoderChoice,
+    EncoderKind, MediaEngines, ModuleIdentity,
+};
 
 #[cfg(feature = "gst")]
 use edge_core::Layout;
@@ -43,21 +46,33 @@ use std::path::Path;
 /// (`/` on device; also how tests inject a fake device tree).
 pub struct JetsonPlatform {
     engines: MediaEngines,
+    module: ModuleIdentity,
+    root: std::path::PathBuf,
 }
 
 impl JetsonPlatform {
     pub fn new(sysfs_root: &Path) -> Self {
         Self {
             engines: probe_media_engines(sysfs_root),
+            module: probe_module_identity(sysfs_root),
+            root: sysfs_root.to_path_buf(),
         }
     }
 
     pub fn with_engines(engines: MediaEngines) -> Self {
-        Self { engines }
+        Self {
+            engines,
+            module: ModuleIdentity::default(),
+            root: std::path::PathBuf::from("/"),
+        }
     }
 
     pub fn engines(&self) -> MediaEngines {
         self.engines
+    }
+
+    pub fn module_identity(&self) -> &ModuleIdentity {
+        &self.module
     }
 }
 
@@ -93,7 +108,11 @@ impl Platform for JetsonPlatform {
             // of the plan key and an accuracy gate exists; `--int8`
             // without calibration silently uses dummy scales.
             precisions: vec![Precision::Fp32, Precision::Fp16],
-            devices: vec!["gpu".into()],
+            devices: {
+                let mut devices = vec!["gpu".into()];
+                devices.extend(dla_cores(&self.root));
+                devices
+            },
             has_hw_encoder: self.engines.nvenc,
             // The CPU stage is compiled in; element presence is
             // checked in `encoder()`, so a missing x264 names its

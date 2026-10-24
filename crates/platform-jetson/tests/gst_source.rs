@@ -31,6 +31,7 @@ fn cfg(kind: &str) -> SourceConfig {
         gain_max: None,
         paced: true,
         pool_size: 6,
+        argus_pool: None,
         frames: None,
     }
 }
@@ -181,7 +182,8 @@ fn argus_eos_is_reported_as_a_capture_fault() {
             Err(e) => {
                 let text = e.to_string();
                 assert!(
-                    text.contains("Argus") && text.contains("fault"),
+                    text.contains("Argus")
+                        && (text.contains("fault") || text.contains("capture service lost")),
                     "Argus EOS must be a named fault: {text}"
                 );
                 return;

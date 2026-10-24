@@ -1,10 +1,10 @@
 # Edge Vision Pipeline — Design
 
 **Status:** M0/M1 groundwork. Everything CPU-side is implemented and
-tested on x86; Jetson device stages (NVMM surface access, CUDA/VIC
-pre-processing, TensorRT, NVENC, RTSP) are not implemented yet. The
-tables below are deliberately explicit about which side of that line
-each claim sits on.
+tested on x86, including the read-only NVMM surface view; Jetson device
+stages (CUDA/VIC pre-processing, TensorRT, NVENC, RTSP) are not
+implemented yet. The tables below are deliberately explicit about which
+side of that line each claim sits on.
 
 The project builds one Rust binary that captures camera frames, runs a
 neural network on them and streams the result, keeping pixels in
@@ -26,12 +26,14 @@ be new `platform-*` crates without changes to the pipeline core.
 | Sinks: JSONL metadata, file video, fan-out, counting/null | Done | `crates/sinks`; unit tests |
 | Conformance suite every backend must pass | Done | `crates/conformance`; sim passes, broken stubs are caught |
 | Jetson: NVENC/NVJPG sysfs probe, launch strings, plan cache | Done (PC-testable) | `crates/platform-jetson`; unit tests with fake sysfs, per-model plan namespaces, property-set file paths |
-| Jetson: GStreamer capture (`appsink`) | Partial | `platform-jetson --features gst`: dmabuf branch and a PC-only copy fallback; NVMM buffers are refused, never copied |
-| Jetson: Argus EOS is a fault, not a clean end | Done (PC-tested) | `gst_source.rs` returns `Err` for an `argus` source; once-per-boot recovery/exit 75 still M1 |
-| Jetson: NVMM/NvBufSurface access (`gst_buffer_map` → `NvBufSurface*`) | Not implemented | Needs `nvbuf-sys` and the L4T sysroot; see `docs/jetson-bringup.md` |
-| Jetson: CPU H.264 encode (Orin Nano) | Done (PC-tested) | `GstEncoder` (`appsrc → nvvidconv → x264enc → h264parse → appsink`), element check, Nano profile; device run still needs the NVMM branch and the VIC/TensorRT stages |
+| Jetson: GStreamer capture (`appsink`) | Done on PC (device run pending) | `platform-jetson --features gst`: dmabuf branch, NVMM `NvBufSurface` branch (T2) and a PC-only honest `shm-copy` fallback |
+| Jetson: Argus EOS is a fault, not a clean end | Done (PC-tested) | `gst_source.rs` returns `CaptureServiceLost`; teardown is skipped and the app applies the once-per-boot exit-75 policy |
+| Jetson: NVMM/NvBufSurface access (`gst_buffer_map` → `NvBufSurface*`) | Done on PC (device run pending) | `nvbuf-sys` read-only `repr(C)` view, exact map-size check, fd/layout/planes from `planeParams`; see `docs/jetson-bringup.md` T2 |
+| Jetson: CPU H.264 encode (Orin Nano) | Done (PC-tested) | `GstEncoder` (`appsrc → nvvidconv → x264enc → h264parse → appsink`), element check, Nano profile; device run still needs the VIC/TensorRT stages |
 | Jetson: encode on its own thread | Done (PC-tested) | runner `encode-cam` thread, leaky one-deep frame hand-off, dropped-frame counter |
-| Jetson: VIC/CUDA pre-process, TensorRT engine, overlay, NVENC encode, RTSP | Not implemented | Device bring-up; launch strings are the contract |
+| Jetson: VIC/CUDA pre-process, TensorRT engine, overlay, NVENC encode, RTSP | Not implemented | Device bring-up; launch strings are the contract. DLA device nodes are probed for `model.device` validation only |
+| Jetson: Argus loss recovery | Done on PC (device run pending) | Typed `CaptureServiceLost`, skipped teardown after Argus EOS, once-per-boot marker + daemon restart + exit 75 |
+| Sinks: bounded async writer | Done | `sinks::AsyncSink`; used by the app for disk/terminal writes |
 | Device zero-copy proof (`copied_frames == 0`, Nsight, EMC) | Not verified | M1 exit gate on the flashed board |
 | Multi-camera orchestration | Not implemented | One process per camera is the default for Argus fault isolation |
 
@@ -256,6 +258,7 @@ width = 640
 height = 480
 fps = 30
 pool_size = 8             # sim pool; must be >= queue_depth + 3
+# argus_pool = 12         # Jetson: validates the live in-flight budget
 frames = 30               # stop after N captured frames (optional)
 
 [model]
@@ -322,6 +325,13 @@ config.
 - **Prometheus**: `--prometheus` prints a text exposition at exit and a
   live summary every 5 s to stderr. There is no HTTP endpoint yet;
   the sink/HTTP layer owns that.
+- **Sinks**: the app wraps its sink in `AsyncSink`, so JSONL/file
+  flushes happen on a bounded `sink-writer` thread; a full queue blocks
+  the producer rather than growing memory.
+- **Argus loss**: a bare Argus EOS becomes `CaptureServiceLost`. The
+  source skips `set_state(Null)` (it can segfault after a daemon
+  restart), the app writes a once-per-boot marker, queues
+  `systemctl --no-block restart nvargus-daemon`, and exits 75.
 - Counters reset at every `run()`; a scraper sees a counter reset.
 
 ## Building
@@ -366,7 +376,7 @@ trait suite.
 ## Testing and CI
 
 - Unit tests across `core`, `config`, `postproc`, `sinks`, `metrics`,
-  `probe`, `launch`, `plan_cache`.
+  `probe`, `launch`, `plan_cache`, `gst_encoder`, `nvbuf-sys`.
 - Pipeline integration tests on the sim: ordering, drop accounting,
   slow sink, stage error without deadlock, stop handle, idle limit,
   run-twice, live metrics, warming engine, encoder refusal.

@@ -20,6 +20,7 @@ fn source_cfg() -> SourceConfig {
         gain_max: None,
         paced: false,
         pool_size: 4,
+        argus_pool: None,
         frames: None,
     }
 }

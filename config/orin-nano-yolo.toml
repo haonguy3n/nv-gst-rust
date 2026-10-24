@@ -12,6 +12,7 @@ width = 1440 # IMX296 native
 height = 1080
 fps = 30
 pool_size = 8 # sim semantics; the Argus pool is fixed (see docs/jetson-bringup.md)
+# argus_pool = 12 # set from the board; enables in-flight budget validation
 # No gain/exposure ranges here: at-start ranges gave black frames on
 # the Nano. Apply them after PLAYING once brightness is checked.
 
